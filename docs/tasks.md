@@ -66,12 +66,12 @@ Dependency: R3.
 
 | ID | Status | Task | Exit criteria |
 |---|---|---|---|
-| T4.1 | planned | Define review input/output contract and revision identity | Critic receives acceptance criteria and the exact diff/base revision. |
-| T4.2 | planned | Enforce an actual Critic read-only boundary | A negative write probe in a temporary repository is refused. |
-| T4.3 | planned | Run independent review through an available CLI | Review uses a separate process; model errors cannot be interpreted as approval. |
-| T4.4 | planned | Implement reject → fix → review again | Rationale and revision are stored; later fixes do not erase findings. |
-| T4.5 | planned | Keep task open for unresolved findings or an active Writer | Gate is checked against deterministic database state. |
-| T4.6 | planned | Select verified Writer and Critic adapters per project | Project configuration independently selects a supported Writer and Critic CLI; unavailable, unverified, or insufficiently isolated adapters are refused with a clear diagnostic. |
+| T4.1 | done | Define review input/output contract and revision identity | `docs/critic-review-contract.md` defines strict JSON findings and approval rules. Review identity binds the full base commit and complete patch; patch, prompt, and response budgets are 64/96/64 KiB. Oversized context fails closed without truncation. |
+| T4.2 | done | Enforce an actual Critic read-only boundary | Antigravity 1.5.10 attempted `write_file` in a disposable project and received `Permission denied` matching the session deny rule; the marker file was absent. Unit checks confirm command/MCP/URL and `.talos`/`.git` denials. |
+| T4.3 | done | Run independent review through an available CLI | `task review` uses a fresh Antigravity process without the Writer conversation. A live approval and a live `request_changes` result were schema-validated and tied to exact revision IDs. Process/parse failures never approve. |
+| T4.4 | done | Implement reject → fix → review again | A live Critic finding moved a deliberately defective task to `implementing`; a fake Writer fix created attempt 2 linked to review 1 and kept the original base. Database tests recorded the later approval and confirmed prior review rows cannot be updated or deleted. |
+| T4.5 | done | Keep task open for unresolved findings or an active Writer | Active/unresolved Writer state blocks review; approval moves only to `verifying`, never `complete`. Database tests cover the global active-Writer gate and state transition. |
+| T4.6 | done | Select verified Writer and Critic adapters per project | `.talos/config.json` selects roles independently. Antigravity 1.5.10 is the only accepted adapter for both roles; missing or unverified role choices are refused. `doctor` reports the selected roles. |
 
 ## R5 — Verification evidence and permissions
 
@@ -143,4 +143,5 @@ First launch/repeat `up`; Writer/Critic success and justified rejection; child t
 
 | ID | Status | Idea | Note |
 |---|---|---|---|
-| F1 | idea | Add a local project-origin and history journal for Git and non-Git projects | Revisit after the current roadmap. Explore project registration/creation milestones, plan and decision history, and references to files or reports produced during work. Keep structured metadata local in SQLite; evaluate path, digest, size, and provenance references for larger files. Define privacy, retention, backup, and export before implementation. This is not a request for TALOS to generate or copy entire projects. Research: `docs/research/project-history-idea.md`. |
+| F1 | idea | Add a local project-origin and history journal for Git and non-Git projects | Revisit after the current roadmap. Explore project registration/creation milestones, plan and decision history, and references to files or reports produced during work. Keep structured metadata local in SQLite; evaluate path, digest, size, and provenance references for larger files. Define privacy, retention, backup, export, archival, and token/context budgets before implementation. Keep rows and prompts bounded; do not store full transcripts or duplicate project trees by default. This is not a request for TALOS to generate or copy entire projects. Research: `docs/research/project-history-idea.md`. |
+| F2 | idea | Evaluate typed agent handoffs and controlled technical language | Revisit after R9. This is exploratory only; TALOS has not adopted ASD-STE100 or a Russian profile. Evaluate whether typed JSON contracts, stable terminology, or optional text checks improve Writer/Critic, child-task, and handoff clarity. Measure ambiguity, false positives, maintenance cost, and token/context overhead. It may not fit TALOS. Research: `docs/research/agent-language-idea.md`. |

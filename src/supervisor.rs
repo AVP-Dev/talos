@@ -7,16 +7,24 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 
 use crate::{
     adapter::agy_process::{AgyProcessEvent, AgyRunConfig, AgyRunResult, TerminationReason},
-    db::{Database, TaskRecord, TaskStatus, WriterAttemptOutcome, WriterAttemptRecord},
+    db::{
+        CriticReviewInput, CriticReviewRecord, Database, TaskRecord, TaskStatus,
+        WriterAttemptOutcome, WriterAttemptRecord,
+    },
     project::{DiscoveryMethod, Project},
+    review::{CriticResponse, ReviewRequest},
+    revision::{RevisionSnapshot, clean_base_commit},
 };
 
 pub const VERIFIED_AGY_WRITE_VERSION: &str = "1.5.10";
+pub const VERIFIED_AGY_CRITIC_VERSION: &str = "1.5.10";
+const MAX_CRITIC_RESPONSE_BYTES: usize = 64 * 1024;
 
 /// Conservatively check whether the process group TALOS created for this Writer still exists.
 /// This reports liveness only; it does not identify a process or establish a Writer outcome.
@@ -48,6 +56,12 @@ pub struct WriterExecutionReport {
     pub attempt: WriterAttemptRecord,
     pub response: Option<String>,
     pub outcome: WriterAttemptOutcome,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct CriticReviewReport {
+    pub review: CriticReviewRecord,
+    pub findings: Vec<crate::review::CriticFinding>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -98,6 +112,127 @@ pub async fn continue_writer_attempt(
     .await
 }
 
+pub async fn run_critic_review(
+    project: &Project,
+    database: &mut Database,
+    task_id: i64,
+    executable: PathBuf,
+    agy_version: &str,
+    timeout: Duration,
+) -> Result<CriticReviewReport> {
+    if agy_version != VERIFIED_AGY_CRITIC_VERSION {
+        bail!(
+            "Read-only Critic use is verified for Antigravity {VERIFIED_AGY_CRITIC_VERSION}; installed version {agy_version} requires a new disposable-project read-only probe"
+        );
+    }
+    if database.has_unresolved_writer_attempts()? {
+        bail!("An active or unresolved Writer attempt prevents Critic review");
+    }
+    let task = database
+        .list_tasks()?
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .with_context(|| format!("Task #{task_id} does not exist"))?;
+    if task.status != TaskStatus::Reviewing {
+        bail!(
+            "Task #{task_id} must be reviewing after a successful Writer attempt before Critic review"
+        );
+    }
+    validate_project_scope(project)?;
+    if !matches!(&project.discovery, DiscoveryMethod::Git) {
+        bail!(
+            "Critic review requires a Git project so TALOS can identify the exact base revision and diff"
+        );
+    }
+
+    let attempts = database.writer_attempts(Some(task_id))?;
+    let writer = attempts
+        .last()
+        .context("Task has no saved Writer attempt to review")?;
+    if writer.state != "succeeded" {
+        bail!("Critic review requires the latest Writer attempt to have succeeded");
+    }
+    let base_revision = writer.base_revision.as_deref().context(
+        "Writer attempt has no saved Git base revision; this result cannot be reviewed safely",
+    )?;
+    let snapshot = RevisionSnapshot::capture(&project.root, base_revision)?;
+    if snapshot.changed_paths.is_empty() {
+        bail!("Critic review requires a non-empty project diff");
+    }
+    let request = ReviewRequest::new(
+        &task,
+        writer.id,
+        &snapshot.base_commit,
+        &snapshot.revision_id,
+        &snapshot.changed_paths,
+        &snapshot.patch,
+    );
+    let prompt = request.prompt()?;
+    let mut settings = create_critic_session_settings(project, task_id, &snapshot.revision_id)?;
+    let execution = crate::adapter::agy_process::run_read_only(
+        AgyRunConfig {
+            executable,
+            project_root: project.root.clone(),
+            settings_file: settings.path.clone(),
+            prompt,
+            conversation_id: None,
+            timeout,
+        },
+        |_| Ok(()),
+    )
+    .await;
+    settings.remove_after_resolution();
+    let execution = execution.context("Critic process failed; no approval was recorded")?;
+    if execution.termination != TerminationReason::Exited
+        || execution.exit_code != Some(0)
+        || execution.agent_status.as_deref() != Some("SUCCESS")
+        || execution.response.as_deref().is_none_or(str::is_empty)
+        || execution.stdout_truncated
+        || execution.input_error.is_some()
+    {
+        bail!("Critic did not return a complete successful response; no approval was recorded");
+    }
+    if execution
+        .response
+        .as_ref()
+        .is_some_and(|response| response.len() > MAX_CRITIC_RESPONSE_BYTES)
+    {
+        bail!(
+            "Critic response exceeds the {MAX_CRITIC_RESPONSE_BYTES}-byte result budget; no approval was recorded"
+        );
+    }
+    let response = CriticResponse::parse_and_validate(
+        execution
+            .response
+            .as_deref()
+            .context("Critic response is missing")?,
+        &snapshot.revision_id,
+        &snapshot.changed_paths,
+    )?;
+    let current_snapshot = RevisionSnapshot::capture(&project.root, base_revision)?;
+    if current_snapshot.revision_id != snapshot.revision_id {
+        bail!(
+            "Project changed while the Critic was reviewing; its result is stale and was not recorded"
+        );
+    }
+    let canonical_json = response.canonical_json()?;
+    let review = database.record_critic_review(CriticReviewInput {
+        task_id,
+        writer_attempt_id: writer.id,
+        base_revision,
+        revision_id: &snapshot.revision_id,
+        decision: response.decision.as_str(),
+        summary: &response.summary,
+        result_json: &canonical_json,
+        adapter: "agy",
+        adapter_version: agy_version,
+    })?;
+    Ok(CriticReviewReport {
+        review,
+        findings: response.findings,
+    })
+}
+
 async fn run_writer_attempt_inner(
     project: &Project,
     database: &mut Database,
@@ -122,7 +257,7 @@ async fn run_writer_attempt_inner(
         .into_iter()
         .find(|task| task.id == task_id)
         .with_context(|| format!("Task #{task_id} does not exist"))?;
-    match &continuation {
+    let revision_review = match &continuation {
         Some(continuation) => {
             let latest = database
                 .latest_continuable_attempt(task_id)?
@@ -137,17 +272,38 @@ async fn run_writer_attempt_inner(
                     "Task #{task_id} must be blocked after a terminal Writer error before continuation"
                 );
             }
+            None
         }
-        None if task.status != TaskStatus::Queued => {
-            bail!("Task #{task_id} must be queued before a Writer can run it");
+        None if task.status == TaskStatus::Implementing => {
+            let latest = database
+                .latest_critic_review(task_id)?
+                .context("Task is implementing without a saved Critic review")?;
+            if latest.decision != "request_changes" {
+                bail!("Task #{task_id} has no latest Critic review requesting Writer changes");
+            }
+            Some(latest)
         }
-        None => {}
-    }
+        None if task.status == TaskStatus::Queued => None,
+        None => bail!(
+            "Task #{task_id} must be queued or awaiting Writer fixes after a Critic rejection"
+        ),
+    };
 
     validate_project_scope(project)?;
+    let initial_base_revision = if continuation.is_none()
+        && revision_review.is_none()
+        && task.status == TaskStatus::Queued
+        && matches!(&project.discovery, DiscoveryMethod::Git)
+    {
+        Some(clean_base_commit(&project.root)?)
+    } else {
+        None
+    };
     project.ensure_runtime_dir()?;
     let prompt = if let Some(continuation) = &continuation {
         build_writer_continuation_prompt(&task, continuation.source_attempt_id)
+    } else if let Some(review) = &revision_review {
+        build_writer_revision_prompt(&task, review)
     } else {
         build_writer_prompt(&task)
     };
@@ -163,6 +319,9 @@ async fn run_writer_attempt_inner(
     } else {
         database.begin_writer_attempt(task.id, &prompt_sha256)?
     };
+    if let Some(base_revision) = initial_base_revision {
+        database.record_writer_base_revision(attempt.id, &base_revision)?;
+    }
     let mut settings = match create_session_settings(project, attempt.id) {
         Ok(settings) => settings,
         Err(error) => {
@@ -330,6 +489,30 @@ fn build_writer_prompt(task: &TaskRecord) -> String {
     )
 }
 
+fn build_writer_revision_prompt(task: &TaskRecord, review: &CriticReviewRecord) -> String {
+    let criteria = if task.acceptance_criteria.trim().is_empty() {
+        "No separate acceptance criteria were supplied."
+    } else {
+        task.acceptance_criteria.trim()
+    };
+    format!(
+        "You are the TALOS Writer starting a new fix iteration after an independent Critic review.\n\
+         Inspect the current project state and make the smallest changes needed to address the blocking findings.\n\
+         Do not run terminal commands, use the network, interact with external services,\n\
+         or modify `.talos/` or `.git/`. TALOS will run project checks separately.\n\
+         Do not claim that checks passed unless TALOS reports their results.\n\
+         Keep the task's original base revision and preserve unrelated files.\n\
+         Task ID: {}\n\
+         Task: {}\n\
+         Acceptance criteria: {}\n\
+         Source Critic review ID: {}\n\
+         Source revision: {}\n\
+         Critic findings JSON: {}\n\
+         At the end, return a concise English summary of changed files and any remaining work.",
+        task.id, task.title, criteria, review.id, review.revision_id, review.result_json
+    )
+}
+
 fn build_writer_continuation_prompt(task: &TaskRecord, source_attempt_id: i64) -> String {
     let criteria = if task.acceptance_criteria.trim().is_empty() {
         "No separate acceptance criteria were supplied."
@@ -361,6 +544,31 @@ fn create_session_settings(project: &Project, attempt_id: i64) -> Result<Session
     write_session_settings(project, attempt_id, &settings)
 }
 
+fn create_critic_session_settings(
+    project: &Project,
+    task_id: i64,
+    revision_id: &str,
+) -> Result<SessionSettings> {
+    let root = rule_path(&project.root)?;
+    let talos = rule_path(&project.runtime_dir())?;
+    let policy = build_critic_session_policy(&root, &talos);
+    let digest = revision_id
+        .strip_prefix("sha256:")
+        .context("Critic revision ID must be a SHA-256 digest")?;
+    if digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        bail!("Critic revision ID has an invalid SHA-256 digest");
+    }
+    write_session_settings_with_name(
+        project,
+        &format!(
+            "agy-critic-{task_id}-{}-{}",
+            &digest[..12],
+            std::process::id()
+        ),
+        &policy,
+    )
+}
+
 fn build_session_policy(root: &str, talos: &str) -> Value {
     json!({
         "enableTerminalSandbox": true,
@@ -380,6 +588,27 @@ fn build_session_policy(root: &str, talos: &str) -> Value {
                 "mcp(*)".to_owned(),
                 "read_url(*)".to_owned(),
                 "execute_url(*)".to_owned(),
+            ],
+        },
+    })
+}
+
+fn build_critic_session_policy(root: &str, talos: &str) -> Value {
+    json!({
+        "enableTerminalSandbox": true,
+        "toolPermission": "proceed-in-sandbox",
+        "permissions": {
+            "allow": [format!("read_file({root}/)")],
+            "deny": [
+                "write_file(*)",
+                "command(*)",
+                "mcp(*)",
+                "read_url(*)",
+                "execute_url(*)",
+                format!("read_file({talos})"),
+                format!("read_file({talos}/)"),
+                format!("read_file({root}/.git)"),
+                format!("read_file({root}/.git/)"),
             ],
         },
     })
@@ -424,9 +653,15 @@ fn write_session_settings(
     attempt_id: i64,
     value: &Value,
 ) -> Result<SessionSettings> {
-    let path = project
-        .runtime_dir()
-        .join(format!("agy-attempt-{attempt_id}-settings.json"));
+    write_session_settings_with_name(project, &format!("agy-attempt-{attempt_id}"), value)
+}
+
+fn write_session_settings_with_name(
+    project: &Project,
+    name: &str,
+    value: &Value,
+) -> Result<SessionSettings> {
+    let path = project.runtime_dir().join(format!("{name}-settings.json"));
     let bytes = serde_json::to_vec_pretty(value).context("Cannot serialize Agy session policy")?;
     let mut options = OpenOptions::new();
     options.write(true).create_new(true);
@@ -492,10 +727,10 @@ mod tests {
     };
 
     use super::{
-        VERIFIED_AGY_WRITE_VERSION, WriterContinuation, build_session_policy,
-        build_writer_continuation_prompt, build_writer_prompt, classify_execution,
-        continue_writer_attempt, encode_lower_hex, rule_path, run_writer_attempt,
-        safe_agent_status, safe_conversation_id, validate_project_scope,
+        VERIFIED_AGY_WRITE_VERSION, WriterContinuation, build_critic_session_policy,
+        build_session_policy, build_writer_continuation_prompt, build_writer_prompt,
+        classify_execution, continue_writer_attempt, encode_lower_hex, rule_path,
+        run_writer_attempt, safe_agent_status, safe_conversation_id, validate_project_scope,
         writer_process_group_running,
     };
     use crate::{
@@ -721,6 +956,31 @@ mod tests {
             "write_file(/tmp/project/)"
         );
         assert!(policy["permissions"]["deny"].as_array().unwrap().len() >= 12);
+    }
+
+    #[test]
+    fn critic_policy_allows_reading_project_files_and_denies_mutation_and_external_tools() {
+        let policy: Value = build_critic_session_policy("/tmp/project", "/tmp/project/.talos");
+        assert_eq!(
+            policy["permissions"]["allow"][0],
+            "read_file(/tmp/project/)"
+        );
+        let denied = policy["permissions"]["deny"].as_array().expect("deny list");
+        for rule in [
+            "write_file(*)",
+            "command(*)",
+            "mcp(*)",
+            "read_url(*)",
+            "execute_url(*)",
+            "read_file(/tmp/project/.talos)",
+            "read_file(/tmp/project/.talos/)",
+            "read_file(/tmp/project/.git)",
+            "read_file(/tmp/project/.git/)",
+        ] {
+            assert!(denied.iter().any(|value| value == rule), "missing {rule}");
+        }
+        assert_eq!(policy["enableTerminalSandbox"], true);
+        assert_eq!(policy["toolPermission"], "proceed-in-sandbox");
     }
 
     #[test]

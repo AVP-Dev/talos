@@ -11,6 +11,7 @@ Each project gets a local SQLite database at `.talos/state.sqlite3`, including p
 - Treat project creation/history as a local journal: registration time and origin, milestone events, approved plan versions, decisions, and links to files or reports produced during work.
 - Keep searchable structured records and provenance metadata in SQLite. For larger outputs, evaluate keeping the file in the project or a private `.talos` area while SQLite stores its relative path, digest, size, media type, producer task/attempt, and source revision. Avoid copying the source tree or storing full CLI transcripts by default.
 - Decide retention, deletion, backup, and export behavior before implementation. `.talos/` is private local runtime state and must remain ignored by Git.
+- Treat long-lived projects as a storage and context-budget problem: keep SQLite rows small, cap task/review payloads, never retain full CLI conversations or duplicate source trees by default, and define archival/retention/export before history volume becomes large. Large outputs should be referenced with bounded metadata and digests; any retrieval into an agent prompt needs an explicit token budget and selection rule.
 - Keep this per-project. A cross-project portfolio database is a separate product decision and is not implied by F1.
 - In product text, describe the feature as a project history/journal. Use “artifact” only when it means a concrete file or file collection produced by a run; TALOS should not generate or duplicate project content merely to create history.
 

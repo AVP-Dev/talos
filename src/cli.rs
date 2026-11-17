@@ -61,9 +61,14 @@ pub enum TaskCommand {
     },
     /// List tasks in the local queue.
     List,
-    /// Run one queued task with the version-verified Antigravity Writer.
+    /// Run one queued task or a Critic-requested fix with the configured Writer.
     Run {
         /// ID of the queued task to execute.
+        task_id: i64,
+    },
+    /// Review the latest successful Writer revision with a separate read-only Critic process.
+    Review {
+        /// ID of the task in review or awaiting fixes.
         task_id: i64,
     },
     /// Continue the latest eligible terminal Antigravity error conversation.
@@ -135,6 +140,19 @@ mod tests {
         };
         assert_eq!(task_id, 17);
         assert!(confirm_project_inspected);
+    }
+
+    #[test]
+    fn task_review_parses_a_task_id() {
+        let cli = Cli::try_parse_from(["talos", "task", "review", "17"])
+            .expect("parse independent review command");
+        let Command::Task(TaskArgs {
+            command: TaskCommand::Review { task_id },
+        }) = cli.command
+        else {
+            panic!("expected task review command");
+        };
+        assert_eq!(task_id, 17);
     }
 
     #[test]

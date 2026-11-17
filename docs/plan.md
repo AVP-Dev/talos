@@ -1,6 +1,6 @@
 # TALOS Project Plan
 
-**Status:** R1, R2, and R3 are complete. R3 is accepted for the verified macOS path. `task recover` quarantines ambiguous attempts; `task resolve` records explicit operator authorization; `task continue` resumes only the latest eligible Agy `ERROR` conversation; and `up --auto` processes at most one queued task from a clean Git worktree. Successful Writer output remains `reviewing` until later review and verification rounds. `up --semi` remains deferred to R5. Linux-specific implementation remains in scope. Linux build, runtime, and Agy sandbox checks that require a Linux environment may be deferred to the user's server under T6.5/T9.3 if setting them up on macOS would slow development; no Docker or VM setup is required.
+**Status:** R1–R4 are complete for the verified macOS path. R4 adds independent read-only Critic review, immutable review history, and a linked reject/fix/review cycle. A valid Critic approval moves a task to `verifying`; project checks and evidence-gated completion remain R5 work. `up --semi` remains deferred to R5. Linux-specific implementation remains in scope. Linux build, runtime, and Agy sandbox checks that require a Linux environment may be deferred to the user's server under T6.5/T9.3 if setting them up on macOS would slow development; no Docker or VM setup is required.
 
 ## 1. Goal
 
@@ -54,6 +54,7 @@ talos up --auto             # implemented in R3: one explicit call processes at 
 talos up --semi             # planned for R5 policy work; not part of initial R3 Auto
 talos task add "..."        # add a task with a verifiable goal
 talos task run <ID>         # implemented in R3 for the verified Writer
+talos task review <ID>      # implemented in R4 for the independent Critic
 talos task continue <ID> --confirm-project-inspected  # implemented for one eligible terminal ERROR result
 talos task recover          # implemented: quarantine ambiguous attempts as unknown
 talos task resolve <ATTEMPT_ID> ...  # implemented: audited operator decision
@@ -65,7 +66,7 @@ talos doctor                # diagnose CLI, tmux, Git, and database setup
 talos stop                  # planned for R6: graceful worker shutdown
 ```
 
-The R3 commands shown here are implemented for the verified macOS Writer path; `up --semi`, `attach`, `pause`, `resume`, and `stop` remain later policy/runtime work. `task continue` is limited to one explicit follow-up for the latest terminal Agy `ERROR` result with exit status zero and a validated public conversation ID. It never handles `unknown`, timeout, nonzero exit, or malformed output. TALOS resumes that exact ID through the public `--conversation` interface, verifies the resumed `init` ID before sending the follow-up, and asks the operator to inspect current workspace state without replaying the original prompt. A successful follow-up remains `reviewing`.
+R3 Writer commands and the R4 `task review` command are implemented for the verified macOS Antigravity 1.5.10 path. `up --semi`, `attach`, `pause`, `resume`, and `stop` remain later policy/runtime work. `task continue` is limited to one explicit follow-up for the latest terminal Agy `ERROR` result with exit status zero and a validated public conversation ID. It never handles `unknown`, timeout, nonzero exit, or malformed output. TALOS resumes that exact ID through the public `--conversation` interface, verifies the resumed `init` ID before sending the follow-up, and asks the operator to inspect current workspace state without replaying the original prompt. A successful follow-up remains `reviewing`. Critic approval moves a task only to `verifying`; it does not claim project checks or completion.
 
 ## 4. Roadmap and rounds
 
@@ -77,7 +78,7 @@ Each round ends with a usable, verifiable result, an updated backlog, and a sess
 | R1 | CLI spike | Headless JSON and same-ID resume verified for Antigravity; TUI handoff and native delegation remain deferred. R1 is complete; R3 later verified the write boundary. |
 | R2 | Core and durable state | Buildable Rust CLI, project discovery, SQLite WAL, schema migration, task queue/transitions, event journal, leases, status/doctor. Complete. |
 | R3 | One autonomous Writer | One verified adapter completes one safe local task per explicit `up --auto` invocation from a clean temporary Git project. Complete for the initial macOS target. |
-| R4 | Independent Critic | Read-only review of the same change, actionable findings, correction loop, and single-Writer protection. |
+| R4 | Independent Critic | Read-only review, real blocker finding, denied write probe, linked Writer fix, immutable review history, and per-project role selection. Complete for verified macOS Antigravity 1.5.10. |
 | R5 | Verification and permissions | Acceptance criteria, real project checks, Git facts, patch digest, Auto/Semi allowlist, and evidence-gated completion. |
 | R6 | Persistent runtime and recovery | tmux, reconnect/manual takeover, cancellation, CLI/TALOS crash, SSH disconnect, and optional Linux reboot autostart. |
 | R7 | Decomposition and parallel work | DAG and subagent tasks, isolated worktrees, leases/concurrency limits, conflict checks, and safe integration. |
@@ -130,6 +131,8 @@ One-shot `up --auto` now requires a clean Git worktree and processes at most one
 Add a separate Critic role, preferably using another vendor/CLI when available. Project configuration will select Writer and Critic adapters independently from the CLIs whose required interfaces and authority boundaries have been verified. The Critic receives the base/new revisions and acceptance criteria; its checkout or file permissions are actually read-only. Review output is structured as path/line/reason/severity findings or an approval with limits. A rejection starts a new Writer iteration. Role and authority persist independently of process restarts. T7.5 later verifies a bounded three-agent flow with one Writer, one independent Critic, and one additional scoped agent.
 
 **Exit criteria:** a realistic defect found by Critic blocks closure; Critic cannot write; repeated Writer/Critic cycles preserve work.
+
+**Result (completed):** T4.1–T4.6 are implemented. `task review <ID>` starts a fresh Antigravity 1.5.10 process without a Writer conversation ID or transcript. The review request binds acceptance criteria and a complete patch to the full base commit and a SHA-256 revision ID. The patch, serialized prompt, and structured response are capped at 64 KiB, 96 KiB, and 64 KiB; TALOS never truncates review context. A valid approval moves the task to `verifying`, a rejection moves it to `implementing`, and `complete` remains unavailable. Historical review rows are immutable. A live review approved a simple revision; another live review found a real empty-input defect, recorded a blocker, and moved the task to `implementing`. A fake Writer fix started a linked second attempt from the same base. A separate live write probe confirmed that Agy's `write_file` call was denied and the marker file was absent. `cargo test`, Clippy, release build, and the security scan passed at the R4 close checkpoint; exact current run results are in `docs/state.md`. CLI and model probes used disposable projects only. Linux-native acceptance remains unverified and stays under T6.5/T9.3.
 
 ### R5 — Ground truth, verification, and permissions
 

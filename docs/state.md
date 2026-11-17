@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R3 — One autonomous Writer is complete for the verified macOS target.** T3.1–T3.7 are done. `task run`, safe terminal-error `task continue`, fail-closed `task recover`, audited `task resolve`, and one-shot `up --auto` are implemented. `up --auto` handles at most one queued task from a clean Git worktree. Writer success always remains `reviewing`; there is no Critic, project-check runner, or task completion gate yet. `up --semi` remains deferred to R5. Backlog count: 25 of 61 scheduled tasks done (41.0% by task count, unweighted); one unscheduled idea is recorded separately. The next planned task is T4.1.
+**R4 — Independent Critic is complete for the verified macOS target.** T4.1–T4.6 are done. `task review` uses a fresh Antigravity 1.5.10 process, a bounded exact Git revision, structured findings, and a deny-write session policy. A rejection links the next Writer attempt to the prior review; approval moves to `verifying`, never `complete`. Project checks and the evidence gate remain R5 work. Linux-native build/runtime/sandbox acceptance remains deferred to the user's server under T6.5/T9.3. Backlog count: 31 of 61 scheduled tasks done (50.8% by task count, unweighted); two unscheduled ideas are recorded separately. The next planned task is T5.1.
 
 ## Goal and fixed direction
 
@@ -47,7 +47,7 @@ Implemented in `Cargo.toml`, `Cargo.lock`, and `src/`:
 - `up --observe` initializes/reports state and does not start a process. One-shot `up --auto` is enabled after R3 acceptance; `up --semi` remains unavailable until R5.
 - Active verification profile is `scripts/verification-profile.tsv`.
 
-R3 introduced schema v2 for durable `writer_attempts` and schema v3 for separate resolution metadata and continuation source links. It stores no prompt or transcript. The Writer uses a single supervisor lease, checks Agy 1.5.10, creates a session-only policy file, persists the PID before sending the prompt, records a public conversation ID as soon as the `init` event arrives, and moves success only to `reviewing`.
+R3 introduced schema v2 for durable `writer_attempts` and schema v3 for separate resolution metadata and continuation source links. R4 advances the schema to v4 with Writer base revisions, linked Critic revisions, and immutable Critic review records. Full prompts, patches, and transcripts are not persisted. The Writer uses a single supervisor lease, checks Agy 1.5.10, creates a session-only policy file, persists the PID before sending the prompt, records a public conversation ID as soon as the `init` event arrives, and moves success only to `reviewing`.
 
 ## Verification evidence
 
@@ -143,7 +143,7 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - A process-group probe is liveness evidence only. It does not identify the Writer or detect escaped descendants; with no saved PID, the stopped-Writer attestation is entirely operator-provided. The audit actor is recorded as the generic role `operator`.
 - The CLI application checks process-group liveness before resolution; the lower-level database method assumes its caller has performed that probe. Keep resolution behind the checked application path. Resolution immediately sets task status (`reviewing`, `queued`, or `failed`) while preserving the attempt as `unknown`; `authorize-retry` only prepares a later explicit Writer command.
 - No literal PID-reuse event or actual post-spawn/pre-PID crash was forced. Tests cover equivalent persisted states and fail-closed behavior. A hard TALOS crash may leave the 35-minute supervisor lease active until expiry.
-- Independent Critic review, automated project checks, evidence-gated completion, background workers, Semi approval, Linux verification, and packaging remain later rounds.
+- Independent Critic review is implemented in R4. Automated project checks, evidence-gated completion, background workers, Semi approval, Linux verification, and packaging remain later rounds.
 - User-approved direction for R4/R7: select Writer and independent Critic CLIs separately from verified adapters; the later concurrency acceptance includes one Writer, one Critic, and at least one additional scoped agent. This is not implemented in R3.
 - TALOS currently relies on each Git project to ignore `.talos/`; `up --auto` rejects a dirty worktree, but `task add` may leave runtime files visible as untracked until the project adds an ignore rule. T5.7 tracks exclusion handling.
 - An independent read-only review flagged a narrow numeric PGID reuse window in the process-runner's cleanup signal path. It did not identify a confirmed T3.6 resolution defect. T6.3 now tracks a focused review/fix; until resolved, do not claim OS-verified process identity.
@@ -153,13 +153,43 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - A local Git repository is initialized on the `master` branch. Initial snapshot commit: `76fa40d` (`chore: initialize local project history`). The project remains local; no remote is configured, and no push or publication is planned until the user creates a hosted repository.
 - The staged snapshot contained 38 project files; `.gitignore` excluded `.DS_Store` and `target/`. `git diff --cached --check` passed. One redundant blank line at the end of `Cargo.toml` was removed before the initial commit. No Rust tests or builds were run for this repository/documentation setup batch.
 - Product history follow-up is recorded as unscheduled idea F1, to revisit after R9. The current database stores task metadata and lifecycle events plus Writer-attempt metadata; it does not persist a separate project plan, project-creation history, or full Writer transcript.
-- No `.talos/` runtime state was created in the TALOS workspace. Smoke databases are isolated under `/private/tmp`.
+- Earlier smoke databases were isolated under `/private/tmp`; the R4 runtime database in this workspace is now documented below.
+- `.talos/state.sqlite3` now exists locally from R4 smoke use; it contains no queued tasks. Two accidental harness tasks were removed after a SQLite backup was made to `/private/tmp/talos-r4-db-before-cleanup.sqlite3`. The workspace database remains ignored by Git.
 - TALOS-driven Antigravity runs happened only in disposable projects. No external AI CLI has written to the TALOS source tree. There is no background worker or tmux session; `up --auto` is one-shot and `up --semi` is not implemented.
 - The original Agent Starter Kit and pair-mailbox repositories remain untouched.
 
+## R4 closure acceptance — 2026-11-17
+
+### Implemented
+
+- Added `src/revision.rs` to capture the original Git base, complete tracked/untracked diff, sorted changed paths, and `sha256:` revision ID. `.git/` and `.talos/` are excluded; patches over 64 KiB fail without truncation.
+- Added `src/review.rs` for the bounded JSON request/response contract. The review prompt is capped at 96 KiB and response at 64 KiB. Invalid, stale, mismatched, oversized, or failed reviews never approve.
+- Added `.talos/config.json` role configuration. Writer and Critic roles default to Agy; unsupported/unverified adapters are rejected and `doctor` reports the selections.
+- Added schema v4 with Writer base revisions and immutable Critic review history. A rejection starts a linked Writer iteration against the same base; approval transitions to `verifying`, not `complete`.
+- Added `talos task review <ID>` and an isolated Antigravity 1.5.10 Critic policy that allows project reads but denies file writes, commands, MCP/URL tools, and reads of `.talos/`/`.git/`.
+- Added unscheduled F2 to explore typed agent handoffs and controlled-language ideas after R9. It is not an accepted feature and makes no assumption about a Russian profile.
+
+### Verification results
+
+- `cargo fmt --all && ./scripts/verify-project.sh` — passed the full active profile: format, Clippy with `-D warnings`, **79 passed / 1 ignored**, macOS ARM64 release build, and `security-scan: clean`.
+- macOS `xcrun` printed non-fatal cache-file permission warnings during Git/test/release build steps; every profile command exited successfully.
+- Live `task review --json` in a disposable Git project — Antigravity 1.5.10 returned a valid approval for the exact diff; task moved to `verifying`; `verification_ran` was false.
+- Live deliberate-defect review — Critic found that `parse_count("")` returned an error instead of `Ok(0)`, reported a blocker, and moved the task to `implementing`.
+- Fake Writer fix run — attempt 2 succeeded, linked to review 1, retained the initial base commit, and moved the task to `reviewing`.
+- Live negative write probe — Agy called `write_file`; the session policy returned `Permission denied` matching the deny rule; the requested marker was absent.
+- One database test covers rejection → linked fix → later approval and verifies review immutability. Another confirms an active Writer for another task blocks Critic review.
+- Normal sandbox did not allow Agy's local runtime needs; the successful live Critic and boundary probes ran with host access in disposable directories. No TALOS source files were passed to an external Writer. Probe token usage is not stored in the project database.
+- Linux-native build/runtime/sandbox checks remain unverified and deferred to the user's server.
+
+### Repository and next action
+
+- Local Git remains on `master`; no remote is configured yet. The connected GitHub account is `AVP-Dev`; its connector does not expose repository creation, so use the authenticated browser UI to create the explicitly authorized private repo, then push local history. Leave topics unset because their names are public even for private repositories.
+- Local `.talos/state.sqlite3` has no queued tasks. It remains ignored; an offline backup of the test DB is in `/private/tmp` until temporary probe cleanup.
+- Next task: **T5.1 — acceptance criteria and project-check evidence.** The user has asked to continue sequentially through later rounds in this same session. Start R5 after the R4 verification profile passes and its local commit is recorded.
+
 ## Next action
 
-Next task: **T4.1 — define the independent Critic input/output contract and revision identity.** R3 remains closed. Implement Linux-specific code as its planned tasks are reached; defer Linux-native acceptance checks to the user's server if local setup would slow macOS development. Do not add Docker/VM infrastructure.
+Inspect the full R4 diff, commit it locally on `master`, create the authorized private GitHub repository, set its default branch to `master`, and push the local history. Then begin T5.1 as explicitly requested. Linux-native validation remains for the user's server.
 
 ## Session close checklist
 

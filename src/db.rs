@@ -10,7 +10,7 @@ use serde::Serialize;
 
 use crate::project::Project;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 4;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -78,6 +78,35 @@ pub struct WriterAttemptRecord {
     pub resolved_at_ms: Option<i64>,
     pub resolution_reason: Option<String>,
     pub source_attempt_id: Option<i64>,
+    pub base_revision: Option<String>,
+    pub source_review_id: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct CriticReviewRecord {
+    pub id: i64,
+    pub task_id: i64,
+    pub writer_attempt_id: i64,
+    pub base_revision: String,
+    pub revision_id: String,
+    pub decision: String,
+    pub summary: String,
+    pub result_json: String,
+    pub adapter: String,
+    pub adapter_version: String,
+    pub created_at_ms: i64,
+}
+
+pub struct CriticReviewInput<'a> {
+    pub task_id: i64,
+    pub writer_attempt_id: i64,
+    pub base_revision: &'a str,
+    pub revision_id: &'a str,
+    pub decision: &'a str,
+    pub summary: &'a str,
+    pub result_json: &'a str,
+    pub adapter: &'a str,
+    pub adapter_version: &'a str,
 }
 
 type WriterFinalizationState = (
@@ -86,6 +115,8 @@ type WriterFinalizationState = (
     String,
     Option<i64>,
     i64,
+    Option<String>,
+    Option<i64>,
     Option<String>,
     Option<i64>,
 );
@@ -403,9 +434,31 @@ impl Database {
         let Some(current_status) = current_status else {
             bail!("Task #{task_id} does not exist");
         };
-        if current_status != TaskStatus::Queued.as_str() {
-            bail!("Task #{task_id} must be queued before a Writer attempt can start");
-        }
+        let revision_source = if current_status == TaskStatus::Implementing.as_str() {
+            let latest_review: Option<(i64, String, String)> = transaction
+                .query_row(
+                    "SELECT id, base_revision, decision FROM critic_reviews
+                     WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+                    [task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((review_id, base_revision, decision)) = latest_review else {
+                bail!(
+                    "Task #{task_id} is implementing without a prior Critic review; a Writer revision is not eligible"
+                );
+            };
+            if decision != "request_changes" {
+                bail!("Task #{task_id} has no latest Critic review requesting changes");
+            }
+            Some((review_id, base_revision))
+        } else if current_status == TaskStatus::Queued.as_str() {
+            None
+        } else {
+            bail!(
+                "Task #{task_id} must be queued or awaiting Writer fixes after a Critic rejection"
+            );
+        };
         let unresolved: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM writer_attempts WHERE task_id = ?1
              AND (state IN ('launching', 'running') OR (state = 'unknown' AND operator_resolution IS NULL))",
@@ -427,22 +480,31 @@ impl Database {
             bail!("An unresolved Writer attempt exists for this project");
         }
 
-        let changed = transaction.execute(
-            "UPDATE tasks SET status = 'implementing', updated_at_ms = ?1 WHERE id = ?2 AND status = 'queued'",
-            params![now, task_id],
-        )?;
-        if changed != 1 {
-            bail!("Task #{task_id} changed while its Writer attempt was being created");
+        if current_status == TaskStatus::Queued.as_str() {
+            let changed = transaction.execute(
+                "UPDATE tasks SET status = 'implementing', updated_at_ms = ?1 WHERE id = ?2 AND status = 'queued'",
+                params![now, task_id],
+            )?;
+            if changed != 1 {
+                bail!("Task #{task_id} changed while its Writer attempt was being created");
+            }
+            transaction.execute(
+                "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+                 VALUES (?1, ?2, 'talos', 'task.status_changed', 'Writer attempt claimed the queued task', ?3)",
+                params![task_id, now, r#"{"from":"queued","to":"implementing"}"#],
+            )?;
         }
         transaction.execute(
-            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
-             VALUES (?1, ?2, 'talos', 'task.status_changed', 'Writer attempt claimed the queued task', ?3)",
-            params![task_id, now, r#"{"from":"queued","to":"implementing"}"#],
-        )?;
-        transaction.execute(
-            "INSERT INTO writer_attempts (task_id, state, started_at_ms, prompt_sha256)
-             VALUES (?1, 'launching', ?2, ?3)",
-            params![task_id, now, prompt_sha256.to_ascii_lowercase()],
+            "INSERT INTO writer_attempts
+                 (task_id, state, started_at_ms, prompt_sha256, base_revision, source_review_id)
+             VALUES (?1, 'launching', ?2, ?3, ?4, ?5)",
+            params![
+                task_id,
+                now,
+                prompt_sha256.to_ascii_lowercase(),
+                revision_source.as_ref().map(|(_, base)| base.as_str()),
+                revision_source.as_ref().map(|(review_id, _)| *review_id),
+            ],
         )?;
         let attempt_id = transaction.last_insert_rowid();
         let attempt_data = serde_json::to_string(&serde_json::json!({"attempt_id": attempt_id}))?;
@@ -451,6 +513,18 @@ impl Database {
              VALUES (?1, ?2, 'talos', 'writer_attempt.started', 'Writer attempt prepared for launch', ?3)",
             params![task_id, now, attempt_data],
         )?;
+        if let Some((review_id, base_revision)) = &revision_source {
+            let event_data = serde_json::to_string(&serde_json::json!({
+                "attempt_id": attempt_id,
+                "source_review_id": review_id,
+                "base_revision": base_revision,
+            }))?;
+            transaction.execute(
+                "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+                 VALUES (?1, ?2, 'talos', 'writer_attempt.revision_started', 'Writer is addressing findings from the latest Critic review', ?3)",
+                params![task_id, now, event_data],
+            )?;
+        }
         transaction
             .commit()
             .context("Cannot commit Writer attempt creation")?;
@@ -471,7 +545,58 @@ impl Database {
             resolved_at_ms: None,
             resolution_reason: None,
             source_attempt_id: None,
+            base_revision: revision_source.as_ref().map(|(_, base)| base.clone()),
+            source_review_id: revision_source.map(|(review_id, _)| review_id),
         })
+    }
+
+    pub fn record_writer_base_revision(
+        &mut self,
+        attempt_id: i64,
+        base_revision: &str,
+    ) -> Result<()> {
+        validate_git_revision(base_revision)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot start Writer base revision transaction")?;
+        let task_id: Option<i64> = transaction
+            .query_row(
+                "SELECT task_id FROM writer_attempts
+                 WHERE id = ?1 AND state = 'launching' AND base_revision IS NULL",
+                [attempt_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(task_id) = task_id else {
+            bail!(
+                "Writer attempt #{attempt_id} changed before its base revision could be recorded"
+            );
+        };
+        let changed = transaction.execute(
+            "UPDATE writer_attempts SET base_revision = ?1
+             WHERE id = ?2 AND state = 'launching' AND base_revision IS NULL",
+            params![base_revision, attempt_id],
+        )?;
+        if changed != 1 {
+            bail!(
+                "Writer attempt #{attempt_id} changed before its base revision could be recorded"
+            );
+        }
+        let now = now_ms()?;
+        let data = serde_json::to_string(&serde_json::json!({
+            "attempt_id": attempt_id,
+            "base_revision": base_revision,
+        }))?;
+        transaction.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, 'talos', 'writer_attempt.base_captured', 'Writer review base revision was recorded', ?3)",
+            params![task_id, now, data],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot commit Writer base revision")?;
+        Ok(())
     }
 
     pub fn mark_writer_attempt_running(&mut self, attempt_id: i64, process_id: u32) -> Result<()> {
@@ -586,7 +711,8 @@ impl Database {
             .query_row(
                 "SELECT id, task_id, state, process_id, started_at_ms, finished_at_ms,
                         prompt_sha256, conversation_id, exit_code, agent_status, error_code,
-                        operator_resolution, resolved_at_ms, resolution_reason, source_attempt_id
+                        operator_resolution, resolved_at_ms, resolution_reason, source_attempt_id,
+                        base_revision, source_review_id
                  FROM writer_attempts WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
                 [task_id],
                 map_writer_attempt_record,
@@ -638,7 +764,8 @@ impl Database {
             .query_row(
                 "SELECT id, task_id, state, process_id, started_at_ms, finished_at_ms,
                         prompt_sha256, conversation_id, exit_code, agent_status, error_code,
-                        operator_resolution, resolved_at_ms, resolution_reason, source_attempt_id
+                        operator_resolution, resolved_at_ms, resolution_reason, source_attempt_id,
+                        base_revision, source_review_id
                  FROM writer_attempts WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
                 [task_id],
                 map_writer_attempt_record,
@@ -674,14 +801,17 @@ impl Database {
         )?;
         transaction.execute(
             "INSERT INTO writer_attempts
-                 (task_id, state, started_at_ms, prompt_sha256, conversation_id, source_attempt_id)
-             VALUES (?1, 'launching', ?2, ?3, ?4, ?5)",
+                 (task_id, state, started_at_ms, prompt_sha256, conversation_id, source_attempt_id,
+                  base_revision, source_review_id)
+             VALUES (?1, 'launching', ?2, ?3, ?4, ?5, ?6, ?7)",
             params![
                 task_id,
                 now,
                 prompt_sha256.to_ascii_lowercase(),
                 conversation_id,
-                source_attempt_id
+                source_attempt_id,
+                source.base_revision,
+                source.source_review_id,
             ],
         )?;
         let attempt_id = transaction.last_insert_rowid();
@@ -716,6 +846,8 @@ impl Database {
             resolved_at_ms: None,
             resolution_reason: None,
             source_attempt_id: Some(source_attempt_id),
+            base_revision: source.base_revision,
+            source_review_id: source.source_review_id,
         })
     }
 
@@ -747,7 +879,7 @@ impl Database {
         let current: Option<WriterFinalizationState> = transaction
             .query_row(
                 "SELECT task_id, state, prompt_sha256, process_id, started_at_ms, conversation_id,
-                        source_attempt_id
+                        source_attempt_id, base_revision, source_review_id
                  FROM writer_attempts WHERE id = ?1",
                 [attempt_id],
                 |row| {
@@ -759,6 +891,8 @@ impl Database {
                         row.get(4)?,
                         row.get(5)?,
                         row.get(6)?,
+                        row.get(7)?,
+                        row.get(8)?,
                     ))
                 },
             )
@@ -771,6 +905,8 @@ impl Database {
             started_at_ms,
             recorded_conversation_id,
             source_attempt_id,
+            base_revision,
+            source_review_id,
         )) = current
         else {
             bail!("Writer attempt #{attempt_id} does not exist");
@@ -876,6 +1012,8 @@ impl Database {
             resolved_at_ms: None,
             resolution_reason: None,
             source_attempt_id,
+            base_revision,
+            source_review_id,
         })
     }
 
@@ -1106,13 +1244,193 @@ impl Database {
         let mut statement = self.connection.prepare(
             "SELECT id, task_id, state, process_id, started_at_ms, finished_at_ms,
                     prompt_sha256, conversation_id, exit_code, agent_status, error_code,
-                    operator_resolution, resolved_at_ms, resolution_reason, source_attempt_id
+                    operator_resolution, resolved_at_ms, resolution_reason, source_attempt_id,
+                    base_revision, source_review_id
              FROM writer_attempts WHERE (?1 IS NULL OR task_id = ?1) ORDER BY id",
         )?;
         let attempts = statement
             .query_map([task_id], map_writer_attempt_record)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(attempts)
+    }
+
+    pub fn latest_critic_review(&self, task_id: i64) -> Result<Option<CriticReviewRecord>> {
+        let review = self
+            .connection
+            .query_row(
+                "SELECT id, task_id, writer_attempt_id, base_revision, revision_id, decision,
+                        summary, result_json, adapter, adapter_version, created_at_ms
+                 FROM critic_reviews WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+                [task_id],
+                map_critic_review_record,
+            )
+            .optional()?;
+        Ok(review)
+    }
+
+    pub fn record_critic_review(
+        &mut self,
+        input: CriticReviewInput<'_>,
+    ) -> Result<CriticReviewRecord> {
+        let CriticReviewInput {
+            task_id,
+            writer_attempt_id,
+            base_revision,
+            revision_id,
+            decision,
+            summary,
+            result_json,
+            adapter,
+            adapter_version,
+        } = input;
+        validate_git_revision(base_revision)?;
+        validate_review_revision_id(revision_id)?;
+        if decision != "approve" && decision != "request_changes" {
+            bail!("Critic decision must be approve or request_changes");
+        }
+        validate_record_text("Critic summary", summary, 16_000)?;
+        validate_record_text("Critic result", result_json, 256_000)?;
+        validate_record_text("Critic adapter", adapter, 80)?;
+        validate_record_text("Critic adapter version", adapter_version, 80)?;
+        serde_json::from_str::<serde_json::Value>(result_json)
+            .context("Critic result must be valid JSON")?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot start Critic review transaction")?;
+        let now = now_ms()?;
+        let task_status: Option<String> = transaction
+            .query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(task_status) = task_status else {
+            bail!("Task #{task_id} does not exist");
+        };
+        if task_status != TaskStatus::Reviewing.as_str() {
+            bail!("Task #{task_id} is not eligible for Critic review");
+        }
+
+        let unresolved: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM writer_attempts
+             WHERE state IN ('launching', 'running')
+                OR (state = 'unknown' AND operator_resolution IS NULL)",
+            [],
+            |row| row.get(0),
+        )?;
+        if unresolved != 0 {
+            bail!("A Writer attempt is active or unresolved; the Critic cannot approve this task");
+        }
+
+        let writer: Option<(String, Option<String>)> = transaction
+            .query_row(
+                "SELECT state, base_revision FROM writer_attempts
+                 WHERE id = ?1 AND task_id = ?2",
+                params![writer_attempt_id, task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((writer_state, writer_base)) = writer else {
+            bail!("Writer attempt #{writer_attempt_id} does not belong to task #{task_id}");
+        };
+        if writer_state != "succeeded" || writer_base.as_deref() != Some(base_revision) {
+            bail!(
+                "Critic review must target a successful Writer attempt with the same base revision"
+            );
+        }
+        let latest_attempt_id: Option<i64> = transaction
+            .query_row(
+                "SELECT id FROM writer_attempts WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if latest_attempt_id != Some(writer_attempt_id) {
+            bail!("Critic review must target the latest Writer attempt");
+        }
+
+        transaction.execute(
+            "INSERT INTO critic_reviews
+                 (task_id, writer_attempt_id, base_revision, revision_id, decision, summary,
+                  result_json, adapter, adapter_version, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+            params![
+                task_id,
+                writer_attempt_id,
+                base_revision,
+                revision_id,
+                decision,
+                summary,
+                result_json,
+                adapter,
+                adapter_version,
+                now,
+            ],
+        )?;
+        let review_id = transaction.last_insert_rowid();
+        let target_status = if decision == "approve" {
+            TaskStatus::Verifying
+        } else {
+            TaskStatus::Implementing
+        };
+        let reason = if decision == "approve" {
+            "Independent Critic approved this revision; project verification is still required"
+        } else {
+            "Independent Critic requested changes to this revision"
+        };
+        if task_status != target_status.as_str() {
+            let changed = transaction.execute(
+                "UPDATE tasks SET status = ?1, updated_at_ms = ?2 WHERE id = ?3 AND status = ?4",
+                params![target_status.as_str(), now, task_id, task_status],
+            )?;
+            if changed != 1 {
+                bail!("Task #{task_id} changed while the Critic review was being recorded");
+            }
+            let transition_data = serde_json::to_string(&serde_json::json!({
+                "from": task_status,
+                "to": target_status.as_str(),
+                "review_id": review_id,
+                "writer_attempt_id": writer_attempt_id,
+                "revision_id": revision_id,
+            }))?;
+            transaction.execute(
+                "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+                 VALUES (?1, ?2, 'talos', 'task.status_changed', ?3, ?4)",
+                params![task_id, now, reason, transition_data],
+            )?;
+        }
+        let review_data = serde_json::to_string(&serde_json::json!({
+            "review_id": review_id,
+            "writer_attempt_id": writer_attempt_id,
+            "base_revision": base_revision,
+            "revision_id": revision_id,
+            "decision": decision,
+            "adapter": adapter,
+            "adapter_version": adapter_version,
+        }))?;
+        transaction.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, 'talos', 'critic_review.recorded', ?3, ?4)",
+            params![task_id, now, reason, review_data],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot commit Critic review")?;
+
+        Ok(CriticReviewRecord {
+            id: review_id,
+            task_id,
+            writer_attempt_id,
+            base_revision: base_revision.to_owned(),
+            revision_id: revision_id.to_owned(),
+            decision: decision.to_owned(),
+            summary: summary.to_owned(),
+            result_json: result_json.to_owned(),
+            adapter: adapter.to_owned(),
+            adapter_version: adapter_version.to_owned(),
+            created_at_ms: now,
+        })
     }
 
     pub fn queue_summary(&self) -> Result<QueueSummary> {
@@ -1343,6 +1661,39 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .context("Cannot migrate Writer recovery and continuation schema")?;
         migrated_version = 3;
     }
+    if migrated_version == 3 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE critic_reviews (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+                     writer_attempt_id INTEGER NOT NULL REFERENCES writer_attempts(id) ON DELETE RESTRICT,
+                     base_revision TEXT NOT NULL,
+                     revision_id TEXT NOT NULL CHECK(length(revision_id) = 71),
+                     decision TEXT NOT NULL CHECK(decision IN ('approve', 'request_changes')),
+                     summary TEXT NOT NULL,
+                     result_json TEXT NOT NULL,
+                     adapter TEXT NOT NULL,
+                     adapter_version TEXT NOT NULL,
+                     created_at_ms INTEGER NOT NULL
+                 );
+                 CREATE INDEX critic_reviews_task_id_id ON critic_reviews(task_id, id);
+                 CREATE TRIGGER critic_reviews_no_update
+                     BEFORE UPDATE ON critic_reviews BEGIN
+                         SELECT RAISE(ABORT, 'critic reviews are immutable');
+                     END;
+                 CREATE TRIGGER critic_reviews_no_delete
+                     BEFORE DELETE ON critic_reviews BEGIN
+                         SELECT RAISE(ABORT, 'critic reviews are immutable');
+                     END;
+                 ALTER TABLE writer_attempts ADD COLUMN base_revision TEXT;
+                 ALTER TABLE writer_attempts ADD COLUMN source_review_id INTEGER
+                     REFERENCES critic_reviews(id) ON DELETE RESTRICT;
+                 PRAGMA user_version = 4;",
+            )
+            .context("Cannot create Critic review schema")?;
+        migrated_version = 4;
+    }
     if migrated_version != SCHEMA_VERSION {
         bail!("Cannot migrate database from unsupported schema version {migrated_version}");
     }
@@ -1438,7 +1789,55 @@ fn map_writer_attempt_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Writer
         resolved_at_ms: row.get(12)?,
         resolution_reason: row.get(13)?,
         source_attempt_id: row.get(14)?,
+        base_revision: row.get(15)?,
+        source_review_id: row.get(16)?,
     })
+}
+
+fn map_critic_review_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CriticReviewRecord> {
+    Ok(CriticReviewRecord {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        writer_attempt_id: row.get(2)?,
+        base_revision: row.get(3)?,
+        revision_id: row.get(4)?,
+        decision: row.get(5)?,
+        summary: row.get(6)?,
+        result_json: row.get(7)?,
+        adapter: row.get(8)?,
+        adapter_version: row.get(9)?,
+        created_at_ms: row.get(10)?,
+    })
+}
+
+fn validate_git_revision(value: &str) -> Result<()> {
+    if !matches!(value.len(), 40 | 64)
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("Git revision must be a full hexadecimal object ID");
+    }
+    Ok(())
+}
+
+fn validate_review_revision_id(value: &str) -> Result<()> {
+    if let Some(digest) = value.strip_prefix("sha256:")
+        && digest.len() == 64
+        && digest
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        return Ok(());
+    }
+    bail!("Critic revision ID must use sha256:<64 lowercase hex characters>");
+}
+
+fn validate_record_text(label: &str, value: &str, maximum_bytes: usize) -> Result<()> {
+    if value.trim().is_empty() || value.len() > maximum_bytes {
+        bail!("{label} must be non-empty and at most {maximum_bytes} bytes");
+    }
+    Ok(())
 }
 
 fn validate_optional_text(label: &str, value: Option<&str>, maximum_bytes: usize) -> Result<()> {
@@ -1583,7 +1982,9 @@ mod tests {
 
     use rusqlite::OptionalExtension;
 
-    use super::{Database, TaskStatus, WriterAttemptOutcome, WriterResolutionAction};
+    use super::{
+        CriticReviewInput, Database, TaskStatus, WriterAttemptOutcome, WriterResolutionAction,
+    };
     use crate::project::{DiscoveryMethod, Project};
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
@@ -1615,7 +2016,7 @@ mod tests {
     fn initialization_is_idempotent_and_uses_wal() {
         let project = temp_project();
         let first = Database::open(&project).expect("initialize database");
-        assert_eq!(first.schema_version().expect("read schema version"), 3);
+        assert_eq!(first.schema_version().expect("read schema version"), 4);
         assert_eq!(
             first
                 .journal_mode()
@@ -1626,7 +2027,7 @@ mod tests {
         drop(first);
 
         let second = Database::open(&project).expect("open database again");
-        assert_eq!(second.schema_version().expect("read schema version"), 3);
+        assert_eq!(second.schema_version().expect("read schema version"), 4);
         drop(second);
         cleanup(&project);
     }
@@ -1656,7 +2057,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_migrates_to_v3_without_losing_tasks() {
+    fn schema_v1_migrates_to_v4_without_losing_tasks() {
         let project = temp_project();
         project
             .ensure_runtime_dir()
@@ -1698,7 +2099,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate existing database");
-        assert_eq!(database.schema_version().expect("read schema version"), 3);
+        assert_eq!(database.schema_version().expect("read schema version"), 4);
         let tasks = database.list_tasks().expect("read preserved tasks");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Existing v1 task");
@@ -1711,6 +2112,199 @@ mod tests {
             )
             .expect("check migrated table");
         assert!(has_attempts_table);
+        cleanup(&project);
+    }
+
+    #[test]
+    fn critic_rejection_allows_a_linked_fix_and_keeps_both_reviews_immutable() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("initialize database");
+        let task = database
+            .add_task("Implement the requested behavior", "It handles empty input")
+            .expect("add task");
+        let base = "12".repeat(20);
+        let first = database
+            .begin_writer_attempt(task.id, &"ab".repeat(32))
+            .expect("start first Writer attempt");
+        database
+            .record_writer_base_revision(first.id, &base)
+            .expect("record immutable task base");
+        database
+            .finish_writer_attempt(
+                first.id,
+                WriterAttemptOutcome::Succeeded,
+                None,
+                Some(0),
+                Some("SUCCESS"),
+                None,
+            )
+            .expect("finish initial Writer attempt");
+
+        let rejected = database
+            .record_critic_review(CriticReviewInput {
+                task_id: task.id,
+                writer_attempt_id: first.id,
+                base_revision: &base,
+                revision_id: &format!("sha256:{}", "a".repeat(64)),
+                decision: "request_changes",
+                summary: "Empty input is still rejected.",
+                result_json: r#"{"decision":"request_changes"}"#,
+                adapter: "agy",
+                adapter_version: "1.5.10",
+            })
+            .expect("record Critic rejection");
+        assert_eq!(
+            database.list_tasks().expect("task after rejection")[0].status,
+            TaskStatus::Implementing
+        );
+        let duplicate_review = database.record_critic_review(CriticReviewInput {
+            task_id: task.id,
+            writer_attempt_id: first.id,
+            base_revision: &base,
+            revision_id: &format!("sha256:{}", "c".repeat(64)),
+            decision: "approve",
+            summary: "A duplicate review cannot skip the Writer fix.",
+            result_json: r#"{"decision":"approve"}"#,
+            adapter: "agy",
+            adapter_version: "1.5.10",
+        });
+        assert!(duplicate_review.is_err());
+        assert_eq!(
+            database
+                .latest_critic_review(task.id)
+                .expect("read latest review")
+                .expect("rejection remains latest")
+                .id,
+            rejected.id
+        );
+
+        let fix = database
+            .begin_writer_attempt(task.id, &"cd".repeat(32))
+            .expect("start the requested fix iteration");
+        assert_eq!(fix.source_review_id, Some(rejected.id));
+        assert_eq!(fix.base_revision.as_deref(), Some(base.as_str()));
+        database
+            .finish_writer_attempt(
+                fix.id,
+                WriterAttemptOutcome::Succeeded,
+                None,
+                Some(0),
+                Some("SUCCESS"),
+                None,
+            )
+            .expect("finish fix Writer attempt");
+        let approved = database
+            .record_critic_review(CriticReviewInput {
+                task_id: task.id,
+                writer_attempt_id: fix.id,
+                base_revision: &base,
+                revision_id: &format!("sha256:{}", "b".repeat(64)),
+                decision: "approve",
+                summary: "The revised change meets the stated criterion.",
+                result_json: r#"{"decision":"approve"}"#,
+                adapter: "agy",
+                adapter_version: "1.5.10",
+            })
+            .expect("record review of fixed revision");
+        assert_eq!(
+            database.list_tasks().expect("task after approval")[0].status,
+            TaskStatus::Verifying
+        );
+        assert_eq!(
+            database
+                .latest_critic_review(task.id)
+                .expect("load latest review")
+                .expect("latest review exists"),
+            approved
+        );
+        let review_count: i64 = database
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FROM critic_reviews WHERE task_id = ?1",
+                [task.id],
+                |row| row.get(0),
+            )
+            .expect("count preserved reviews");
+        assert_eq!(review_count, 2);
+        assert!(
+            database
+                .connection
+                .execute(
+                    "UPDATE critic_reviews SET summary = 'rewritten' WHERE id = ?1",
+                    [rejected.id],
+                )
+                .is_err()
+        );
+        assert!(
+            database
+                .connection
+                .execute("DELETE FROM critic_reviews WHERE id = ?1", [rejected.id],)
+                .is_err()
+        );
+        cleanup(&project);
+    }
+
+    #[test]
+    fn active_writer_attempt_blocks_critic_approval_for_another_task() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("initialize database");
+        let review_task = database
+            .add_task(
+                "Prepare a reviewable change",
+                "The change meets its criteria",
+            )
+            .expect("add review task");
+        let base = "23".repeat(20);
+        let writer = database
+            .begin_writer_attempt(review_task.id, &"ab".repeat(32))
+            .expect("start review task Writer");
+        database
+            .record_writer_base_revision(writer.id, &base)
+            .expect("record review task base");
+        database
+            .finish_writer_attempt(
+                writer.id,
+                WriterAttemptOutcome::Succeeded,
+                None,
+                Some(0),
+                Some("SUCCESS"),
+                None,
+            )
+            .expect("finish review task Writer");
+        let other_task = database
+            .add_task("Keep one Writer active", "")
+            .expect("add unrelated task");
+        let active = database
+            .begin_writer_attempt(other_task.id, &"cd".repeat(32))
+            .expect("start unrelated Writer");
+
+        let result = database.record_critic_review(CriticReviewInput {
+            task_id: review_task.id,
+            writer_attempt_id: writer.id,
+            base_revision: &base,
+            revision_id: &format!("sha256:{}", "c".repeat(64)),
+            decision: "approve",
+            summary: "The change meets the criteria.",
+            result_json: r#"{"decision":"approve"}"#,
+            adapter: "agy",
+            adapter_version: "1.5.10",
+        });
+        assert!(result.is_err());
+        assert!(
+            database
+                .latest_critic_review(review_task.id)
+                .expect("read review history")
+                .is_none()
+        );
+        assert_eq!(
+            database
+                .writer_attempts(Some(other_task.id))
+                .expect("read active Writer")
+                .last()
+                .expect("active attempt")
+                .id,
+            active.id
+        );
         cleanup(&project);
     }
 
@@ -1777,7 +2371,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate v2 database");
-        assert_eq!(database.schema_version().expect("read schema version"), 3);
+        assert_eq!(database.schema_version().expect("read schema version"), 4);
         assert!(
             database
                 .has_unresolved_writer_attempts()

@@ -11,14 +11,15 @@ use serde_json::json;
 use crate::{
     adapter::agy::AgyProbe,
     cli::{Cli, Command, ResolveAction, TaskCommand},
+    config::{AdapterKind, AgentRole, ProjectConfig},
     db::{
         Database, QueueSummary, TaskEvent, TaskRecord, WriterResolutionAction,
         WriterResolutionRecord,
     },
     project::{DiscoveryMethod, Project},
     supervisor::{
-        VERIFIED_AGY_WRITE_VERSION, WriterContinuation, continue_writer_attempt,
-        run_writer_attempt, validate_project_scope,
+        VERIFIED_AGY_CRITIC_VERSION, VERIFIED_AGY_WRITE_VERSION, WriterContinuation,
+        continue_writer_attempt, run_critic_review, run_writer_attempt, validate_project_scope,
     },
 };
 
@@ -43,6 +44,8 @@ struct DoctorReport {
     schema_version: i64,
     journal_mode: String,
     agent_execution: String,
+    writer_adapter: &'static str,
+    critic_adapter: &'static str,
     antigravity: AgyProbe,
     git: &'static str,
 }
@@ -54,7 +57,10 @@ pub async fn run(cli: Cli) -> Result<()> {
     if matches!(
         &cli.command,
         Command::Task(arguments)
-            if matches!(&arguments.command, TaskCommand::Run { .. } | TaskCommand::Continue { .. })
+            if matches!(
+                &arguments.command,
+                TaskCommand::Run { .. } | TaskCommand::Continue { .. } | TaskCommand::Review { .. }
+            )
     ) {
         validate_project_scope(&project)?;
     }
@@ -117,6 +123,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             TaskCommand::Run { task_id } => {
                 run_queued_task(cli.json, &project, &mut database, task_id).await?;
+            }
+            TaskCommand::Review { task_id } => {
+                run_task_review(cli.json, &project, &mut database, task_id).await?;
             }
             TaskCommand::Continue {
                 task_id,
@@ -201,6 +210,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 "no Git root detected; local project discovery is active"
             };
             let antigravity = AgyProbe::inspect(&project.root);
+            let project_config = ProjectConfig::load(&project)?;
             let agent_execution = if antigravity.version.as_deref()
                 == Some(VERIFIED_AGY_WRITE_VERSION)
                 && antigravity.status.as_str() == "available"
@@ -220,6 +230,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 schema_version: database.schema_version()?,
                 journal_mode: database.journal_mode()?,
                 agent_execution,
+                writer_adapter: project_config.adapter_for(AgentRole::Writer).as_str(),
+                critic_adapter: project_config.adapter_for(AgentRole::Critic).as_str(),
                 antigravity,
                 git,
             };
@@ -235,6 +247,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 println!("Journal mode: {}", report.journal_mode.to_uppercase());
                 println!("Git: {}", report.git);
                 println!("Agent execution: {}", report.agent_execution);
+                println!("Writer adapter: {}", report.writer_adapter);
+                println!("Critic adapter: {}", report.critic_adapter);
                 println!("Antigravity CLI: {}", report.antigravity.status.as_str());
                 if let Some(executable) = &report.antigravity.executable {
                     println!("  Executable: {}", executable.display());
@@ -335,6 +349,71 @@ async fn continue_task(
     ensure_writer_succeeded(&report)
 }
 
+async fn run_task_review(
+    json_output: bool,
+    project: &Project,
+    database: &mut Database,
+    task_id: i64,
+) -> Result<()> {
+    let report = execute_critic_review(project, database, task_id).await?;
+    print_critic_report(json_output, &report)?;
+    Ok(())
+}
+
+async fn execute_critic_review(
+    project: &Project,
+    database: &mut Database,
+    task_id: i64,
+) -> Result<crate::supervisor::CriticReviewReport> {
+    let config = ProjectConfig::load(project)?;
+    match config.adapter_for(AgentRole::Critic) {
+        AdapterKind::Agy => {}
+    }
+    let probe = AgyProbe::inspect(&project.root);
+    if probe.status.as_str() != "available" {
+        bail!(
+            "Configured Antigravity Critic is unavailable: {}",
+            probe.note.as_deref().unwrap_or("capability probe failed")
+        );
+    }
+    let version = probe
+        .version
+        .clone()
+        .context("Antigravity did not report a version")?;
+    if version != VERIFIED_AGY_CRITIC_VERSION {
+        bail!(
+            "Critic execution is enabled only for the read-only-boundary-tested Antigravity version {VERIFIED_AGY_CRITIC_VERSION}; found {version}"
+        );
+    }
+    if !has_required_writer_capabilities(&probe) {
+        bail!("Antigravity no longer advertises the required headless, JSON, or sandbox flags");
+    }
+    let executable = probe
+        .executable
+        .context("Antigravity executable path is unavailable")?;
+    let now = now_ms()?;
+    let owner_id = format!("talos-task-review-{task_id}-{}-{now}", std::process::id());
+    let lease_duration_ms = i64::try_from(SUPERVISOR_LEASE.as_millis())
+        .context("Supervisor lease duration is out of range")?;
+    let lease = database
+        .acquire_supervisor_lease(&owner_id, now, lease_duration_ms)?
+        .context("Another TALOS supervisor currently owns the project lease")?;
+    let review = run_critic_review(
+        project,
+        database,
+        task_id,
+        executable,
+        &version,
+        WRITER_TIMEOUT,
+    )
+    .await;
+    let lease_released = database.release_supervisor_lease(&lease)?;
+    if !lease_released {
+        bail!("TALOS lost its supervisor lease while running the Critic");
+    }
+    review
+}
+
 async fn execute_writer_task(
     _json_output: bool,
     project: &Project,
@@ -342,6 +421,10 @@ async fn execute_writer_task(
     task_id: i64,
     continuation: Option<WriterContinuation>,
 ) -> Result<crate::supervisor::WriterExecutionReport> {
+    let config = ProjectConfig::load(project)?;
+    match config.adapter_for(AgentRole::Writer) {
+        AdapterKind::Agy => {}
+    }
     let probe = AgyProbe::inspect(&project.root);
     if probe.status.as_str() != "available" {
         bail!(
@@ -404,6 +487,53 @@ async fn execute_writer_task(
         bail!("TALOS lost its supervisor lease while running the Writer");
     }
     execution
+}
+
+fn print_critic_report(
+    json_output: bool,
+    report: &crate::supervisor::CriticReviewReport,
+) -> Result<()> {
+    let task_status = if report.review.decision == "approve" {
+        "verifying"
+    } else {
+        "implementing"
+    };
+    let output = json!({
+        "task_id": report.review.task_id,
+        "review_id": report.review.id,
+        "writer_attempt_id": report.review.writer_attempt_id,
+        "base_revision": report.review.base_revision,
+        "revision_id": report.review.revision_id,
+        "decision": report.review.decision,
+        "task_status": task_status,
+        "summary": report.review.summary,
+        "findings": report.findings,
+        "verification_ran": false,
+    });
+    if json_output {
+        print_json(&output)?;
+    } else {
+        println!(
+            "Critic review #{} {} for revision {}.",
+            report.review.id, report.review.decision, report.review.revision_id
+        );
+        println!("Task #{} is now {task_status}.", report.review.task_id);
+        println!("{}", report.review.summary);
+        for finding in &report.findings {
+            let line = finding
+                .line
+                .map(|line| format!(":{line}"))
+                .unwrap_or_default();
+            println!(
+                "{:?} {}{} — {}: {}",
+                finding.severity, finding.path, line, finding.title, finding.reason
+            );
+        }
+        if report.review.decision == "approve" {
+            println!("Project verification has not run; the task is not complete.");
+        }
+    }
+    Ok(())
 }
 
 fn print_writer_report(

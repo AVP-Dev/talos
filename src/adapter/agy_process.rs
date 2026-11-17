@@ -101,6 +101,26 @@ pub async fn run<F>(config: AgyRunConfig, mut on_event: F) -> Result<AgyRunResul
 where
     F: FnMut(AgyProcessEvent) -> Result<()>,
 {
+    run_with_mode(config, "accept-edits", &mut on_event).await
+}
+
+/// Run an independent Antigravity turn in plan mode. The caller must also supply a session
+/// policy that denies all writes, commands, and external tools; plan mode alone is not a boundary.
+pub async fn run_read_only<F>(config: AgyRunConfig, mut on_event: F) -> Result<AgyRunResult>
+where
+    F: FnMut(AgyProcessEvent) -> Result<()>,
+{
+    run_with_mode(config, "plan", &mut on_event).await
+}
+
+async fn run_with_mode<F>(
+    config: AgyRunConfig,
+    mode: &'static str,
+    mut on_event: F,
+) -> Result<AgyRunResult>
+where
+    F: FnMut(AgyProcessEvent) -> Result<()>,
+{
     validate_config(&config)?;
 
     let mut command = Command::new(&config.executable);
@@ -110,7 +130,7 @@ where
         .arg("--output-format")
         .arg("stream-json")
         .arg("--mode")
-        .arg("accept-edits")
+        .arg(mode)
         .arg("--sandbox")
         .arg("--disable-slash-commands")
         .arg("--settings")
