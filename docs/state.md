@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R6 — Runtime and resumption is in progress.** T6.1 and T6.2 are complete. T6.3 implementation adds cooperative stop/cancellation, process-group cleanup for project checks, and early stale-lease reclaim when the recorded supervisor PID is absent. T6.4's macOS SSH reconnect scenario and T6.3 behavior/profile verification remain pending. T6.5 implementation adds schema-v9 Linux `/proc` fingerprints and recovery reporting; Linux-native build/runtime/sandbox acceptance is deferred until the user provides server access. R5 and R6.2 pass the local macOS profile. Backlog count: 40 of 61 scheduled tasks done (65.6% by task count, unweighted); two unscheduled ideas are recorded separately.
+**R6 — Runtime and resumption remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. T6.5 implementation adds schema-v9 Linux `/proc` fingerprints and recovery reporting; Linux-native checks are deferred until server access. R7.1 implementation has started while those external acceptance gates remain documented. Backlog count: 40 of 61 scheduled tasks done (65.6% by task count, unweighted); two unscheduled ideas are recorded separately.
 
 ## Goal and fixed direction
 
@@ -249,11 +249,19 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - Writer launch stores the fingerprint when capture succeeds. `task recover` compares saved and current values and reports `matches`, `different_process`, `unavailable`, or `not_recorded`. Recovery events retain the recorded value. This remains lifecycle evidence only and does not change quarantine, stop, resolution, or retry rules.
 - Updated the README, architecture, plan, backlog, and this handoff. The v1–v8 SQLite migrations remain in sequence; schema-v9 migration coverage was added but not executed.
 - `cargo fmt --all && cargo check --all-targets --all-features` passed on macOS after the T6.5 edits. Behavior tests and the schema migration tests were not executed. No Linux host was contacted. R6.4/T6.5 are not complete until the relevant reconnect/server acceptance is observed.
-- T6.3 code and docs are committed locally as `173d736`; T6.5 changes are uncommitted. Branch remains `master`, with no remote.
+- T6.3 code and docs are committed locally as `173d736`; T6.5 code and docs are committed as `098f7b1`. Branch remains `master`, with no remote.
+
+## R7.1 progress — 2026-11-18
+
+- Advanced SQLite to schema v10 with append-only task dependency edges and an index for prerequisite lookup.
+- Added `task depends <TASK> --on <PREREQUISITE>` and `task dependencies <TASK>`. Dependencies are accepted only for queued tasks; self-edges and cycles are refused, and duplicate additions are idempotent.
+- Added a shared runnable-task gate: explicit Writer starts check all prerequisites inside the creation transaction, while `up --auto` selects only queued tasks whose prerequisites are `complete`. Auto reports blocked queued tasks and their prerequisites instead of claiming the queue is empty.
+- Added schema-v9-to-v10 migration coverage. `cargo fmt --all && cargo check --all-targets --all-features` and `git diff --check` passed on macOS. Migration, DAG cycle, eligibility, and command behavior tests have not been run. This R7.1 implementation is not complete until those checks pass.
+- R6.3 and R6.5 code are committed locally as `173d736` and `098f7b1`. R7.1 changes are uncommitted. The repository remains local on `master` with no remote; no Linux host or external service was contacted.
 
 ## Next action
 
-Continue R6 in order. T6.3 behavior/profile checks and T6.4 macOS SSH reconnect remain open. T6.5 code now stores Linux process identity and reports it without changing recovery authority; run the macOS compile check, then defer Linux build/runtime/Agy acceptance until server access. Next is T6.6 (interactive handoff), then continue R7–R9 in order. Keep all work local; the user will create the hosted repository later.
+Finish the R7.1 local compile check, then implement T7.2's bounded child-task contract. R6 acceptance gates remain open: T6.3 behavior/full-profile checks, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6's TUI trust/handoff scenario. No Linux connection or trust-setting change has been made. Continue R7–R9 implementation locally while keeping these checks unclaimed. Keep all work on `master`; the user will create the hosted repository later.
 
 ## Session close checklist
 

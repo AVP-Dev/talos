@@ -86,7 +86,7 @@ Each round ends with a usable, verifiable result, an updated backlog, and a sess
 | R4 | Independent Critic | Read-only review, real blocker finding, denied write probe, linked Writer fix, immutable review history, and per-project role selection. Complete for verified macOS Antigravity 1.5.10. |
 | R5 | Verification and permissions | Configured checks, exact Git facts, Auto/Semi policy, redaction, and evidence-gated completion. Complete on macOS; see R5 acceptance below. |
 | R6 | Persistent runtime and recovery | In progress: T6.1 adds a project-scoped tmux control shell; T6.2 adds durable pause/resume and manual-change reconciliation; T6.3 adds cooperative stop and safer recovery; T6.4 SSH reconnect and T6.5 Linux identity/server acceptance remain open. R6.3 behavior/profile verification is pending. |
-| R7 | Decomposition and parallel work | DAG and subagent tasks, isolated worktrees, leases/concurrency limits, conflict checks, and safe integration. |
+| R7 | Decomposition and parallel work | In progress: T7.1 implements dependency edges and runnable-task filtering; child-task contracts, verified subagent support, worktrees, and bounded integration remain open. |
 | R8 | GitHub workflow | Authorized branch, push and PR, CI monitoring, and report; no automatic merge. |
 | R9 | Hardening and release | Resilience, long-running checks, macOS install/update/uninstall, complete operator documentation, and Linux build/runtime/package acceptance. |
 
@@ -166,6 +166,8 @@ Use tmux for persistent sessions with a visible status and a user control shell.
 ### R7 — Parallel development
 
 Start with a dependency DAG and bounded child tasks. Use native subagents only when that CLI has a documented, verified interface. Parallel file writes require separate Git worktrees and bounded concurrency. Before integration, verify base revision, ownership separation, tests, and merge-conflict status. Record worktree lifecycle; never remove a dirty worktree automatically.
+
+**T7.1 implementation (in progress):** schema v10 stores append-only task dependency edges. A recursive prerequisite walk rejects cycles; dependency edges can only be added while the dependent task is queued. Explicit Writer launch and `up --auto` both require every prerequisite to be `complete`. `task dependencies` displays current prerequisite statuses; Auto reports queued tasks that remain blocked. Migration and behavior checks remain pending.
 
 **Exit criteria:** independent tasks run in parallel without write collisions; dependent tasks wait; duplicate child submission does not create a second worker; real checks run after integration.
 

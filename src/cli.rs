@@ -92,6 +92,19 @@ pub enum TaskCommand {
         #[arg(long = "check", action = clap::ArgAction::Append, required = true)]
         checks: Vec<String>,
     },
+    /// Make a queued task wait for another task to complete.
+    Depends {
+        /// ID of the task that will wait.
+        task_id: i64,
+        /// ID of the prerequisite task.
+        #[arg(long = "on")]
+        prerequisite_task_id: i64,
+    },
+    /// Show the prerequisite tasks and their current states.
+    Dependencies {
+        /// ID of the dependent task.
+        task_id: i64,
+    },
     /// List tasks in the local queue.
     List,
     /// Run one queued task or a Critic-requested fix with the configured Writer.

@@ -106,7 +106,7 @@ Dependency: R5/R6.
 
 | ID | Status | Task | Exit criteria |
 |---|---|---|---|
-| T7.1 | planned | Add task dependencies and DAG scheduler | Cycles are rejected; dependent work waits for prerequisites. |
+| T7.1 | in progress | Add task dependencies and DAG scheduler | Schema v10 adds append-only dependency edges; cycle and self-dependency checks reject invalid graphs. Explicit Writer attempts and `up --auto` select only tasks whose prerequisites are all complete. `task dependencies` reports prerequisite states. Migration, cycle, ordering, and scheduler behavior checks remain pending. |
 | T7.2 | planned | Define bounded child-task contract | Each child has a parent, allowed scope, acceptance criteria, timeout, and report shape. |
 | T7.3 | planned | Detect native subagents per CLI | Missing support disables only that delegation path. |
 | T7.4 | planned | Create/manage task worktrees only when useful | Branch and lifecycle are recorded; dirty worktrees are not auto-deleted. |

@@ -197,6 +197,51 @@ pub async fn run(cli: Cli) -> Result<()> {
                     );
                 }
             }
+            TaskCommand::Depends {
+                task_id,
+                prerequisite_task_id,
+            } => {
+                let dependency_added =
+                    database.add_task_dependency(task_id, prerequisite_task_id)?;
+                if cli.json {
+                    print_json(&json!({
+                        "task_id": task_id,
+                        "prerequisite_task_id": prerequisite_task_id,
+                        "dependency_added": dependency_added,
+                    }))?;
+                } else {
+                    if dependency_added {
+                        println!(
+                            "Task #{task_id} now waits for task #{prerequisite_task_id} to complete."
+                        );
+                    } else {
+                        println!("Task #{task_id} already waits for task #{prerequisite_task_id}.");
+                    }
+                }
+            }
+            TaskCommand::Dependencies { task_id } => {
+                if !database.list_tasks()?.iter().any(|task| task.id == task_id) {
+                    bail!("Task #{task_id} does not exist");
+                }
+                let dependencies = database.task_dependencies(task_id)?;
+                if cli.json {
+                    print_json(&json!({
+                        "task_id": task_id,
+                        "dependencies": dependencies,
+                    }))?;
+                } else if dependencies.is_empty() {
+                    println!("Task #{task_id} has no prerequisite tasks.");
+                } else {
+                    for dependency in dependencies {
+                        println!(
+                            "Task #{} requires task #{} ({}).",
+                            dependency.task_id,
+                            dependency.prerequisite_task_id,
+                            dependency.prerequisite_status.as_str(),
+                        );
+                    }
+                }
+            }
             TaskCommand::List => {
                 let tasks = database.list_tasks()?;
                 if cli.json {
@@ -1135,18 +1180,44 @@ async fn run_one_shot_auto(
         bail!("`up --auto` requires a Git project so TALOS can report actual changed files");
     }
     validate_project_scope(project)?;
-    let task = database
+    let queued_tasks = database
         .list_tasks()?
         .into_iter()
-        .find(|task| task.status == crate::db::TaskStatus::Queued);
+        .filter(|task| task.status == crate::db::TaskStatus::Queued)
+        .collect::<Vec<_>>();
+    let task = database.runnable_queued_tasks()?.into_iter().next();
     let Some(task) = task else {
+        let waiting_tasks = database.queued_tasks_waiting_on_dependencies()?;
         if json_output {
             print_json(&json!({
                 "mode": "auto",
-                "result": "no_queued_tasks",
+                "result": if queued_tasks.is_empty() {
+                    "no_queued_tasks"
+                } else {
+                    "waiting_on_dependencies"
+                },
+                "waiting_tasks": waiting_tasks
+                    .iter()
+                    .map(|(task_id, prerequisites)| json!({
+                        "task_id": task_id,
+                        "prerequisite_task_ids": prerequisites,
+                    }))
+                    .collect::<Vec<_>>(),
                 "writer_launched": false,
                 "automatic_retry": false,
             }))?;
+        } else if !waiting_tasks.is_empty() {
+            println!("No queued task is ready; prerequisite tasks are still open:");
+            for (task_id, prerequisites) in waiting_tasks {
+                println!(
+                    "  Task #{task_id} waits for {}.",
+                    prerequisites
+                        .iter()
+                        .map(|id| format!("#{id}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
         } else {
             println!("No queued tasks; no Writer was started.");
         }
@@ -1182,17 +1253,43 @@ async fn run_one_shot_semi(
         bail!("`up --semi` requires a Git project so TALOS can report actual changed files");
     }
     validate_project_scope(project)?;
-    let task = database
+    let queued_tasks = database
         .list_tasks()?
         .into_iter()
-        .find(|task| task.status == crate::db::TaskStatus::Queued);
+        .filter(|task| task.status == crate::db::TaskStatus::Queued)
+        .collect::<Vec<_>>();
+    let task = database.runnable_queued_tasks()?.into_iter().next();
     let Some(task) = task else {
+        let waiting_tasks = database.queued_tasks_waiting_on_dependencies()?;
         if json_output {
             print_json(&json!({
                 "mode": "semi",
-                "result": "no_queued_tasks",
+                "result": if queued_tasks.is_empty() {
+                    "no_queued_tasks"
+                } else {
+                    "waiting_on_dependencies"
+                },
+                "waiting_tasks": waiting_tasks
+                    .iter()
+                    .map(|(task_id, prerequisites)| json!({
+                        "task_id": task_id,
+                        "prerequisite_task_ids": prerequisites,
+                    }))
+                    .collect::<Vec<_>>(),
                 "writer_launched": false,
             }))?;
+        } else if !waiting_tasks.is_empty() {
+            println!("No queued task is ready; prerequisite tasks are still open:");
+            for (task_id, prerequisites) in waiting_tasks {
+                println!(
+                    "  Task #{task_id} waits for {}.",
+                    prerequisites
+                        .iter()
+                        .map(|id| format!("#{id}"))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                );
+            }
         } else {
             println!("No queued tasks; no Writer was started.");
         }

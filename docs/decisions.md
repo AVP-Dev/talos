@@ -234,3 +234,10 @@ No schema change for process identity is selected or implemented. The separate s
 - **Decision:** on Linux, capture `/proc/<pid>/stat` process-group and start-time fields plus `/proc/sys/kernel/random/boot_id` when the Writer starts. Persist the versioned fingerprint in the attempt row. During `task recover`, compare the saved fingerprint with current procfs data and report a match, different process, unavailable identity, or missing record. On platforms without a supported public collector, report unavailable.
 - **Reason:** after PID reuse, operators need to know whether a recorded numeric PID still describes the same process, while preserving the rule that process identity cannot establish what the Writer did to project files.
 - **Consequence:** identity comparison is diagnostic only. It does not permit TALOS to signal, resume, retry, accept, abandon, or resolve an attempt; unresolved work still requires process/project inspection and explicit operator attestations. Linux support remains unverified until native server acceptance passes.
+
+## ADR-029 — Schedule tasks from an append-only dependency DAG
+
+- **Status:** implemented in T7.1; behavior/migration verification pending.
+- **Decision:** persist task-to-prerequisite edges in SQLite. Reject self-dependencies and any edge that closes a cycle. Allow adding an edge only while the dependent task is queued. A task is runnable only after every prerequisite reaches `complete`; explicit Writer launch and Auto share this gate.
+- **Reason:** the queue must represent task order durably and must not start dependent work early or produce a scheduler that can deadlock on a cycle.
+- **Consequence:** dependency edges are append-only and visible through `task dependencies`. Auto reports queued tasks waiting on open prerequisites. Dependencies do not change task success criteria, Critic review, or verification evidence.

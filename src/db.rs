@@ -15,7 +15,7 @@ use crate::{
     secrets::contains_sensitive,
 };
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -53,6 +53,13 @@ pub struct TaskRecord {
     pub status: TaskStatus,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct TaskDependencyRecord {
+    pub task_id: i64,
+    pub prerequisite_task_id: i64,
+    pub prerequisite_status: TaskStatus,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -397,6 +404,154 @@ impl Database {
             created_at_ms: now,
             updated_at_ms: now,
         })
+    }
+
+    pub fn add_task_dependency(&mut self, task_id: i64, prerequisite_task_id: i64) -> Result<bool> {
+        if task_id == prerequisite_task_id {
+            bail!("A task cannot depend on itself");
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot add task dependency")?;
+        let task_status: Option<String> = transaction
+            .query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(task_status) = task_status else {
+            bail!("Task #{task_id} does not exist");
+        };
+        if task_status != TaskStatus::Queued.as_str() {
+            bail!("Dependencies can only be added to a queued task");
+        }
+        let prerequisite_status: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                [prerequisite_task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(prerequisite_status) = prerequisite_status else {
+            bail!("Prerequisite task #{prerequisite_task_id} does not exist");
+        };
+        let already_exists: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_dependencies WHERE task_id = ?1 AND depends_on_task_id = ?2)",
+            params![task_id, prerequisite_task_id],
+            |row| row.get(0),
+        )?;
+        if already_exists {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let closes_cycle: bool = transaction.query_row(
+            "WITH RECURSIVE prerequisites(task_id) AS (
+                 SELECT ?1
+                 UNION
+                 SELECT edges.depends_on_task_id
+                 FROM task_dependencies AS edges
+                 JOIN prerequisites ON edges.task_id = prerequisites.task_id
+             )
+             SELECT EXISTS(SELECT 1 FROM prerequisites WHERE task_id = ?2)",
+            params![prerequisite_task_id, task_id],
+            |row| row.get(0),
+        )?;
+        if closes_cycle {
+            bail!("This dependency would create a cycle in the task graph");
+        }
+        let now = now_ms()?;
+        transaction.execute(
+            "INSERT INTO task_dependencies (task_id, depends_on_task_id, created_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![task_id, prerequisite_task_id, now],
+        )?;
+        let event_data = serde_json::to_string(&serde_json::json!({
+            "prerequisite_task_id": prerequisite_task_id,
+            "prerequisite_status": prerequisite_status,
+        }))?;
+        transaction.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, 'talos', 'task.dependency_added', 'Task now waits for a prerequisite task', ?3)",
+            params![task_id, now, event_data],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot commit task dependency")?;
+        Ok(true)
+    }
+
+    pub fn task_dependencies(&self, task_id: i64) -> Result<Vec<TaskDependencyRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT edges.task_id, edges.depends_on_task_id, tasks.status
+             FROM task_dependencies AS edges
+             JOIN tasks ON tasks.id = edges.depends_on_task_id
+             WHERE edges.task_id = ?1 ORDER BY edges.depends_on_task_id",
+        )?;
+        statement
+            .query_map([task_id], |row| {
+                let status: String = row.get(2)?;
+                Ok(TaskDependencyRecord {
+                    task_id: row.get(0)?,
+                    prerequisite_task_id: row.get(1)?,
+                    prerequisite_status: parse_task_status(&status).ok_or_else(|| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            2,
+                            rusqlite::types::Type::Text,
+                            Box::new(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                format!("Unknown task status in database: {status}"),
+                            )),
+                        )
+                    })?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("Cannot list task dependencies")
+    }
+
+    pub fn runnable_queued_tasks(&self) -> Result<Vec<TaskRecord>> {
+        let tasks = self.list_tasks()?;
+        let mut statement = self.connection.prepare(
+            "SELECT EXISTS(
+                 SELECT 1 FROM task_dependencies AS edges
+                 JOIN tasks AS prerequisite ON prerequisite.id = edges.depends_on_task_id
+                 WHERE edges.task_id = ?1 AND prerequisite.status <> 'complete'
+             )",
+        )?;
+        let mut runnable = Vec::new();
+        for task in tasks {
+            if task.status != TaskStatus::Queued {
+                continue;
+            }
+            let blocked: bool = statement.query_row([task.id], |row| row.get(0))?;
+            if !blocked {
+                runnable.push(task);
+            }
+        }
+        Ok(runnable)
+    }
+
+    pub fn queued_tasks_waiting_on_dependencies(&self) -> Result<Vec<(i64, Vec<i64>)>> {
+        let mut statement = self.connection.prepare(
+            "SELECT tasks.id, edges.depends_on_task_id
+             FROM tasks
+             JOIN task_dependencies AS edges ON edges.task_id = tasks.id
+             JOIN tasks AS prerequisite ON prerequisite.id = edges.depends_on_task_id
+             WHERE tasks.status = 'queued' AND prerequisite.status <> 'complete'
+             ORDER BY tasks.id, edges.depends_on_task_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut waiting: Vec<(i64, Vec<i64>)> = Vec::new();
+        for (task_id, prerequisite_task_id) in rows {
+            if let Some((_, prerequisites)) = waiting.last_mut().filter(|(id, _)| *id == task_id) {
+                prerequisites.push(prerequisite_task_id);
+            } else {
+                waiting.push((task_id, vec![prerequisite_task_id]));
+            }
+        }
+        Ok(waiting)
     }
 
     pub fn task_verification_checks(&self, task_id: i64) -> Result<Vec<ProjectCheck>> {
@@ -1007,6 +1162,17 @@ impl Database {
         let Some(current_status) = current_status else {
             bail!("Task #{task_id} does not exist");
         };
+        let unmet_dependencies: i64 = transaction.query_row(
+            "SELECT COUNT(*)
+             FROM task_dependencies AS edges
+             JOIN tasks AS prerequisite ON prerequisite.id = edges.depends_on_task_id
+             WHERE edges.task_id = ?1 AND prerequisite.status <> 'complete'",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        if unmet_dependencies > 0 {
+            bail!("Task #{task_id} is waiting for prerequisite tasks to complete");
+        }
         let revision_source = if current_status == TaskStatus::Implementing.as_str() {
             let latest_review: Option<(i64, String, String)> = transaction
                 .query_row(
@@ -2984,6 +3150,31 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .context("Cannot add durable Writer process identity")?;
         migrated_version = 9;
     }
+    if migrated_version == 9 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE task_dependencies (
+                     task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+                     depends_on_task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+                     created_at_ms INTEGER NOT NULL,
+                     PRIMARY KEY(task_id, depends_on_task_id),
+                     CHECK(task_id <> depends_on_task_id)
+                 );
+                 CREATE INDEX task_dependencies_prerequisite_id
+                     ON task_dependencies(depends_on_task_id, task_id);
+                 CREATE TRIGGER task_dependencies_no_update
+                     BEFORE UPDATE ON task_dependencies BEGIN
+                         SELECT RAISE(ABORT, 'task dependencies are append-only');
+                     END;
+                 CREATE TRIGGER task_dependencies_no_delete
+                     BEFORE DELETE ON task_dependencies BEGIN
+                         SELECT RAISE(ABORT, 'task dependencies are append-only');
+                     END;
+                 PRAGMA user_version = 10;",
+            )
+            .context("Cannot add task dependency graph")?;
+        migrated_version = 10;
+    }
     if migrated_version != SCHEMA_VERSION {
         bail!("Cannot migrate database from unsupported schema version {migrated_version}");
     }
@@ -3471,7 +3662,7 @@ mod tests {
     fn initialization_is_idempotent_and_uses_wal() {
         let project = temp_project();
         let first = Database::open(&project).expect("initialize database");
-        assert_eq!(first.schema_version().expect("read schema version"), 9);
+        assert_eq!(first.schema_version().expect("read schema version"), 10);
         assert_eq!(
             first
                 .journal_mode()
@@ -3482,19 +3673,20 @@ mod tests {
         drop(first);
 
         let second = Database::open(&project).expect("open database again");
-        assert_eq!(second.schema_version().expect("read schema version"), 9);
+        assert_eq!(second.schema_version().expect("read schema version"), 10);
         drop(second);
         cleanup(&project);
     }
 
     #[test]
-    fn schema_v5_migrates_to_v9_with_optional_check_durations_and_control_state() {
+    fn schema_v5_migrates_to_v10_with_optional_check_durations_and_control_state() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
         database
             .connection
             .execute_batch(
-                "ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
+                "DROP TABLE task_dependencies;
+                 ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
                  ALTER TABLE verification_results DROP COLUMN duration_ms;
                  ALTER TABLE verification_results DROP COLUMN version_duration_ms;
                  DROP TABLE project_control_events;
@@ -3505,7 +3697,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema-v5 duration fields");
-        assert_eq!(migrated.schema_version().unwrap(), 9);
+        assert_eq!(migrated.schema_version().unwrap(), 10);
         let columns: (i64, i64) = migrated
             .connection
             .query_row(
@@ -3522,7 +3714,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v6_migrates_to_v9_without_losing_tasks() {
+    fn schema_v6_migrates_to_v10_without_losing_tasks() {
         let project = temp_project();
         let mut database = Database::open(&project).expect("initialize current database");
         let task = database
@@ -3531,7 +3723,8 @@ mod tests {
         database
             .connection
             .execute_batch(
-                "ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
+                "DROP TABLE task_dependencies;
+                 ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
                  DROP TABLE project_control_events;
                  DROP TABLE project_control_state;
                  PRAGMA user_version = 6;",
@@ -3540,7 +3733,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v6");
-        assert_eq!(migrated.schema_version().unwrap(), 9);
+        assert_eq!(migrated.schema_version().unwrap(), 10);
         assert_eq!(migrated.list_tasks().unwrap()[0].id, task.id);
         assert!(!migrated.project_control_state().unwrap().queue_paused);
         cleanup(&project);
@@ -3553,7 +3746,8 @@ mod tests {
         database
             .connection
             .execute_batch(
-                "ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
+                "DROP TABLE task_dependencies;
+                 ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
                  ALTER TABLE project_control_state DROP COLUMN stop_requested_attempt_id;
                  PRAGMA user_version = 7;",
             )
@@ -3561,7 +3755,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v7");
-        assert_eq!(migrated.schema_version().unwrap(), 9);
+        assert_eq!(migrated.schema_version().unwrap(), 10);
         assert_eq!(
             migrated
                 .project_control_state()
@@ -3579,14 +3773,15 @@ mod tests {
         database
             .connection
             .execute_batch(
-                "ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
+                "DROP TABLE task_dependencies;
+                 ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
                  PRAGMA user_version = 8;",
             )
             .expect("simulate schema v8");
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v8");
-        assert_eq!(migrated.schema_version().unwrap(), 9);
+        assert_eq!(migrated.schema_version().unwrap(), 10);
         assert!(
             migrated
                 .writer_attempts(None)
@@ -3594,6 +3789,33 @@ mod tests {
                 .iter()
                 .all(|attempt| attempt.process_identity_fingerprint.is_none())
         );
+        cleanup(&project);
+    }
+
+    #[test]
+    fn schema_v9_migrates_to_v10_with_dependency_tables() {
+        let project = temp_project();
+        let database = Database::open(&project).expect("initialize current database");
+        database
+            .connection
+            .execute_batch(
+                "DROP TABLE task_dependencies;
+                 PRAGMA user_version = 9;",
+            )
+            .expect("simulate schema v9");
+        drop(database);
+
+        let migrated = Database::open(&project).expect("migrate schema v9");
+        assert_eq!(migrated.schema_version().unwrap(), 10);
+        let dependencies_table_exists: bool = migrated
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'task_dependencies')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect migrated dependency table");
+        assert!(dependencies_table_exists);
         cleanup(&project);
     }
 
@@ -3927,6 +4149,7 @@ mod tests {
                  ALTER TABLE critic_reviews DROP COLUMN head_commit;
                  ALTER TABLE critic_reviews DROP COLUMN patch_sha256;
                  ALTER TABLE critic_reviews DROP COLUMN changed_paths_json;
+                 DROP TABLE task_dependencies;
                  ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
                  DROP TABLE project_control_events;
                  DROP TABLE project_control_state;
@@ -3936,7 +4159,7 @@ mod tests {
         drop(database);
 
         let mut migrated = Database::open(&project).expect("migrate the v4 approval");
-        assert_eq!(migrated.schema_version().unwrap(), 9);
+        assert_eq!(migrated.schema_version().unwrap(), 10);
         assert_eq!(
             migrated.list_tasks().unwrap()[0].status,
             TaskStatus::Reviewing
@@ -4078,7 +4301,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_migrates_to_v9_without_losing_tasks() {
+    fn schema_v1_migrates_to_v10_without_losing_tasks() {
         let project = temp_project();
         project
             .ensure_runtime_dir()
@@ -4120,7 +4343,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate existing database");
-        assert_eq!(database.schema_version().expect("read schema version"), 9);
+        assert_eq!(database.schema_version().expect("read schema version"), 10);
         let tasks = database.list_tasks().expect("read preserved tasks");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Existing v1 task");
@@ -4416,7 +4639,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate v2 database");
-        assert_eq!(database.schema_version().expect("read schema version"), 9);
+        assert_eq!(database.schema_version().expect("read schema version"), 10);
         assert!(
             database
                 .has_unresolved_writer_attempts()

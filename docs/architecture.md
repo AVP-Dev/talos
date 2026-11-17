@@ -42,6 +42,8 @@ Git worktrees provide task isolation, not an OS security boundary. One Writer ru
 
 Schema v9 can store a Linux process fingerprint containing the boot ID, PID, process-group ID, and `/proc/<pid>/stat` start ticks. `task recover` compares the saved and current fingerprint and reports `matches`, `different_process`, `unavailable`, or `not_recorded`. The comparison is lifecycle evidence only: it does not establish a Writer outcome, permit signaling, or remove operator attestations. macOS continues to report identity as unavailable and does not use private `libproc` APIs or parse `ps`.
 
+Schema v10 stores task prerequisite edges in an append-only DAG. A recursive dependency check rejects cycles before an edge is committed. Only queued tasks can receive dependencies, and a task cannot start until each prerequisite is complete. Auto selects the first runnable queued task and reports queued tasks waiting on prerequisites; it does not skip the dependency gate for explicit runs.
+
 ## Phased delivery
 
 1. Bootstrap: apply and adapt the Agent Starter Kit, inspect pair-mailbox, and measure local CLI capabilities.

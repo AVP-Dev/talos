@@ -2,7 +2,7 @@
 
 TALOS is a Rust CLI-first orchestrator for local AI coding CLIs. It stores tasks, Writer attempts, and events in a durable local SQLite database, supervises one verified Antigravity Writer at a time, and preserves ambiguous work for operator review.
 
-> **Current status:** R6 is in progress. Durable queue pause/resume, manual-change reconciliation, and a cooperative Writer stop command are implemented; R6.3 behavior tests and full-profile verification remain pending. Linux-specific implementation continues in order; Linux-native checks are deferred to the user's server and Linux support remains unverified. No Docker or VM is required. Antigravity 1.5.10 is the only Writer- and Critic-verified adapter. Critic approval moves a task to `verifying`; TALOS completes it only after saved project checks pass for the same approved Git revision. `up --auto` runs at most one task per explicit call. `up --semi` prompts before a Writer launch and requires an interactive terminal.
+> **Current status:** R6 implementation is in progress, with macOS reconnect, process-recovery behavior, interactive handoff, and Linux server acceptance still open. R7.1 adds an in-progress task dependency DAG. Linux-specific checks are deferred to the user's server; Linux support remains unverified. No Docker or VM is required. Antigravity 1.5.10 is the only Writer- and Critic-verified adapter. Critic approval moves a task to `verifying`; TALOS completes it only after saved project checks pass for the same approved Git revision. `up --auto` runs at most one task per explicit call. `up --semi` prompts before a Writer launch and requires an interactive terminal.
 
 ## Start here
 
@@ -20,6 +20,8 @@ This keeps progress independent of chat history, model vendor, or which agent co
 ```sh
 talos up --observe
 talos task add "Describe the change" --criteria "Describe how to verify it"
+talos task depends 12 --on 7
+talos task dependencies 12
 talos task list
 talos up --auto
 talos status
@@ -41,6 +43,8 @@ talos resume
 ```sh
 talos task review <ID>
 ```
+
+Tasks can be linked into a directed acyclic graph. `task depends <TASK> --on <PREREQUISITE>` adds an append-only edge; self-dependencies and cycles are refused. Explicit runs and Auto both wait until all prerequisites have status `complete`. Use `task dependencies <TASK>` to inspect prerequisite states.
 
 The Critic uses a fresh read-only process. A rejection moves the task to `implementing`; run the task again to start a linked Writer fix, then review the new revision. Approval moves the task to `verifying`. Configure named project checks in `.talos/config.json` and save them to a task:
 
