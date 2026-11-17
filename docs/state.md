@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R6 — Runtime and resumption is in progress.** T6.1 is complete: `talos attach` now creates/reuses a project-scoped tmux control shell without starting a worker. T6.2 is next. R5 remains complete for the locally verified macOS path. Linux-native build/runtime/sandbox acceptance remains deferred until the user provides server access under T6.5/T9.3. Backlog count: 39 of 61 scheduled tasks done (63.9% by task count, unweighted); two unscheduled ideas are recorded separately.
+**R6 — Runtime and resumption is in progress.** T6.1 and T6.2 are complete. R6.2 adds durable pause/resume, Git-snapshot reconciliation, and an append-only control journal. Next is **T6.3 — stop/cancellation and crash recovery**. R5 and R6.2 pass the local macOS profile. Linux-native build/runtime/sandbox acceptance remains deferred until the user provides server access under T6.5/T9.3. Backlog count: 40 of 61 scheduled tasks done (65.6% by task count, unweighted); two unscheduled ideas are recorded separately.
 
 ## Goal and fixed direction
 
@@ -221,9 +221,19 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - Local `.talos/state.sqlite3` has no queued tasks. It remains ignored; an offline backup of the test DB is in `/private/tmp` until temporary probe cleanup.
 - Next task: **T6.2 — support pause/resume and manual takeover.** Continue sequentially through R6–R9. Do not connect to a Linux host or run Linux-native checks until the user provides server access.
 
+## R6.2 progress — 2026-11-18
+
+- Added SQLite schema v7 for durable project queue control and an append-only control-event journal. Schema v1, v2, v4, v5, and v6 migration paths preserve task data and initialize an unpaused queue.
+- Added `talos pause [--reason ...]`, `talos resume [--reconcile]`, and `talos logs --project`. `status` and `up --observe` report pause state. A pause blocks new Writer attempts and continuations atomically; it preserves queued tasks and does not interrupt an active Writer.
+- Resume compares a stable Git revision snapshot. Changed or unavailable snapshots keep the queue paused until explicit `--reconcile`. Reconciliation reopens any `verifying` task to `reviewing`, so the changed project needs a fresh Critic review. Resume refuses while Writer execution remains active or unresolved.
+- Tests cover schema migrations, idempotent/persistent pause, task preservation, Writer launch blocking, unchanged resume, changed/missing snapshot handling, approval reopening, unresolved Writer refusal, secret rejection, append-only events, and CLI parsing.
+- `cargo fmt --all && ./scripts/verify-project.sh` — passed: format, Clippy with `-D warnings`, **113 passed / 2 ignored**, macOS ARM64 release build, and `security-scan: clean`.
+- macOS `xcrun` emitted non-fatal cache-file permission warnings; required checks exited successfully. No Linux host was contacted and no Linux-native check was run.
+- T6.2 code and docs are not yet committed at this checkpoint. Keep the work local on `master`, commit after final diff review, then continue with T6.3.
+
 ## Next action
 
-R5 is implemented, locally verified, and committed as `1e76675` on `master`. T6.1 is complete; continue with **T6.2 — support pause/resume and manual takeover**. Keep all work local; the user will create the hosted repository later. Linux-native implementation can proceed in its planned round, but server connection and Linux-native verification are deferred until access is provided.
+R5 is implemented, locally verified, and committed as `1e76675` on `master`. T6.1 is committed locally. T6.2 implementation and local verification are complete; review and commit this slice, then continue with **T6.3 — stop/cancellation and crash recovery**. Keep all work local; the user will create the hosted repository later. Linux implementation can proceed in its planned round, but server connection and Linux-native verification are deferred until access is provided.
 
 ## Session close checklist
 

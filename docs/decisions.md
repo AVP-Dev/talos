@@ -213,3 +213,10 @@ No schema change for process identity is selected or implemented. The separate s
 - **Decision:** project checks are named, allowlisted argv arrays saved immutably to each task. A task may become `complete` only after all saved checks pass for the latest approved Critic revision and the Git facts remain unchanged before and after verification. Persist exact check metadata, version/check durations, statuses, and output hashes; do not persist raw stdout/stderr.
 - **Reason:** a successful Writer or Critic response does not prove project acceptance, and later sessions need compact evidence that can be inspected without retaining potentially sensitive output.
 - **Consequence:** `task verify` runs the recorded checks under the supervisor lease; `task evidence` displays durable run evidence. The Critic remains findings-only; an unexpected patch field is rejected. Auto and Semi permissions are deterministic, and Semi requires interactive approval before a Writer launch.
+
+## ADR-026 — Pause new Writer assignments and reconcile manual project edits
+
+- **Status:** accepted implementation decision for R6.2.
+- **Decision:** store queue pause state and an optional Git revision identity in SQLite. A pause blocks new Writer attempts and continuations. It does not interrupt an already-running process. Resume compares the current Git revision identity with the saved pause snapshot; if they differ or either snapshot is unavailable, keep the queue paused until the operator explicitly requests `resume --reconcile`.
+- **Reason:** pausing task assignment is separate from stopping a process, and manual edits must not silently invalidate a previous Critic approval.
+- **Failure handling:** if a writer attempt is still launching, running, or unresolved, do not resume the queue. If manual changes are reconciled, move tasks in `verifying` back to `reviewing` and require a fresh Critic review of their current revision. Append control events so pause, detected changes, reconciliation, and resume remain auditable. New tasks may still be added while paused.

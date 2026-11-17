@@ -15,7 +15,7 @@ use crate::{
     secrets::contains_sensitive,
 };
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -139,6 +139,36 @@ pub struct VerificationEvidenceRecord {
     pub patch_sha256: String,
     pub changed_paths_json: String,
     pub checks: Vec<CheckExecution>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ProjectControlState {
+    pub queue_paused: bool,
+    pub paused_at_ms: Option<i64>,
+    pub pause_reason: Option<String>,
+    pub pause_revision_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ProjectControlEvent {
+    pub id: i64,
+    pub occurred_at_ms: i64,
+    pub event_type: String,
+    pub reason: String,
+    pub data_json: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ResumeProjectOutcome {
+    AlreadyRunning,
+    ReconciliationRequired {
+        pause_revision_id: Option<String>,
+        current_revision_id: Option<String>,
+    },
+    Resumed {
+        reconciled_manual_changes: bool,
+        reopened_task_ids: Vec<i64>,
+    },
 }
 
 type WriterFinalizationState = (
@@ -585,6 +615,224 @@ impl Database {
         Ok(events)
     }
 
+    pub fn project_control_state(&self) -> Result<ProjectControlState> {
+        self.connection
+            .query_row(
+                "SELECT queue_paused, paused_at_ms, pause_reason, pause_revision_id
+                 FROM project_control_state WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok(ProjectControlState {
+                        queue_paused: row.get::<_, i64>(0)? != 0,
+                        paused_at_ms: row.get(1)?,
+                        pause_reason: row.get(2)?,
+                        pause_revision_id: row.get(3)?,
+                    })
+                },
+            )
+            .context("Cannot read project control state")
+    }
+
+    pub fn pause_project(
+        &mut self,
+        reason: &str,
+        pause_revision_id: Option<&str>,
+    ) -> Result<ProjectControlState> {
+        validate_record_text("Pause reason", reason, 1_000)?;
+        if contains_sensitive(reason) {
+            bail!("Pause reason contains secret-like text and was not stored");
+        }
+        if let Some(revision_id) = pause_revision_id {
+            validate_review_revision_id(revision_id)?;
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot pause the project queue")?;
+        let existing = transaction.query_row(
+            "SELECT queue_paused, paused_at_ms, pause_reason, pause_revision_id
+             FROM project_control_state WHERE singleton = 1",
+            [],
+            |row| {
+                Ok(ProjectControlState {
+                    queue_paused: row.get::<_, i64>(0)? != 0,
+                    paused_at_ms: row.get(1)?,
+                    pause_reason: row.get(2)?,
+                    pause_revision_id: row.get(3)?,
+                })
+            },
+        )?;
+        if existing.queue_paused {
+            transaction.commit()?;
+            return Ok(existing);
+        }
+        let now = now_ms()?;
+        transaction.execute(
+            "UPDATE project_control_state
+             SET queue_paused = 1, paused_at_ms = ?1, pause_reason = ?2,
+                 pause_revision_id = ?3, updated_at_ms = ?1
+             WHERE singleton = 1 AND queue_paused = 0",
+            params![now, reason, pause_revision_id],
+        )?;
+        let data_json = serde_json::to_string(&serde_json::json!({
+            "pause_revision_id": pause_revision_id,
+        }))?;
+        insert_project_control_event(&transaction, now, "queue.paused", reason, &data_json)?;
+        transaction.commit().context("Cannot commit queue pause")?;
+        Ok(ProjectControlState {
+            queue_paused: true,
+            paused_at_ms: Some(now),
+            pause_reason: Some(reason.to_owned()),
+            pause_revision_id: pause_revision_id.map(str::to_owned),
+        })
+    }
+
+    pub fn resume_project(
+        &mut self,
+        current_revision_id: Option<&str>,
+        reconcile: bool,
+    ) -> Result<ResumeProjectOutcome> {
+        if let Some(revision_id) = current_revision_id {
+            validate_review_revision_id(revision_id)?;
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot resume the project queue")?;
+        let existing = transaction.query_row(
+            "SELECT queue_paused, pause_revision_id
+             FROM project_control_state WHERE singleton = 1",
+            [],
+            |row| Ok((row.get::<_, i64>(0)? != 0, row.get::<_, Option<String>>(1)?)),
+        )?;
+        let (queue_paused, pause_revision_id) = existing;
+        if !queue_paused {
+            transaction.commit()?;
+            return Ok(ResumeProjectOutcome::AlreadyRunning);
+        }
+        let unresolved: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM writer_attempts
+             WHERE state IN ('launching', 'running')
+                OR (state = 'unknown' AND operator_resolution IS NULL)",
+            [],
+            |row| row.get(0),
+        )?;
+        if unresolved != 0 {
+            bail!("Cannot resume while a Writer attempt is active or unresolved");
+        }
+
+        let snapshots_match =
+            pause_revision_id.is_some() && pause_revision_id.as_deref() == current_revision_id;
+        if !snapshots_match && !reconcile {
+            let now = now_ms()?;
+            let data_json = serde_json::to_string(&serde_json::json!({
+                "pause_revision_id": pause_revision_id,
+                "current_revision_id": current_revision_id,
+                "reconciliation_required": true,
+            }))?;
+            insert_project_control_event(
+                &transaction,
+                now,
+                "project.manual_changes_detected",
+                "Project Git facts changed during the pause or a safe baseline was unavailable",
+                &data_json,
+            )?;
+            transaction
+                .commit()
+                .context("Cannot record manual project changes")?;
+            return Ok(ResumeProjectOutcome::ReconciliationRequired {
+                pause_revision_id,
+                current_revision_id: current_revision_id.map(str::to_owned),
+            });
+        }
+
+        let now = now_ms()?;
+        let mut reopened_task_ids = Vec::new();
+        if !snapshots_match {
+            let mut statement = transaction
+                .prepare("SELECT id FROM tasks WHERE status = 'verifying' ORDER BY id")?;
+            reopened_task_ids = statement
+                .query_map([], |row| row.get(0))?
+                .collect::<rusqlite::Result<Vec<i64>>>()?;
+            drop(statement);
+            for task_id in &reopened_task_ids {
+                let changed = transaction.execute(
+                    "UPDATE tasks SET status = 'reviewing', updated_at_ms = ?1
+                     WHERE id = ?2 AND status = 'verifying'",
+                    params![now, task_id],
+                )?;
+                if changed != 1 {
+                    bail!("Task #{task_id} changed during manual project reconciliation");
+                }
+                let data_json = serde_json::to_string(&serde_json::json!({
+                    "from": "verifying",
+                    "to": "reviewing",
+                    "cause": "manual_project_reconciliation",
+                }))?;
+                transaction.execute(
+                    "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+                     VALUES (?1, ?2, 'talos', 'task.status_changed',
+                             'Manual project changes invalidated the approved revision; a fresh Critic review is required', ?3)",
+                    params![task_id, now, data_json],
+                )?;
+            }
+            let data_json = serde_json::to_string(&serde_json::json!({
+                "pause_revision_id": pause_revision_id,
+                "current_revision_id": current_revision_id,
+                "reopened_task_ids": reopened_task_ids,
+            }))?;
+            insert_project_control_event(
+                &transaction,
+                now,
+                "project.manual_changes_reconciled",
+                "Operator accepted the inspected project state; affected approvals were reopened",
+                &data_json,
+            )?;
+        }
+        transaction.execute(
+            "UPDATE project_control_state
+             SET queue_paused = 0, paused_at_ms = NULL, pause_reason = NULL,
+                 pause_revision_id = NULL, updated_at_ms = ?1
+             WHERE singleton = 1 AND queue_paused = 1",
+            [now],
+        )?;
+        let data_json = serde_json::to_string(&serde_json::json!({
+            "reconciled_manual_changes": !snapshots_match,
+            "reopened_task_ids": reopened_task_ids,
+        }))?;
+        insert_project_control_event(
+            &transaction,
+            now,
+            "queue.resumed",
+            "Operator resumed the project queue",
+            &data_json,
+        )?;
+        transaction.commit().context("Cannot commit queue resume")?;
+        Ok(ResumeProjectOutcome::Resumed {
+            reconciled_manual_changes: !snapshots_match,
+            reopened_task_ids,
+        })
+    }
+
+    pub fn project_control_events(&self) -> Result<Vec<ProjectControlEvent>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, occurred_at_ms, event_type, reason, data_json
+             FROM project_control_events ORDER BY id",
+        )?;
+        let events = statement
+            .query_map([], |row| {
+                Ok(ProjectControlEvent {
+                    id: row.get(0)?,
+                    occurred_at_ms: row.get(1)?,
+                    event_type: row.get(2)?,
+                    reason: row.get(3)?,
+                    data_json: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(events)
+    }
+
     pub fn verification_history(&self, task_id: i64) -> Result<Vec<VerificationEvidenceRecord>> {
         let mut statement = self.connection.prepare(
             "SELECT id, task_id, critic_review_id, status, revision_id, started_at_ms,
@@ -677,6 +925,7 @@ impl Database {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Cannot start Writer attempt transaction")?;
+        ensure_queue_not_paused(&transaction)?;
         let current_status: Option<String> = transaction
             .query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
                 row.get(0)
@@ -989,6 +1238,7 @@ impl Database {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Cannot start Writer continuation transaction")?;
+        ensure_queue_not_paused(&transaction)?;
         let now = now_ms()?;
         let unresolved: i64 = transaction.query_row(
             "SELECT COUNT(*) FROM writer_attempts
@@ -2472,6 +2722,43 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .context("Cannot add verification duration evidence")?;
         migrated_version = 6;
     }
+    if migrated_version == 6 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE project_control_state (
+                     singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
+                     queue_paused INTEGER NOT NULL CHECK(queue_paused IN (0, 1)),
+                     paused_at_ms INTEGER,
+                     pause_reason TEXT,
+                     pause_revision_id TEXT,
+                     updated_at_ms INTEGER NOT NULL,
+                     CHECK(
+                         (queue_paused = 0 AND paused_at_ms IS NULL AND pause_reason IS NULL AND pause_revision_id IS NULL)
+                         OR (queue_paused = 1 AND paused_at_ms IS NOT NULL AND length(trim(pause_reason)) > 0)
+                     )
+                 );
+                 INSERT INTO project_control_state (singleton, queue_paused, updated_at_ms)
+                     VALUES (1, 0, 0);
+                 CREATE TABLE project_control_events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     occurred_at_ms INTEGER NOT NULL,
+                     event_type TEXT NOT NULL,
+                     reason TEXT NOT NULL,
+                     data_json TEXT NOT NULL DEFAULT '{}'
+                 );
+                 CREATE TRIGGER project_control_events_no_update
+                     BEFORE UPDATE ON project_control_events BEGIN
+                         SELECT RAISE(ABORT, 'project control events are append-only');
+                     END;
+                 CREATE TRIGGER project_control_events_no_delete
+                     BEFORE DELETE ON project_control_events BEGIN
+                         SELECT RAISE(ABORT, 'project control events are append-only');
+                     END;
+                 PRAGMA user_version = 7;",
+            )
+            .context("Cannot add durable project pause state")?;
+        migrated_version = 7;
+    }
     if migrated_version != SCHEMA_VERSION {
         bail!("Cannot migrate database from unsupported schema version {migrated_version}");
     }
@@ -2505,6 +2792,38 @@ fn validate_lease_in_transaction(
     if !lease_is_valid {
         bail!("Writer operation requires the current unexpired supervisor lease");
     }
+    Ok(())
+}
+
+fn ensure_queue_not_paused(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+    let queue_paused: i64 = transaction.query_row(
+        "SELECT queue_paused FROM project_control_state WHERE singleton = 1",
+        [],
+        |row| row.get(0),
+    )?;
+    if queue_paused != 0 {
+        bail!("TALOS queue is paused; run `talos resume` after inspecting project changes");
+    }
+    Ok(())
+}
+
+fn insert_project_control_event(
+    transaction: &rusqlite::Transaction<'_>,
+    occurred_at_ms: i64,
+    event_type: &str,
+    reason: &str,
+    data_json: &str,
+) -> Result<()> {
+    validate_record_text("Project control event type", event_type, 100)?;
+    validate_record_text("Project control event reason", reason, 1_000)?;
+    if contains_sensitive(reason) || contains_sensitive(data_json) {
+        bail!("Project control event contains secret-like text and was not stored");
+    }
+    transaction.execute(
+        "INSERT INTO project_control_events (occurred_at_ms, event_type, reason, data_json)
+         VALUES (?1, ?2, ?3, ?4)",
+        params![occurred_at_ms, event_type, reason, data_json],
+    )?;
     Ok(())
 }
 
@@ -2710,6 +3029,7 @@ fn is_allowed_transition(current: &TaskStatus, target: &TaskStatus) -> bool {
             | (TaskStatus::Reviewing, TaskStatus::Blocked)
             | (TaskStatus::Reviewing, TaskStatus::Failed)
             | (TaskStatus::Verifying, TaskStatus::Implementing)
+            | (TaskStatus::Verifying, TaskStatus::Reviewing)
             | (TaskStatus::Verifying, TaskStatus::Blocked)
             | (TaskStatus::Verifying, TaskStatus::Failed)
             | (TaskStatus::Blocked, TaskStatus::Queued)
@@ -2812,8 +3132,8 @@ mod tests {
     use rusqlite::OptionalExtension;
 
     use super::{
-        CheckExecution, CriticReviewInput, Database, TaskStatus, WriterAttemptOutcome,
-        WriterResolutionAction,
+        CheckExecution, CriticReviewInput, Database, ResumeProjectOutcome, TaskStatus,
+        WriterAttemptOutcome, WriterResolutionAction,
     };
     use crate::project::{DiscoveryMethod, Project};
     use crate::{checks::ProjectCheck, revision::RevisionFacts};
@@ -2925,7 +3245,7 @@ mod tests {
     fn initialization_is_idempotent_and_uses_wal() {
         let project = temp_project();
         let first = Database::open(&project).expect("initialize database");
-        assert_eq!(first.schema_version().expect("read schema version"), 6);
+        assert_eq!(first.schema_version().expect("read schema version"), 7);
         assert_eq!(
             first
                 .journal_mode()
@@ -2936,13 +3256,13 @@ mod tests {
         drop(first);
 
         let second = Database::open(&project).expect("open database again");
-        assert_eq!(second.schema_version().expect("read schema version"), 6);
+        assert_eq!(second.schema_version().expect("read schema version"), 7);
         drop(second);
         cleanup(&project);
     }
 
     #[test]
-    fn schema_v5_migrates_to_v6_with_optional_check_durations() {
+    fn schema_v5_migrates_to_v7_with_optional_check_durations_and_control_state() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
         database
@@ -2950,13 +3270,15 @@ mod tests {
             .execute_batch(
                 "ALTER TABLE verification_results DROP COLUMN duration_ms;
                  ALTER TABLE verification_results DROP COLUMN version_duration_ms;
+                 DROP TABLE project_control_events;
+                 DROP TABLE project_control_state;
                  PRAGMA user_version = 5;",
             )
             .expect("simulate a schema-v5 database");
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema-v5 duration fields");
-        assert_eq!(migrated.schema_version().unwrap(), 6);
+        assert_eq!(migrated.schema_version().unwrap(), 7);
         let columns: (i64, i64) = migrated
             .connection
             .query_row(
@@ -2968,6 +3290,196 @@ mod tests {
             )
             .expect("read migrated duration columns");
         assert_eq!(columns, (1, 1));
+        assert!(!migrated.project_control_state().unwrap().queue_paused);
+        cleanup(&project);
+    }
+
+    #[test]
+    fn schema_v6_migrates_without_losing_tasks() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("initialize current database");
+        let task = database
+            .add_task("Preserve v6 task", "Keep the existing row")
+            .expect("add task before migration");
+        database
+            .connection
+            .execute_batch(
+                "DROP TABLE project_control_events;
+                 DROP TABLE project_control_state;
+                 PRAGMA user_version = 6;",
+            )
+            .expect("simulate schema v6");
+        drop(database);
+
+        let migrated = Database::open(&project).expect("migrate schema v6");
+        assert_eq!(migrated.schema_version().unwrap(), 7);
+        assert_eq!(migrated.list_tasks().unwrap()[0].id, task.id);
+        assert!(!migrated.project_control_state().unwrap().queue_paused);
+        cleanup(&project);
+    }
+
+    #[test]
+    fn pause_is_persistent_idempotent_and_blocks_new_writer_attempts() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("initialize database");
+        let task = database
+            .add_task("Preserve while paused", "The queue keeps this task")
+            .expect("add task");
+        let pause_revision = format!("sha256:{}", "a".repeat(64));
+        let first = database
+            .pause_project("Operator review", Some(&pause_revision))
+            .expect("pause queue");
+        let again = database
+            .pause_project("A replacement reason", None)
+            .expect("repeat pause is idempotent");
+        assert_eq!(again, first);
+        assert!(
+            database
+                .begin_writer_attempt(task.id, &"b".repeat(64))
+                .is_err()
+        );
+        let queued = database
+            .add_task("Still accepted", "Adding a task does not resume work")
+            .expect("add a task while paused");
+        assert_eq!(queued.status, TaskStatus::Queued);
+        drop(database);
+
+        let mut reopened = Database::open(&project).expect("reopen paused project");
+        assert!(reopened.project_control_state().unwrap().queue_paused);
+        assert_eq!(
+            reopened
+                .resume_project(Some(&pause_revision), false)
+                .unwrap(),
+            ResumeProjectOutcome::Resumed {
+                reconciled_manual_changes: false,
+                reopened_task_ids: Vec::new(),
+            }
+        );
+        assert_eq!(reopened.project_control_events().unwrap().len(), 2);
+        cleanup(&project);
+    }
+
+    #[test]
+    fn changed_project_snapshot_requires_reconciliation_and_reopens_approvals() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("initialize database");
+        let (task_id, _, _, _) =
+            prepare_approved_verification_task(&mut database, "pause-reconciliation");
+        let pause_revision = format!("sha256:{}", "1".repeat(64));
+        let changed_revision = format!("sha256:{}", "2".repeat(64));
+        database
+            .pause_project("Manual takeover", Some(&pause_revision))
+            .expect("pause queue");
+
+        assert_eq!(
+            database
+                .resume_project(Some(&changed_revision), false)
+                .unwrap(),
+            ResumeProjectOutcome::ReconciliationRequired {
+                pause_revision_id: Some(pause_revision),
+                current_revision_id: Some(changed_revision.clone()),
+            }
+        );
+        assert!(database.project_control_state().unwrap().queue_paused);
+        assert_eq!(
+            database.list_tasks().unwrap()[0].status,
+            TaskStatus::Verifying
+        );
+
+        assert_eq!(
+            database
+                .resume_project(Some(&changed_revision), true)
+                .unwrap(),
+            ResumeProjectOutcome::Resumed {
+                reconciled_manual_changes: true,
+                reopened_task_ids: vec![task_id],
+            }
+        );
+        assert!(!database.project_control_state().unwrap().queue_paused);
+        assert_eq!(
+            database.list_tasks().unwrap()[0].status,
+            TaskStatus::Reviewing
+        );
+        let events = database.project_control_events().unwrap();
+        assert_eq!(events.len(), 4);
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "project.manual_changes_detected")
+        );
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "project.manual_changes_reconciled")
+        );
+        cleanup(&project);
+    }
+
+    #[test]
+    fn missing_pause_snapshot_requires_explicit_reconciliation() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("initialize database");
+        database
+            .pause_project("No Git baseline", None)
+            .expect("pause without Git facts");
+        assert!(matches!(
+            database.resume_project(None, false).unwrap(),
+            ResumeProjectOutcome::ReconciliationRequired { .. }
+        ));
+        assert!(database.project_control_state().unwrap().queue_paused);
+        assert!(matches!(
+            database.resume_project(None, true).unwrap(),
+            ResumeProjectOutcome::Resumed {
+                reconciled_manual_changes: true,
+                ..
+            }
+        ));
+        cleanup(&project);
+    }
+
+    #[test]
+    fn queue_cannot_resume_while_writer_is_unresolved() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("initialize database");
+        let task = database.add_task("Wait for writer", "").expect("add task");
+        database
+            .begin_writer_attempt(task.id, &"3a".repeat(32))
+            .expect("begin Writer attempt");
+        let revision = format!("sha256:{}", "3".repeat(64));
+        database
+            .pause_project("Wait for current Writer", Some(&revision))
+            .expect("pause queue");
+        assert!(database.resume_project(Some(&revision), false).is_err());
+        assert!(database.project_control_state().unwrap().queue_paused);
+        cleanup(&project);
+    }
+
+    #[test]
+    fn project_control_events_are_append_only_and_reject_secrets() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("initialize database");
+        let assignment_name = ["api", "key"].join("_");
+        let secret_reason = format!("{assignment_name}={}", "a".repeat(16));
+        assert!(database.pause_project(&secret_reason, None).is_err());
+        database
+            .pause_project("Safe operator reason", None)
+            .expect("record safe pause");
+        assert!(
+            database
+                .connection
+                .execute(
+                    "UPDATE project_control_events SET reason = 'rewritten' WHERE id = 1",
+                    [],
+                )
+                .is_err()
+        );
+        assert!(
+            database
+                .connection
+                .execute("DELETE FROM project_control_events WHERE id = 1", [],)
+                .is_err()
+        );
+        assert_eq!(database.project_control_events().unwrap().len(), 1);
         cleanup(&project);
     }
 
@@ -3093,13 +3605,15 @@ mod tests {
                  ALTER TABLE critic_reviews DROP COLUMN head_commit;
                  ALTER TABLE critic_reviews DROP COLUMN patch_sha256;
                  ALTER TABLE critic_reviews DROP COLUMN changed_paths_json;
+                 DROP TABLE project_control_events;
+                 DROP TABLE project_control_state;
                  PRAGMA user_version = 4;",
             )
             .expect("simulate a schema-v4 database");
         drop(database);
 
         let mut migrated = Database::open(&project).expect("migrate the v4 approval");
-        assert_eq!(migrated.schema_version().unwrap(), 6);
+        assert_eq!(migrated.schema_version().unwrap(), 7);
         assert_eq!(
             migrated.list_tasks().unwrap()[0].status,
             TaskStatus::Reviewing
@@ -3241,7 +3755,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_migrates_to_v6_without_losing_tasks() {
+    fn schema_v1_migrates_to_v7_without_losing_tasks() {
         let project = temp_project();
         project
             .ensure_runtime_dir()
@@ -3283,7 +3797,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate existing database");
-        assert_eq!(database.schema_version().expect("read schema version"), 6);
+        assert_eq!(database.schema_version().expect("read schema version"), 7);
         let tasks = database.list_tasks().expect("read preserved tasks");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Existing v1 task");
@@ -3579,7 +4093,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate v2 database");
-        assert_eq!(database.schema_version().expect("read schema version"), 6);
+        assert_eq!(database.schema_version().expect("read schema version"), 7);
         assert!(
             database
                 .has_unresolved_writer_attempts()
@@ -3754,6 +4268,30 @@ mod tests {
                 )
                 .is_err()
         );
+        let pause_revision = format!("sha256:{}", "4".repeat(64));
+        database
+            .pause_project("Operator takeover", Some(&pause_revision))
+            .expect("pause before continuation");
+        assert!(
+            database
+                .begin_writer_continuation(
+                    task.id,
+                    &"ef".repeat(32),
+                    source.id,
+                    "session-continue-1",
+                    true,
+                )
+                .is_err()
+        );
+        assert!(matches!(
+            database
+                .resume_project(Some(&pause_revision), false)
+                .expect("resume with the same project snapshot"),
+            ResumeProjectOutcome::Resumed {
+                reconciled_manual_changes: false,
+                ..
+            }
+        ));
         let continuation = database
             .begin_writer_continuation(
                 task.id,

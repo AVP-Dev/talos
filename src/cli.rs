@@ -26,10 +26,28 @@ pub enum Command {
     Status,
     /// Show task event history.
     Logs(LogsArgs),
+    /// Pause new Writer assignments for this project.
+    Pause(PauseArgs),
+    /// Resume a paused project queue after checking for manual edits.
+    Resume(ResumeArgs),
     /// Check local project and database readiness.
     Doctor,
     /// Create or reconnect to this project's persistent tmux control shell.
     Attach,
+}
+
+#[derive(Debug, Args)]
+pub struct PauseArgs {
+    /// Explain why the queue is being paused. Secret-like text is rejected.
+    #[arg(long)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Args)]
+pub struct ResumeArgs {
+    /// Confirm that current project changes were inspected and reopen approvals affected by them.
+    #[arg(long)]
+    pub reconcile: bool,
 }
 
 #[derive(Debug, Args)]
@@ -136,7 +154,7 @@ pub enum ResolveAction {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, ResolveAction, TaskArgs, TaskCommand};
+    use super::{Cli, Command, ResolveAction, ResumeArgs, TaskArgs, TaskCommand};
 
     #[test]
     fn task_continue_requires_project_inspection_confirmation() {
@@ -243,6 +261,32 @@ mod tests {
     }
 
     #[test]
+    fn pause_resume_and_project_logs_parse_explicit_controls() {
+        let paused = Cli::try_parse_from(["talos", "pause", "--reason", "Operator review"])
+            .expect("parse queue pause");
+        let Command::Pause(arguments) = paused.command else {
+            panic!("expected pause command");
+        };
+        assert_eq!(arguments.reason.as_deref(), Some("Operator review"));
+
+        let resumed = Cli::try_parse_from(["talos", "resume", "--reconcile"])
+            .expect("parse explicit reconciliation");
+        let Command::Resume(ResumeArgs { reconcile }) = resumed.command else {
+            panic!("expected resume command");
+        };
+        assert!(reconcile);
+
+        assert!(Cli::try_parse_from(["talos", "logs", "17", "--project"]).is_err());
+        let project_logs = Cli::try_parse_from(["talos", "logs", "--project"])
+            .expect("parse project control log view");
+        let Command::Logs(arguments) = project_logs.command else {
+            panic!("expected logs command");
+        };
+        assert!(arguments.project);
+        assert_eq!(arguments.task_id, None);
+    }
+
+    #[test]
     fn task_checks_requires_explicit_check_names() {
         assert!(Cli::try_parse_from(["talos", "task", "checks", "17"]).is_err());
         let cli = Cli::try_parse_from(["talos", "task", "checks", "17", "--check", "unit"])
@@ -328,6 +372,10 @@ mod tests {
 
 #[derive(Debug, Args)]
 pub struct LogsArgs {
-    /// Limit the event history to one task ID.
+    /// Limit the task event history to one task ID.
+    #[arg(conflicts_with = "project")]
     pub task_id: Option<i64>,
+    /// Show the append-only project control history.
+    #[arg(long)]
+    pub project: bool,
 }

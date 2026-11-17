@@ -15,12 +15,12 @@ use crate::{
     cli::{Cli, Command, ResolveAction, TaskCommand},
     config::{AdapterKind, AgentRole, ProjectConfig},
     db::{
-        Database, QueueSummary, TaskEvent, TaskRecord, WriterResolutionAction,
-        WriterResolutionRecord,
+        Database, ProjectControlEvent, QueueSummary, ResumeProjectOutcome, TaskEvent, TaskRecord,
+        WriterResolutionAction, WriterResolutionRecord,
     },
     policy::{self, Action as PolicyAction, Authorization, ExecutionMode},
     project::{DiscoveryMethod, Project},
-    revision::RevisionSnapshot,
+    revision::{RevisionSnapshot, git_head},
     secrets::{contains_sensitive, redact_sensitive},
     supervisor::{
         VERIFIED_AGY_CRITIC_VERSION, VERIFIED_AGY_WRITE_VERSION, WriterContinuation,
@@ -40,6 +40,8 @@ struct StatusReport {
     schema_version: i64,
     journal_mode: String,
     queue: QueueSummary,
+    queue_paused: bool,
+    pause_reason: Option<String>,
     supervisor: &'static str,
 }
 
@@ -101,13 +103,16 @@ pub async fn run(cli: Cli) -> Result<()> {
     let mut database = Database::open(&project)?;
     match cli.command {
         Command::Up(arguments) if arguments.auto => {
+            ensure_queue_running(&database)?;
             run_one_shot_auto(cli.json, &project, &mut database).await?;
         }
         Command::Up(arguments) if arguments.semi => {
+            ensure_queue_running(&database)?;
             run_one_shot_semi(cli.json, &project, &mut database).await?;
         }
         Command::Up(_) => {
             let queue = database.queue_summary()?;
+            let control = database.project_control_state()?;
             if cli.json {
                 print_json(&json!({
                     "mode": "observe",
@@ -115,6 +120,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                     "database_path": database.path(),
                     "schema_version": database.schema_version()?,
                     "queue": queue,
+                    "queue_paused": control.queue_paused,
+                    "pause_reason": control.pause_reason,
                     "worker_started": false,
                 }))?;
             } else {
@@ -128,6 +135,17 @@ pub async fn run(cli: Cli) -> Result<()> {
                     redact_sensitive(&database.path().display().to_string())
                 );
                 println!("Queue: {} total, {} queued", queue.total, queue.queued);
+                if control.queue_paused {
+                    println!(
+                        "Queue is PAUSED: {}",
+                        redact_sensitive(
+                            control
+                                .pause_reason
+                                .as_deref()
+                                .unwrap_or("no reason recorded"),
+                        )
+                    );
+                }
                 println!("No agent or worker was started.");
             }
         }
@@ -284,12 +302,15 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         },
         Command::Status => {
+            let control = database.project_control_state()?;
             let report = StatusReport {
                 project_root: project.root.display().to_string(),
                 database_path: database.path().display().to_string(),
                 schema_version: database.schema_version()?,
                 journal_mode: database.journal_mode()?,
                 queue: database.queue_summary()?,
+                queue_paused: control.queue_paused,
+                pause_reason: control.pause_reason,
                 supervisor: "not running",
             };
             if cli.json {
@@ -310,18 +331,125 @@ pub async fn run(cli: Cli) -> Result<()> {
                     report.queue.complete,
                     report.queue.blocked_or_failed
                 );
+                if report.queue_paused {
+                    println!(
+                        "Queue: PAUSED ({})",
+                        redact_sensitive(
+                            report
+                                .pause_reason
+                                .as_deref()
+                                .unwrap_or("no reason recorded"),
+                        )
+                    );
+                } else {
+                    println!("Queue: running");
+                }
                 println!("Supervisor: {}", report.supervisor);
             }
         }
         Command::Logs(arguments) => {
-            let events = database.task_events(arguments.task_id)?;
-            if cli.json {
-                print_json(&events)?;
-            } else if events.is_empty() {
-                println!("No matching events.");
+            if arguments.project {
+                let events = database.project_control_events()?;
+                if cli.json {
+                    print_json(&events)?;
+                } else if events.is_empty() {
+                    println!("No project control events.");
+                } else {
+                    for event in events {
+                        print_project_control_event(&event);
+                    }
+                }
             } else {
-                for event in events {
-                    print_event(&event);
+                let events = database.task_events(arguments.task_id)?;
+                if cli.json {
+                    print_json(&events)?;
+                } else if events.is_empty() {
+                    println!("No matching events.");
+                } else {
+                    for event in events {
+                        print_event(&event);
+                    }
+                }
+            }
+        }
+        Command::Pause(arguments) => {
+            let reason = arguments
+                .reason
+                .as_deref()
+                .unwrap_or("Operator requested a queue pause");
+            let revision_id = current_project_revision_id(&project);
+            let control = database.pause_project(reason, revision_id.as_deref())?;
+            if cli.json {
+                print_json(&json!({
+                    "queue_paused": control.queue_paused,
+                    "paused_at_ms": control.paused_at_ms,
+                    "pause_reason": control.pause_reason,
+                    "pause_revision_id": control.pause_revision_id,
+                    "active_writer_interrupted": false,
+                }))?;
+            } else {
+                println!("Project queue paused.");
+                println!("New Writer attempts and continuations are blocked.");
+                println!("An already-running Writer may continue; inspect it separately.");
+                if control.pause_revision_id.is_none() {
+                    println!("No safe Git snapshot was recorded; resume will require --reconcile.");
+                }
+            }
+        }
+        Command::Resume(arguments) => {
+            let revision_id = current_project_revision_id(&project);
+            match database.resume_project(revision_id.as_deref(), arguments.reconcile)? {
+                ResumeProjectOutcome::AlreadyRunning => {
+                    if cli.json {
+                        print_json(&json!({ "queue_paused": false, "already_running": true }))?;
+                    } else {
+                        println!("Project queue is already running.");
+                    }
+                }
+                ResumeProjectOutcome::ReconciliationRequired {
+                    pause_revision_id,
+                    current_revision_id,
+                } => {
+                    if cli.json {
+                        print_json(&json!({
+                            "queue_paused": true,
+                            "reconciliation_required": true,
+                            "pause_revision_id": pause_revision_id,
+                            "current_revision_id": current_revision_id,
+                        }))?;
+                    } else {
+                        println!(
+                            "Project changes differ from the pause snapshot or no safe snapshot was available."
+                        );
+                        println!(
+                            "Inspect `git diff` and `git status`, then run `talos resume --reconcile` to accept the current state."
+                        );
+                        println!("The queue remains paused until reconciliation completes.");
+                    }
+                }
+                ResumeProjectOutcome::Resumed {
+                    reconciled_manual_changes,
+                    reopened_task_ids,
+                } => {
+                    if cli.json {
+                        print_json(&json!({
+                            "queue_paused": false,
+                            "reconciled_manual_changes": reconciled_manual_changes,
+                            "reopened_task_ids": reopened_task_ids,
+                        }))?;
+                    } else {
+                        if reconciled_manual_changes {
+                            println!(
+                                "Manual project changes reconciled; affected tasks require a fresh Critic review."
+                            );
+                            if reopened_task_ids.is_empty() {
+                                println!("No verifying tasks needed to be reopened.");
+                            } else {
+                                println!("Reopened tasks: {}", format_task_ids(&reopened_task_ids));
+                            }
+                        }
+                        println!("Project queue resumed.");
+                    }
                 }
             }
         }
@@ -461,6 +589,28 @@ async fn run_queued_task(
     let report = execute_writer_task(json_output, project, database, task_id, None).await?;
     print_writer_report(json_output, &report, None)?;
     ensure_writer_succeeded(&report)
+}
+
+fn ensure_queue_running(database: &Database) -> Result<()> {
+    let control = database.project_control_state()?;
+    if control.queue_paused {
+        bail!(
+            "TALOS queue is paused{}; inspect project changes and run `talos resume`",
+            control
+                .pause_reason
+                .as_deref()
+                .map(|reason| format!(" ({})", redact_sensitive(reason)))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
+fn current_project_revision_id(project: &Project) -> Option<String> {
+    let head = git_head(&project.root).ok().flatten()?;
+    RevisionSnapshot::capture(&project.root, &head)
+        .ok()
+        .map(|snapshot| snapshot.revision_id)
 }
 
 async fn continue_task(
@@ -1293,6 +1443,23 @@ fn print_event(event: &TaskEvent) {
         redact_sensitive(&event.actor),
         redact_sensitive(&event.reason)
     );
+}
+
+fn print_project_control_event(event: &ProjectControlEvent) {
+    println!(
+        "{} project {}: {}",
+        event.occurred_at_ms,
+        redact_sensitive(&event.event_type),
+        redact_sensitive(&event.reason)
+    );
+}
+
+fn format_task_ids(task_ids: &[i64]) -> String {
+    task_ids
+        .iter()
+        .map(|task_id| format!("#{task_id}"))
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn print_json(value: &impl Serialize) -> Result<()> {

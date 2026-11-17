@@ -2,7 +2,7 @@
 
 TALOS is a Rust CLI-first orchestrator for local AI coding CLIs. It stores tasks, Writer attempts, and events in a durable local SQLite database, supervises one verified Antigravity Writer at a time, and preserves ambiguous work for operator review.
 
-> **Current status:** R5 is complete for the locally verified macOS path. Linux-specific implementation continues in order; Linux-native checks are deferred to the user's server and Linux support remains unverified. No Docker or VM is required. Antigravity 1.5.10 is the only Writer- and Critic-verified adapter. Critic approval moves a task to `verifying`; TALOS completes it only after saved project checks pass for the same approved Git revision. `up --auto` runs at most one task per explicit call. `up --semi` prompts before a Writer launch and requires an interactive terminal.
+> **Current status:** R6 is in progress; durable queue pause/resume and manual-change reconciliation are implemented for the locally verified macOS path. Linux-specific implementation continues in order; Linux-native checks are deferred to the user's server and Linux support remains unverified. No Docker or VM is required. Antigravity 1.5.10 is the only Writer- and Critic-verified adapter. Critic approval moves a task to `verifying`; TALOS completes it only after saved project checks pass for the same approved Git revision. `up --auto` runs at most one task per explicit call. `up --semi` prompts before a Writer launch and requires an interactive terminal.
 
 ## Start here
 
@@ -24,9 +24,14 @@ talos task list
 talos up --auto
 talos status
 talos attach
+talos pause --reason "Operator takeover"
+talos logs --project
+talos resume
 ```
 
 `talos attach` creates or reconnects to one persistent tmux shell for the current project. It does not start a worker. Run the existing TALOS commands in that shell, or keep using them directly in the foreground when tmux is unavailable.
+
+`talos pause` durably blocks new Writer attempts and continuations while preserving queued tasks. It does not stop an already-running Writer. Before resuming, TALOS compares the saved Git snapshot with the current project. If the snapshot changed or could not be captured, inspect `git diff` and `git status`, then run `talos resume --reconcile`; tasks already awaiting verification return to Critic review. `talos logs --project` shows the append-only pause and reconciliation history.
 
 `up --auto` requires a clean Git worktree with `.talos/` ignored and processes the first queued task once. It reports the Writer response and changed Git paths. A successful attempt remains `reviewing`. Use the independent Critic for a structured review:
 

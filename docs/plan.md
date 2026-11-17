@@ -64,12 +64,14 @@ talos task resolve <ATTEMPT_ID> ...  # implemented: audited operator decision
 talos status                # session, worker, queue, and capability status
 talos logs [TASK_ID]        # task event history
 talos attach                # implemented in T6.1: create/reuse this project's control shell
-talos pause | resume        # planned for R6: stop assigning work / continue
+talos pause [--reason ...]  # implemented in T6.2: block new Writer attempts durably
+talos resume [--reconcile]  # implemented in T6.2: compare Git facts before resuming
+talos logs --project        # inspect append-only pause/reconciliation history
 talos doctor                # diagnose CLI, tmux, Git, and database setup
-talos stop                  # planned for R6: graceful worker shutdown
+talos stop                  # planned for T6.3: graceful Writer/process-group shutdown
 ```
 
-R3 Writer commands, R4 `task review`, and R5 verification commands are implemented for the verified macOS Antigravity 1.5.10 path. T6.1 adds `attach`; `pause`, `resume`, and `stop` remain R6 work. `task continue` is limited to one explicit follow-up for the latest terminal Agy `ERROR` result with exit status zero and a validated public conversation ID. It never handles `unknown`, timeout, nonzero exit, or malformed output. TALOS resumes that exact ID through the public `--conversation` interface, verifies the resumed `init` ID before sending the follow-up, and asks the operator to inspect current workspace state without replaying the original prompt. A successful follow-up remains `reviewing`. Critic approval moves a task only to `verifying`; it does not claim project checks or completion.
+R3 Writer commands, R4 `task review`, and R5 verification commands are implemented for the verified macOS Antigravity 1.5.10 path. T6.1 adds `attach`; T6.2 adds durable pause/resume and project event history; `stop` remains T6.3 work. `task continue` is limited to one explicit follow-up for the latest terminal Agy `ERROR` result with exit status zero and a validated public conversation ID. It never handles `unknown`, timeout, nonzero exit, or malformed output. TALOS resumes that exact ID through the public `--conversation` interface, verifies the resumed `init` ID before sending the follow-up, and asks the operator to inspect current workspace state without replaying the original prompt. A successful follow-up remains `reviewing`. Critic approval moves a task only to `verifying`; it does not claim project checks or completion.
 
 ## 4. Roadmap and rounds
 
@@ -83,7 +85,7 @@ Each round ends with a usable, verifiable result, an updated backlog, and a sess
 | R3 | One autonomous Writer | One verified adapter completes one safe local task per explicit `up --auto` invocation from a clean temporary Git project. Complete for the initial macOS target. |
 | R4 | Independent Critic | Read-only review, real blocker finding, denied write probe, linked Writer fix, immutable review history, and per-project role selection. Complete for verified macOS Antigravity 1.5.10. |
 | R5 | Verification and permissions | Configured checks, exact Git facts, Auto/Semi policy, redaction, and evidence-gated completion. Complete on macOS; see R5 acceptance below. |
-| R6 | Persistent runtime and recovery | In progress: T6.1 adds a project-scoped tmux control shell; pause/resume, manual takeover, cancellation, crash recovery, SSH reconnect, and Linux autostart remain open. |
+| R6 | Persistent runtime and recovery | In progress: T6.1 adds a project-scoped tmux control shell; T6.2 adds durable pause/resume and manual-change reconciliation. Stop/cancellation, crash recovery, SSH reconnect, and Linux autostart remain open. |
 | R7 | Decomposition and parallel work | DAG and subagent tasks, isolated worktrees, leases/concurrency limits, conflict checks, and safe integration. |
 | R8 | GitHub workflow | Authorized branch, push and PR, CI monitoring, and report; no automatic merge. |
 | R9 | Hardening and release | Resilience, long-running checks, macOS install/update/uninstall, complete operator documentation, and Linux build/runtime/package acceptance. |
@@ -149,7 +151,9 @@ Project config v2 defines checks as validated argument arrays, version probes, a
 
 Use tmux for persistent sessions with a visible status and a user control shell. Distinguish stopping an agent, pausing the queue, and detaching a terminal. Recovery considers PID reuse, stale leases, SIGINT/SIGTERM, CLI crash, daemon crash, reboot, and repeat SSH attach. macOS is the currently verified runtime. Implement Linux paths in T6.5; defer native Linux checks to the user's server when setting up a local Linux target or runtime would slow macOS development. Linux boot recovery and optional systemd user autostart require an explicit install choice. Do not use text typed into another TUI as IPC.
 
-**T6.1 result (complete):** `talos attach` creates or reuses one detached shell session per canonical project root. The session name is a truncated SHA-256 path identity, so projects with the same directory basename do not collide. Outside tmux, TALOS attaches to the session; inside tmux, it switches the current client. It never starts a TALOS worker, and task commands remain usable in the foreground if tmux is unavailable. `doctor` reports the installed tmux version without creating a session. T6.2–T6.6 remain open.
+**T6.1 result (complete):** `talos attach` creates or reuses one detached shell session per canonical project root. The session name is a truncated SHA-256 path identity, so projects with the same directory basename do not collide. Outside tmux, TALOS attaches to the session; inside tmux, it switches the current client. It never starts a TALOS worker, and task commands remain usable in the foreground if tmux is unavailable. `doctor` reports the installed tmux version without creating a session.
+
+**T6.2 result (complete):** schema v7 persists the queue pause flag, reason, and optional Git revision snapshot; project control events are append-only. `pause` blocks new Writer attempts and continuations in the same SQLite transaction that creates them, and it preserves queued work. `resume` refuses while a Writer outcome is active or unresolved. Matching Git facts resume directly; changed or unavailable facts keep the queue paused until `--reconcile`. Reconciliation moves tasks from `verifying` back to `reviewing`, requiring a new Critic decision. `status` and `up --observe` show pause state; `logs --project` displays the control journal. A running Writer is not interrupted by pause. T6.3–T6.6 remain open.
 
 **Exit criteria:** state survives SSH loss and is visible on reattach; repeated `up` creates no duplicate workers or panes; ambiguous attempts stop in a safe recoverable state.
 
