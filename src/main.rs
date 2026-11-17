@@ -11,7 +11,10 @@ async fn main() {
     let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
 
     if let Err(error) = run(Cli::parse()).await {
-        eprintln!("Error: {error:#}");
+        eprintln!(
+            "Error: {}",
+            talos::secrets::redact_sensitive(&format!("{error:#}"))
+        );
         std::process::exit(1);
     }
 }

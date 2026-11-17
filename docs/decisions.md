@@ -196,9 +196,9 @@ No schema change for process identity is selected or implemented. The separate s
 ## ADR-023 — Implement Linux while keeping macOS as the active development platform
 
 - **Status:** accepted by the user.
-- **Decision:** continue day-to-day implementation and launch work on macOS while implementing Linux-specific paths as their planned tasks are reached. If Linux-target compilation, runtime, or sandbox checks require cumbersome setup on macOS, defer those checks to the user's Linux server. Do not add Docker, a VM, or a heavy local Linux test matrix.
+- **Decision:** continue implementation and launch work on macOS while adding Linux-specific code in its planned round. Do not connect to, boot, provision, or run Linux-native checks before the user provides server access. Do not add Docker, a VM, or a heavy local Linux test matrix.
 - **Reason:** avoid delaying implementation and macOS launch for platform-specific test infrastructure while still building Linux support into TALOS.
-- **Consequence:** macOS remains the verified platform. Linux code can be implemented before server validation, but Linux support must remain marked unverified until the deferred build/runtime/sandbox acceptance passes. This supersedes ADR-016's macOS-only implementation scope and clarifies ADR-020.
+- **Consequence:** macOS remains the verified platform. Linux code can be implemented before server validation; all Linux-native checks are deferred until server access is available, and Linux support remains unverified until build/runtime/sandbox acceptance passes. This supersedes ADR-016's macOS-only implementation scope and clarifies ADR-020.
 
 ## ADR-024 — Use `master` as the default branch
 
@@ -206,3 +206,10 @@ No schema change for process identity is selected or implemented. The separate s
 - **Decision:** create and maintain `master` as TALOS's default branch.
 - **Reason:** this is the user's explicit branch naming preference.
 - **Consequence:** initialize the local repository and any later hosted repository with `master` as the default branch unless the user changes this direction.
+
+## ADR-025 — Verify R5 completion through saved project-check evidence
+
+- **Status:** accepted by the user and implemented in R5.
+- **Decision:** project checks are named, allowlisted argv arrays saved immutably to each task. A task may become `complete` only after all saved checks pass for the latest approved Critic revision and the Git facts remain unchanged before and after verification. Persist exact check metadata, version/check durations, statuses, and output hashes; do not persist raw stdout/stderr.
+- **Reason:** a successful Writer or Critic response does not prove project acceptance, and later sessions need compact evidence that can be inspected without retaining potentially sensitive output.
+- **Consequence:** `task verify` runs the recorded checks under the supervisor lease; `task evidence` displays durable run evidence. The Critic remains findings-only; an unexpected patch field is rejected. Auto and Semi permissions are deterministic, and Semi requires interactive approval before a Writer launch.

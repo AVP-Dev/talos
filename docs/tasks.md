@@ -79,13 +79,13 @@ Dependency: R3/R4.
 
 | ID | Status | Task | Exit criteria |
 |---|---|---|---|
-| T5.1 | planned | Support verifiable acceptance criteria and project checks | Command, CWD, version, and exit code recorded; unknown command is not skipped. |
-| T5.2 | planned | Compare tree facts and Git diff with the claimed result | HEAD, dirty paths, and diff digest match the attempt being verified. |
-| T5.3 | planned | Apply Critic patches only after digest verification | Changed patch/base is blocked before application. |
-| T5.4 | planned | Design Auto/Semi action policy | Auto uses only the approved allowlist; Semi requests approval at policy boundaries; deny rules outrank allows. |
-| T5.5 | planned | Redact credentials and secrets from logs/reports | Test secrets never appear in runtime logs, reports, database events, or final output. |
-| T5.6 | planned | Close tasks only with complete evidence | Failed/unrun checks, open review, or invalid Git facts block completion. |
-| T5.7 | planned | Keep local TALOS runtime state out of Git | Ensure `.talos/` is excluded in each Git project or fail with actionable setup guidance; do not silently rewrite tracked project files. Verify normal repositories and worktrees. |
+| T5.1 | done | Support verifiable acceptance criteria and project checks | Config v2 defines allowlisted executable argv, version argv, and project-relative working directory. A task snapshots named checks; unknown tools, shell paths, secret-like arguments, and unknown check IDs fail closed. `task evidence <ID>` retrieves each run's command, working directory, version, separate version/check durations and exit statuses, timeout/failure code, revision identity, and output hashes. Raw check output is bounded while streamed and is not persisted. |
+| T5.2 | done | Compare tree facts and Git diff with the claimed result | Critic approval and verification bind the base commit, HEAD, sorted changed paths, and complete patch digest. TALOS checks the exact same facts before and after every saved check. |
+| T5.3 | done | Keep Critic review findings-only and bind Writer fixes to reviewed revisions | The Critic cannot return an applicable patch; unknown `patch` fields are rejected. A requested fix is a new linked Writer attempt from the saved base, and the new full revision must receive a separate review. This preserves R4's findings-only authority boundary. |
+| T5.4 | done | Design Auto/Semi action policy | Auto permits only allowlisted Writer launch and local project checks; Semi prompts before each Writer launch and requires a TTY. Critic patch application, Git mutation, and publish actions are hard denied. `task verify` is an explicit operator command. |
+| T5.5 | done | Redact credentials and secrets from logs/reports | Common token, URL credential, cloud key, JWT, bearer, generic token assignment, and PEM patterns are rejected from persisted inputs or redacted from text/JSON output. Raw check stdout/stderr is neither logged nor stored; only its digest is retained. |
+| T5.6 | done | Close tasks only with complete evidence | Completion is one transaction requiring the latest approved review, current `verifying` status, every saved check's passing version probe and command exit, and unchanged Git facts. Missing, failed, stale, or partial evidence leaves the task open. |
+| T5.7 | done | Keep local TALOS runtime state out of Git | Git projects must already ignore `.talos/state.sqlite3`; tracked state or a missing ignore rule is refused before the runtime database opens. TALOS does not rewrite project ignore files. |
 
 ## R6 — tmux, manual takeover, and recovery
 
@@ -95,7 +95,7 @@ Dependency: R3 and R5.
 |---|---|---|---|
 | T6.1 | planned | Create and reconnect tmux control session | Repeated launch creates no duplicate workers/panes; without tmux, foreground mode is clear. |
 | T6.2 | planned | Support pause/resume/stop and manual takeover | Pause preserves tasks; manual edits are detected and reconciled before continuing. |
-| T6.3 | planned | Recover after CLI/TALOS exit and SIGTERM/SIGKILL | Test separate failure points; transitions preserve the last confirmed write. Address stale 35-minute lease recovery after a hard crash. Review the narrow numeric process-group ID reuse window in runner cleanup and ensure cleanup cannot signal an unrelated group; if the platform cannot prove the target, fail closed. |
+| T6.3 | planned | Recover after CLI/TALOS exit and SIGTERM/SIGKILL | Test separate failure points; transitions preserve the last confirmed write. Extend bounded process-group cleanup to project-check subprocess trees. Address stale 35-minute lease recovery after a hard crash. Review the narrow numeric process-group ID reuse window in runner cleanup and ensure cleanup cannot signal an unrelated group; if the platform cannot prove the target, fail closed. |
 | T6.4 | planned | Check SSH reconnect on macOS and record deferred Linux boot recovery | macOS state and status remain visible after reattach. Linux boot recovery and systemd user autostart remain deferred until Linux runtime support is implemented under T6.5/T9.3. |
 | T6.5 | planned | Implement Linux process identity and complete Linux server acceptance | Do not use private macOS `libproc` APIs or parse `ps`. macOS remains fail-closed when no supported public identity source is available. Implement the Linux `/proc` process identity path as part of the codebase. If Linux-target compilation, runtime, or Agy sandbox checks require cumbersome setup on macOS, defer them to the user's Linux server; no Docker/VM or heavy local Linux matrix is required. Keep Linux support unverified until those checks pass. |
 | T6.6 | planned | Verify interactive handoff and return to headless resume | Test after the workspace trust decision in a disposable project; if same-session continuity is unsupported, use an explicit new context packet and report the difference. |

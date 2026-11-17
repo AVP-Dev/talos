@@ -54,10 +54,11 @@ Deterministic acceptance rules:
 
 - A process error, nonzero exit, truncated output, malformed JSON, unknown schema version, revision mismatch, invalid finding, or stale working tree is a failed review, never approval.
 - Persist only the validated structured result and bounded task/revision metadata. Do not persist the full prompt, patch, or CLI transcript in SQLite.
+- The response schema rejects unknown fields, including `patch`; Critic output is findings-only and TALOS has no Critic patch-application route.
 - `request_changes` requires at least one `blocker` or `major` finding.
 - `approve` is accepted only when no `blocker` or `major` findings remain. `minor` and `note` findings are recorded as non-blocking observations.
 - Findings are immutable historical records tied to one revision. A later fix and review create a new record; they do not edit or delete earlier findings.
-- A rejection moves the task back to `implementing`; a valid approval moves it to `verifying`. Completion remains unavailable until the separate R5 verification gate.
+- A rejection moves the task back to `implementing`; a valid approval moves it to `verifying`. R5 completion requires separately recorded project-check evidence for this exact approved Git revision.
 
 ## Planned command flow
 

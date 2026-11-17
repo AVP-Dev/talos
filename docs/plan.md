@@ -1,6 +1,6 @@
 # TALOS Project Plan
 
-**Status:** R1–R4 are complete for the verified macOS path. R4 adds independent read-only Critic review, immutable review history, and a linked reject/fix/review cycle. A valid Critic approval moves a task to `verifying`; project checks and evidence-gated completion remain R5 work. `up --semi` remains deferred to R5. Linux-specific implementation remains in scope. Linux build, runtime, and Agy sandbox checks that require a Linux environment may be deferred to the user's server under T6.5/T9.3 if setting them up on macOS would slow development; no Docker or VM setup is required.
+**Status:** R1–R5 are complete for the locally verified macOS path. R5 adds project-check snapshots, exact Git-revision evidence, evidence-gated completion, deterministic secret handling, and an interactive Semi Writer gate. Linux-specific implementation remains in scope; Linux-native build/runtime/sandbox acceptance is deferred to the user's server under T6.5/T9.3, so Linux remains unverified. No Docker or VM setup is required.
 
 ## 1. Goal
 
@@ -51,10 +51,13 @@ A rejected review returns the task to `implementing`, with findings attached and
 
 ```text
 talos up --auto             # implemented in R3: one explicit call processes at most one eligible task
-talos up --semi             # planned for R5 policy work; not part of initial R3 Auto
+talos up --semi             # implemented in R5; prompts before one Writer launch
 talos task add "..."        # add a task with a verifiable goal
 talos task run <ID>         # implemented in R3 for the verified Writer
 talos task review <ID>      # implemented in R4 for the independent Critic
+talos task checks <ID> ...  # add immutable verification requirements
+talos task verify <ID>      # run checks for the exact approved Git revision
+talos task evidence <ID>    # inspect saved verification evidence
 talos task continue <ID> --confirm-project-inspected  # implemented for one eligible terminal ERROR result
 talos task recover          # implemented: quarantine ambiguous attempts as unknown
 talos task resolve <ATTEMPT_ID> ...  # implemented: audited operator decision
@@ -79,7 +82,7 @@ Each round ends with a usable, verifiable result, an updated backlog, and a sess
 | R2 | Core and durable state | Buildable Rust CLI, project discovery, SQLite WAL, schema migration, task queue/transitions, event journal, leases, status/doctor. Complete. |
 | R3 | One autonomous Writer | One verified adapter completes one safe local task per explicit `up --auto` invocation from a clean temporary Git project. Complete for the initial macOS target. |
 | R4 | Independent Critic | Read-only review, real blocker finding, denied write probe, linked Writer fix, immutable review history, and per-project role selection. Complete for verified macOS Antigravity 1.5.10. |
-| R5 | Verification and permissions | Acceptance criteria, real project checks, Git facts, patch digest, Auto/Semi allowlist, and evidence-gated completion. |
+| R5 | Verification and permissions | Configured checks, exact Git facts, Auto/Semi policy, redaction, and evidence-gated completion. Complete on macOS; see R5 acceptance below. |
 | R6 | Persistent runtime and recovery | tmux, reconnect/manual takeover, cancellation, CLI/TALOS crash, SSH disconnect, and optional Linux reboot autostart. |
 | R7 | Decomposition and parallel work | DAG and subagent tasks, isolated worktrees, leases/concurrency limits, conflict checks, and safe integration. |
 | R8 | GitHub workflow | Authorized branch, push and PR, CI monitoring, and report; no automatic merge. |
@@ -136,9 +139,11 @@ Add a separate Critic role, preferably using another vendor/CLI when available. 
 
 ### R5 — Ground truth, verification, and permissions
 
-Include verifiable acceptance criteria and project commands. Record the exact commands, working directory, exit code, duration, and commit/diff identity; bound output and redact secrets. Collect Git facts such as HEAD, dirty paths, and diff digest. Verify a Critic patch against its content digest immediately before applying. Auto/Semi classify actions using an explicit policy.
+Project config v2 defines checks as validated argument arrays, version probes, and project-relative working directories. Tasks save an immutable snapshot of selected checks. Verification records exact commands, working directories, version/command exit codes, failure/timeout status, output hashes, and approved revision facts. Output is drained with a bounded capture and raw check stdout/stderr is not persisted. Git facts include base commit, HEAD, sorted changed paths, and patch digest; they must match both the Critic approval and the final post-check snapshot. The Critic remains findings-only and any unexpected patch field is rejected; Writer fixes are linked attempts that receive a new exact-revision review. Auto permits only allowlisted Writer launch and project checks; Semi requires an interactive approval before launching a Writer; hard-denied actions take precedence. A task completes only when all saved checks and all Git/review invariants pass.
 
-**Exit criteria:** a failed test, missing file, open review, or changed digest blocks `complete`; CI is not claimed as local evidence unless its status was retrieved; dangerous operations are excluded from Auto defaults.
+**Result (completed locally on macOS):** T5.1–T5.7 are implemented. `task add --check`, `task checks`, `task verify`, and `task evidence` provide the check/evidence path. Verification uses a supervisor lease and schema-v6 immutable records. `complete` is committed in the same transaction as a passed run and requires the latest approval, current `verifying` state, every saved check passing, and identical revision facts. `task evidence` returns stored checks, versions, separate version/check durations, statuses, digests, and revision identity across later sessions. Semi prompts once for the one-shot Writer action and refuses non-interactive input. `.talos/state.sqlite3` is checked for Git ignore status before opening local state. No CI evidence is inferred. Linux-native acceptance remains deferred.
+
+**Exit criteria:** a failed, missing, open, stale, or incomplete check blocks `complete`; no Critic patch is applied; dangerous operations remain denied; secrets and raw check output do not enter persisted logs or reports.
 
 ### R6 — Runtime and resumption
 

@@ -8,9 +8,14 @@ use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
 use serde::Serialize;
 
-use crate::project::Project;
+use crate::{
+    checks::{CheckExecution, ProjectCheck, validate_project_checks},
+    project::Project,
+    revision::RevisionFacts,
+    secrets::contains_sensitive,
+};
 
-const SCHEMA_VERSION: i64 = 4;
+const SCHEMA_VERSION: i64 = 6;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -88,7 +93,10 @@ pub struct CriticReviewRecord {
     pub task_id: i64,
     pub writer_attempt_id: i64,
     pub base_revision: String,
+    pub head_commit: Option<String>,
     pub revision_id: String,
+    pub patch_sha256: Option<String>,
+    pub changed_paths_json: Option<String>,
     pub decision: String,
     pub summary: String,
     pub result_json: String,
@@ -101,12 +109,36 @@ pub struct CriticReviewInput<'a> {
     pub task_id: i64,
     pub writer_attempt_id: i64,
     pub base_revision: &'a str,
+    pub head_commit: &'a str,
     pub revision_id: &'a str,
+    pub patch_sha256: &'a str,
+    pub changed_paths_json: &'a str,
     pub decision: &'a str,
     pub summary: &'a str,
     pub result_json: &'a str,
     pub adapter: &'a str,
     pub adapter_version: &'a str,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct VerificationRunRecord {
+    pub id: i64,
+    pub task_id: i64,
+    pub critic_review_id: i64,
+    pub status: String,
+    pub revision_id: String,
+    pub started_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct VerificationEvidenceRecord {
+    pub run: VerificationRunRecord,
+    pub base_revision: String,
+    pub head_commit: String,
+    pub patch_sha256: String,
+    pub changed_paths_json: String,
+    pub checks: Vec<CheckExecution>,
 }
 
 type WriterFinalizationState = (
@@ -119,6 +151,15 @@ type WriterFinalizationState = (
     Option<i64>,
     Option<String>,
     Option<i64>,
+);
+
+type CriticReviewSnapshot = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Option<String>,
+    Option<String>,
 );
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -253,6 +294,25 @@ impl Database {
     }
 
     pub fn add_task(&mut self, title: &str, acceptance_criteria: &str) -> Result<TaskRecord> {
+        self.add_task_with_checks(title, acceptance_criteria, &[])
+    }
+
+    pub fn add_task_with_checks(
+        &mut self,
+        title: &str,
+        acceptance_criteria: &str,
+        checks: &[ProjectCheck],
+    ) -> Result<TaskRecord> {
+        validate_project_checks(checks)?;
+        if title.trim().is_empty() || title.len() > 2_000 {
+            bail!("Task title must be non-empty and at most 2000 bytes");
+        }
+        if acceptance_criteria.len() > 8_000 {
+            bail!("Task acceptance criteria must be at most 8000 bytes");
+        }
+        if contains_sensitive(title) || contains_sensitive(acceptance_criteria) {
+            bail!("Task title or acceptance criteria contains secret-like text");
+        }
         let now = now_ms()?;
         let transaction = self
             .connection
@@ -264,6 +324,23 @@ impl Database {
             params![title, acceptance_criteria, now],
         )?;
         let task_id = transaction.last_insert_rowid();
+        for (ordinal, check) in checks.iter().enumerate() {
+            let argv_json = serde_json::to_string(&check.argv)?;
+            let version_argv_json = serde_json::to_string(&check.version_argv)?;
+            transaction.execute(
+                "INSERT INTO task_verification_checks
+                     (task_id, check_id, ordinal, argv_json, version_argv_json, working_directory)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    task_id,
+                    check.id,
+                    i64::try_from(ordinal).context("Too many project checks")?,
+                    argv_json,
+                    version_argv_json,
+                    check.working_directory,
+                ],
+            )?;
+        }
         transaction.execute(
             "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
              VALUES (?1, ?2, 'talos', 'task.created', 'Task added to the durable queue', '{}')",
@@ -283,6 +360,96 @@ impl Database {
         })
     }
 
+    pub fn task_verification_checks(&self, task_id: i64) -> Result<Vec<ProjectCheck>> {
+        let mut statement = self.connection.prepare(
+            "SELECT check_id, argv_json, version_argv_json, working_directory
+             FROM task_verification_checks WHERE task_id = ?1 ORDER BY ordinal",
+        )?;
+        let rows = statement.query_map([task_id], |row| {
+            let argv_json: String = row.get(1)?;
+            let version_argv_json: String = row.get(2)?;
+            Ok((
+                row.get::<_, String>(0)?,
+                argv_json,
+                version_argv_json,
+                row.get::<_, String>(3)?,
+            ))
+        })?;
+        let mut checks = Vec::new();
+        for row in rows {
+            let (id, argv_json, version_argv_json, working_directory) = row?;
+            checks.push(ProjectCheck {
+                id,
+                argv: serde_json::from_str(&argv_json)
+                    .context("Saved project check command is malformed")?,
+                version_argv: serde_json::from_str(&version_argv_json)
+                    .context("Saved project check version command is malformed")?,
+                working_directory,
+            });
+        }
+        validate_project_checks(&checks)?;
+        Ok(checks)
+    }
+
+    pub fn add_task_verification_checks(
+        &mut self,
+        task_id: i64,
+        checks: &[ProjectCheck],
+    ) -> Result<()> {
+        if checks.is_empty() {
+            bail!("Add at least one project check");
+        }
+        validate_project_checks(checks)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot start task verification requirement transaction")?;
+        let status: Option<String> = transaction
+            .query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(status) = status else {
+            bail!("Task #{task_id} does not exist");
+        };
+        if status != TaskStatus::Queued.as_str() && status != TaskStatus::Reviewing.as_str() {
+            bail!("Project checks can only be added while task #{task_id} is queued or reviewing");
+        }
+        for check in checks {
+            let ordinal: i64 = transaction.query_row(
+                "SELECT COALESCE(MAX(ordinal) + 1, 0) FROM task_verification_checks WHERE task_id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                "INSERT INTO task_verification_checks
+                     (task_id, check_id, ordinal, argv_json, version_argv_json, working_directory)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    task_id,
+                    check.id,
+                    ordinal,
+                    serde_json::to_string(&check.argv)?,
+                    serde_json::to_string(&check.version_argv)?,
+                    check.working_directory,
+                ],
+            )?;
+        }
+        let now = now_ms()?;
+        let event_data = serde_json::to_string(&serde_json::json!({
+            "check_ids": checks.iter().map(|check| check.id.as_str()).collect::<Vec<_>>(),
+        }))?;
+        transaction.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, 'talos', 'task.verification_checks_added', 'Project checks were bound to the task before review', ?3)",
+            params![task_id, now, event_data],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot commit task verification requirements")?;
+        Ok(())
+    }
+
     pub fn transition_task(
         &mut self,
         task_id: i64,
@@ -292,6 +459,9 @@ impl Database {
     ) -> Result<TaskRecord> {
         if actor.trim().is_empty() || reason.trim().is_empty() {
             bail!("Task transition requires a non-empty actor and reason");
+        }
+        if contains_sensitive(actor) || contains_sensitive(reason) {
+            bail!("Task transition metadata contains secret-like text");
         }
         if target == TaskStatus::Complete {
             bail!(
@@ -413,6 +583,87 @@ impl Database {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(events)
+    }
+
+    pub fn verification_history(&self, task_id: i64) -> Result<Vec<VerificationEvidenceRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, task_id, critic_review_id, status, revision_id, started_at_ms,
+                    finished_at_ms, base_revision, head_commit, patch_sha256, changed_paths_json
+             FROM verification_runs WHERE task_id = ?1 ORDER BY id",
+        )?;
+        let runs = statement
+            .query_map([task_id], |row| {
+                Ok((
+                    VerificationRunRecord {
+                        id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        critic_review_id: row.get(2)?,
+                        status: row.get(3)?,
+                        revision_id: row.get(4)?,
+                        started_at_ms: row.get(5)?,
+                        finished_at_ms: row.get(6)?,
+                    },
+                    row.get::<_, String>(7)?,
+                    row.get::<_, String>(8)?,
+                    row.get::<_, String>(9)?,
+                    row.get::<_, String>(10)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let mut history = Vec::with_capacity(runs.len());
+        for (run, base_revision, head_commit, patch_sha256, changed_paths_json) in runs {
+            let mut results = self.connection.prepare(
+                "SELECT check_id, argv_json, version_argv_json, working_directory, tool_version,
+                        version_duration_ms, version_exit_code, duration_ms, exit_code, timed_out,
+                        failure_code, stdout_sha256, stderr_sha256
+                 FROM verification_results WHERE run_id = ?1 ORDER BY id",
+            )?;
+            let checks = results
+                .query_map([run.id], |row| {
+                    let argv_json: String = row.get(1)?;
+                    let version_argv_json: String = row.get(2)?;
+                    let argv = serde_json::from_str(&argv_json).map_err(|error| {
+                        rusqlite::Error::FromSqlConversionFailure(
+                            1,
+                            rusqlite::types::Type::Text,
+                            Box::new(error),
+                        )
+                    })?;
+                    let version_argv =
+                        serde_json::from_str(&version_argv_json).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                2,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })?;
+                    Ok(CheckExecution {
+                        check_id: row.get(0)?,
+                        argv,
+                        version_argv,
+                        working_directory: row.get(3)?,
+                        tool_version: row.get(4)?,
+                        version_duration_ms: row.get(5)?,
+                        version_exit_code: row.get(6)?,
+                        duration_ms: row.get(7)?,
+                        exit_code: row.get(8)?,
+                        timed_out: row.get::<_, i64>(9)? != 0,
+                        failure_code: row.get(10)?,
+                        stdout_sha256: row.get(11)?,
+                        stderr_sha256: row.get(12)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            history.push(VerificationEvidenceRecord {
+                run,
+                base_revision,
+                head_commit,
+                patch_sha256,
+                changed_paths_json,
+                checks,
+            });
+        }
+        Ok(history)
     }
 
     pub fn begin_writer_attempt(
@@ -1041,6 +1292,9 @@ impl Database {
             bail!("Writer resolution requires both explicit operator attestations");
         }
         validate_optional_text("resolution reason", Some(reason), 1000)?;
+        if contains_sensitive(reason) {
+            bail!("Writer resolution reason contains secret-like text");
+        }
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -1258,8 +1512,9 @@ impl Database {
         let review = self
             .connection
             .query_row(
-                "SELECT id, task_id, writer_attempt_id, base_revision, revision_id, decision,
-                        summary, result_json, adapter, adapter_version, created_at_ms
+                "SELECT id, task_id, writer_attempt_id, base_revision, head_commit, revision_id,
+                        patch_sha256, changed_paths_json, decision, summary, result_json, adapter,
+                        adapter_version, created_at_ms
                  FROM critic_reviews WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
                 [task_id],
                 map_critic_review_record,
@@ -1276,7 +1531,10 @@ impl Database {
             task_id,
             writer_attempt_id,
             base_revision,
+            head_commit,
             revision_id,
+            patch_sha256,
+            changed_paths_json,
             decision,
             summary,
             result_json,
@@ -1284,7 +1542,10 @@ impl Database {
             adapter_version,
         } = input;
         validate_git_revision(base_revision)?;
+        validate_git_revision(head_commit)?;
         validate_review_revision_id(revision_id)?;
+        validate_sha256_id(patch_sha256, "Critic patch digest")?;
+        validate_changed_paths_json(changed_paths_json)?;
         if decision != "approve" && decision != "request_changes" {
             bail!("Critic decision must be approve or request_changes");
         }
@@ -1292,8 +1553,22 @@ impl Database {
         validate_record_text("Critic result", result_json, 256_000)?;
         validate_record_text("Critic adapter", adapter, 80)?;
         validate_record_text("Critic adapter version", adapter_version, 80)?;
-        serde_json::from_str::<serde_json::Value>(result_json)
-            .context("Critic result must be valid JSON")?;
+        let result_value: serde_json::Value =
+            serde_json::from_str(result_json).context("Critic result must be valid JSON")?;
+        if result_value
+            .get("decision")
+            .and_then(serde_json::Value::as_str)
+            != Some(decision)
+            || result_value
+                .get("revision_id")
+                .and_then(serde_json::Value::as_str)
+                != Some(revision_id)
+        {
+            bail!("Critic result decision and revision must match the validated review metadata");
+        }
+        if contains_sensitive(summary) || contains_sensitive(result_json) {
+            bail!("Critic result contains secret-like text and was not stored");
+        }
 
         let transaction = self
             .connection
@@ -1353,8 +1628,9 @@ impl Database {
         transaction.execute(
             "INSERT INTO critic_reviews
                  (task_id, writer_attempt_id, base_revision, revision_id, decision, summary,
-                  result_json, adapter, adapter_version, created_at_ms)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                  result_json, adapter, adapter_version, created_at_ms, head_commit, patch_sha256,
+                  changed_paths_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 task_id,
                 writer_attempt_id,
@@ -1366,6 +1642,9 @@ impl Database {
                 adapter,
                 adapter_version,
                 now,
+                head_commit,
+                patch_sha256,
+                changed_paths_json,
             ],
         )?;
         let review_id = transaction.last_insert_rowid();
@@ -1405,6 +1684,8 @@ impl Database {
             "writer_attempt_id": writer_attempt_id,
             "base_revision": base_revision,
             "revision_id": revision_id,
+            "head_commit": head_commit,
+            "patch_sha256": patch_sha256,
             "decision": decision,
             "adapter": adapter,
             "adapter_version": adapter_version,
@@ -1423,13 +1704,393 @@ impl Database {
             task_id,
             writer_attempt_id,
             base_revision: base_revision.to_owned(),
+            head_commit: Some(head_commit.to_owned()),
             revision_id: revision_id.to_owned(),
+            patch_sha256: Some(patch_sha256.to_owned()),
+            changed_paths_json: Some(changed_paths_json.to_owned()),
             decision: decision.to_owned(),
             summary: summary.to_owned(),
             result_json: result_json.to_owned(),
             adapter: adapter.to_owned(),
             adapter_version: adapter_version.to_owned(),
             created_at_ms: now,
+        })
+    }
+
+    pub fn begin_verification_run(
+        &mut self,
+        task_id: i64,
+        critic_review_id: i64,
+        facts: &RevisionFacts,
+        lease: &SupervisorLease,
+    ) -> Result<VerificationRunRecord> {
+        validate_git_revision(&facts.base_commit)?;
+        validate_git_revision(&facts.head_commit)?;
+        validate_review_revision_id(&facts.revision_id)?;
+        validate_sha256_id(&facts.patch_sha256, "Verification patch digest")?;
+        let changed_paths_json = serde_json::to_string(&facts.changed_paths)?;
+        validate_changed_paths_json(&changed_paths_json)?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot start verification run transaction")?;
+        validate_lease_in_transaction(&transaction, lease, now_ms()?)?;
+        let task_status: Option<String> = transaction
+            .query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if task_status.as_deref() != Some(TaskStatus::Verifying.as_str()) {
+            bail!("Task #{task_id} must be verifying after an approved Critic review");
+        }
+        let review: Option<CriticReviewSnapshot> = transaction
+            .query_row(
+                "SELECT decision, base_revision, head_commit, revision_id, patch_sha256,
+                        changed_paths_json
+                     FROM critic_reviews WHERE id = ?1 AND task_id = ?2",
+                params![critic_review_id, task_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((decision, base_revision, head_commit, revision_id, patch_sha256, reviewed_paths)) =
+            review
+        else {
+            bail!("Critic review #{critic_review_id} does not belong to task #{task_id}");
+        };
+        if decision != "approve"
+            || base_revision != facts.base_commit
+            || head_commit.as_deref() != Some(facts.head_commit.as_str())
+            || revision_id.as_deref() != Some(facts.revision_id.as_str())
+            || patch_sha256.as_deref() != Some(facts.patch_sha256.as_str())
+            || reviewed_paths.as_deref() != Some(changed_paths_json.as_str())
+        {
+            bail!("Git facts do not match the latest approved Critic revision");
+        }
+        let latest_review_id: Option<i64> = transaction
+            .query_row(
+                "SELECT id FROM critic_reviews WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if latest_review_id != Some(critic_review_id) {
+            bail!("Verification requires the latest Critic review for task #{task_id}");
+        }
+        let required_checks: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM task_verification_checks WHERE task_id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        if required_checks == 0 {
+            bail!("Task #{task_id} has no saved project checks and cannot be completed");
+        }
+        let started_at_ms = now_ms()?;
+        transaction.execute(
+            "INSERT INTO verification_runs
+                 (task_id, critic_review_id, base_revision, head_commit, revision_id,
+                  patch_sha256, changed_paths_json, status, started_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'running', ?8)",
+            params![
+                task_id,
+                critic_review_id,
+                facts.base_commit,
+                facts.head_commit,
+                facts.revision_id,
+                facts.patch_sha256,
+                changed_paths_json,
+                started_at_ms,
+            ],
+        )?;
+        let run_id = transaction.last_insert_rowid();
+        let event_data = serde_json::to_string(&serde_json::json!({
+            "run_id": run_id,
+            "critic_review_id": critic_review_id,
+            "base_revision": facts.base_commit,
+            "head_commit": facts.head_commit,
+            "revision_id": facts.revision_id,
+            "patch_sha256": facts.patch_sha256,
+            "required_checks": required_checks,
+        }))?;
+        transaction.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, 'talos', 'verification.started', 'Project checks started for the approved Git revision', ?3)",
+            params![task_id, started_at_ms, event_data],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot commit verification run start")?;
+        Ok(VerificationRunRecord {
+            id: run_id,
+            task_id,
+            critic_review_id,
+            status: "running".to_owned(),
+            revision_id: facts.revision_id.clone(),
+            started_at_ms,
+            finished_at_ms: None,
+        })
+    }
+
+    pub fn record_verification_result(
+        &mut self,
+        run_id: i64,
+        execution: &CheckExecution,
+        lease: &SupervisorLease,
+    ) -> Result<()> {
+        if execution.check_id.is_empty() || execution.check_id.len() > 64 {
+            bail!("Verification result has an invalid check ID");
+        }
+        validate_sha256_digest(&execution.stdout_sha256, "Verification stdout digest")?;
+        validate_sha256_digest(&execution.stderr_sha256, "Verification stderr digest")?;
+        if execution
+            .tool_version
+            .as_deref()
+            .is_some_and(|version| version.is_empty() || version.len() > 200)
+        {
+            bail!("Verification tool version must be at most 200 bytes");
+        }
+        if execution
+            .tool_version
+            .as_deref()
+            .is_some_and(contains_sensitive)
+        {
+            bail!("Verification tool version contains secret-like text and was not stored");
+        }
+        if execution
+            .version_duration_ms
+            .into_iter()
+            .chain(execution.duration_ms)
+            .any(|duration| duration < 0)
+        {
+            bail!("Verification durations cannot be negative");
+        }
+        if execution.failure_code.as_deref().is_some_and(|code| {
+            !code
+                .bytes()
+                .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        }) {
+            bail!("Verification failure code is invalid");
+        }
+        let check = ProjectCheck {
+            id: execution.check_id.clone(),
+            argv: execution.argv.clone(),
+            version_argv: execution.version_argv.clone(),
+            working_directory: execution.working_directory.clone(),
+        };
+        validate_project_checks(std::slice::from_ref(&check))?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot start verification result transaction")?;
+        validate_lease_in_transaction(&transaction, lease, now_ms()?)?;
+        let task_id: Option<i64> = transaction
+            .query_row(
+                "SELECT task_id FROM verification_runs WHERE id = ?1 AND status = 'running'",
+                [run_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(task_id) = task_id else {
+            bail!("Verification run #{run_id} is missing or already finished");
+        };
+        let required: Option<(String, String, String)> = transaction
+            .query_row(
+                "SELECT argv_json, version_argv_json, working_directory
+                 FROM task_verification_checks WHERE task_id = ?1 AND check_id = ?2",
+                params![task_id, execution.check_id],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .optional()?;
+        let Some((required_argv, required_version_argv, required_cwd)) = required else {
+            bail!(
+                "Check {:?} is not a saved requirement for this task",
+                execution.check_id
+            );
+        };
+        if serde_json::from_str::<Vec<String>>(&required_argv)? != execution.argv
+            || serde_json::from_str::<Vec<String>>(&required_version_argv)?
+                != execution.version_argv
+            || required_cwd != execution.working_directory
+        {
+            bail!("Verification command does not match the saved task requirement");
+        }
+        let finished_at_ms = now_ms()?;
+        transaction.execute(
+            "INSERT INTO verification_results
+                 (run_id, check_id, argv_json, version_argv_json, working_directory,
+                  tool_version, version_duration_ms, version_exit_code, duration_ms, exit_code,
+                  timed_out, failure_code,
+                  stdout_sha256, stderr_sha256, finished_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+            params![
+                run_id,
+                execution.check_id,
+                required_argv,
+                required_version_argv,
+                execution.working_directory,
+                execution.tool_version,
+                execution.version_duration_ms,
+                execution.version_exit_code,
+                execution.duration_ms,
+                execution.exit_code,
+                execution.timed_out,
+                execution.failure_code,
+                execution.stdout_sha256,
+                execution.stderr_sha256,
+                finished_at_ms,
+            ],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot commit verification result")?;
+        Ok(())
+    }
+
+    pub fn finish_verification_run(
+        &mut self,
+        run_id: i64,
+        snapshot_matches_review: bool,
+        lease: &SupervisorLease,
+    ) -> Result<VerificationRunRecord> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot finish verification run transaction")?;
+        validate_lease_in_transaction(&transaction, lease, now_ms()?)?;
+        let run: Option<(i64, i64, String, String, i64)> = transaction
+            .query_row(
+                "SELECT task_id, critic_review_id, revision_id, status, started_at_ms
+                 FROM verification_runs WHERE id = ?1",
+                [run_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((task_id, critic_review_id, revision_id, current_status, started_at_ms)) = run
+        else {
+            bail!("Verification run #{run_id} does not exist");
+        };
+        if current_status != "running" {
+            bail!("Verification run #{run_id} has already finished");
+        }
+        let required_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM task_verification_checks WHERE task_id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        let result_summary: (i64, i64) = transaction.query_row(
+            "SELECT COUNT(*), SUM(CASE WHEN version_exit_code = 0 AND exit_code = 0
+                                      AND version_duration_ms IS NOT NULL AND duration_ms IS NOT NULL
+                                      AND timed_out = 0 AND failure_code IS NULL THEN 1 ELSE 0 END)
+             FROM verification_results WHERE run_id = ?1",
+            [run_id],
+            |row| Ok((row.get(0)?, row.get::<_, Option<i64>>(1)?.unwrap_or(0))),
+        )?;
+        let (result_count, passed_count) = result_summary;
+        let latest_review: Option<i64> = transaction
+            .query_row(
+                "SELECT id FROM critic_reviews WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let task_status: Option<String> = transaction
+            .query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let completion_authority_matches = latest_review == Some(critic_review_id)
+            && task_status.as_deref() == Some(TaskStatus::Verifying.as_str());
+        let status = if !snapshot_matches_review || !completion_authority_matches {
+            "stale"
+        } else if result_count != required_count || passed_count != required_count {
+            "failed"
+        } else {
+            "passed"
+        };
+        let finished_at_ms = now_ms()?;
+        let changed = transaction.execute(
+            "UPDATE verification_runs SET status = ?1, finished_at_ms = ?2
+             WHERE id = ?3 AND status = 'running'",
+            params![status, finished_at_ms, run_id],
+        )?;
+        if changed != 1 {
+            bail!("Verification run #{run_id} changed before it could finish");
+        }
+        if status == "passed" {
+            let updated = transaction.execute(
+                "UPDATE tasks SET status = 'complete', updated_at_ms = ?1
+                 WHERE id = ?2 AND status = 'verifying'",
+                params![finished_at_ms, task_id],
+            )?;
+            if updated != 1 {
+                bail!("Task #{task_id} changed before evidence could complete it");
+            }
+        }
+        let reason = match status {
+            "passed" => "All saved project checks passed for the exact approved Git revision",
+            "stale" => {
+                "Git facts or review authority changed while project checks were running; task remains open"
+            }
+            _ => "One or more saved project checks failed or did not produce complete evidence",
+        };
+        let event_data = serde_json::to_string(&serde_json::json!({
+            "run_id": run_id,
+            "critic_review_id": critic_review_id,
+            "revision_id": revision_id,
+            "status": status,
+            "required_checks": required_count,
+            "recorded_checks": result_count,
+            "passed_checks": passed_count,
+            "snapshot_matches_review": snapshot_matches_review,
+        }))?;
+        transaction.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, 'talos', 'verification.finished', ?3, ?4)",
+            params![task_id, finished_at_ms, reason, event_data],
+        )?;
+        if status == "passed" {
+            let transition = serde_json::to_string(&serde_json::json!({
+                "from": "verifying",
+                "to": "complete",
+                "run_id": run_id,
+                "critic_review_id": critic_review_id,
+                "revision_id": revision_id,
+            }))?;
+            transaction.execute(
+                "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+                 VALUES (?1, ?2, 'talos', 'task.status_changed', ?3, ?4)",
+                params![task_id, finished_at_ms, reason, transition],
+            )?;
+        }
+        transaction
+            .commit()
+            .context("Cannot commit verification run result")?;
+        Ok(VerificationRunRecord {
+            id: run_id,
+            task_id,
+            critic_review_id,
+            status: status.to_owned(),
+            revision_id,
+            started_at_ms,
+            finished_at_ms: Some(finished_at_ms),
         })
     }
 
@@ -1694,6 +2355,123 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .context("Cannot create Critic review schema")?;
         migrated_version = 4;
     }
+    if migrated_version == 4 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE critic_reviews ADD COLUMN head_commit TEXT;
+                 ALTER TABLE critic_reviews ADD COLUMN patch_sha256 TEXT;
+                 ALTER TABLE critic_reviews ADD COLUMN changed_paths_json TEXT;
+
+                 INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+                 SELECT tasks.id, CAST(strftime('%s', 'now') AS INTEGER) * 1000, 'talos',
+                        'task.status_changed',
+                        'Legacy Critic approval needs a fresh review with Git facts before verification',
+                        '{\"from\":\"verifying\",\"to\":\"reviewing\",\"cause\":\"missing_git_facts\"}'
+                 FROM tasks
+                 WHERE tasks.status = 'verifying'
+                   AND EXISTS (
+                       SELECT 1 FROM critic_reviews
+                       WHERE critic_reviews.task_id = tasks.id
+                         AND critic_reviews.id = (
+                             SELECT MAX(latest.id) FROM critic_reviews AS latest
+                             WHERE latest.task_id = tasks.id
+                         )
+                         AND critic_reviews.decision = 'approve'
+                         AND (critic_reviews.head_commit IS NULL
+                              OR critic_reviews.patch_sha256 IS NULL
+                              OR critic_reviews.changed_paths_json IS NULL)
+                   );
+                 UPDATE tasks SET status = 'reviewing', updated_at_ms = CAST(strftime('%s', 'now') AS INTEGER) * 1000
+                 WHERE status = 'verifying'
+                   AND EXISTS (
+                       SELECT 1 FROM critic_reviews
+                       WHERE critic_reviews.task_id = tasks.id
+                         AND critic_reviews.id = (
+                             SELECT MAX(latest.id) FROM critic_reviews AS latest
+                             WHERE latest.task_id = tasks.id
+                         )
+                         AND critic_reviews.decision = 'approve'
+                         AND (critic_reviews.head_commit IS NULL
+                              OR critic_reviews.patch_sha256 IS NULL
+                              OR critic_reviews.changed_paths_json IS NULL)
+                   );
+
+                 CREATE TABLE task_verification_checks (
+                     task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+                     check_id TEXT NOT NULL CHECK(length(check_id) BETWEEN 1 AND 64),
+                     ordinal INTEGER NOT NULL CHECK(ordinal >= 0),
+                     argv_json TEXT NOT NULL,
+                     version_argv_json TEXT NOT NULL,
+                     working_directory TEXT NOT NULL,
+                     PRIMARY KEY(task_id, check_id),
+                     UNIQUE(task_id, ordinal)
+                 );
+                 CREATE TRIGGER task_verification_checks_no_update
+                     BEFORE UPDATE ON task_verification_checks BEGIN
+                         SELECT RAISE(ABORT, 'task verification requirements are immutable');
+                     END;
+                 CREATE TRIGGER task_verification_checks_no_delete
+                     BEFORE DELETE ON task_verification_checks BEGIN
+                         SELECT RAISE(ABORT, 'task verification requirements are immutable');
+                     END;
+
+                 CREATE TABLE verification_runs (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+                     critic_review_id INTEGER NOT NULL REFERENCES critic_reviews(id) ON DELETE RESTRICT,
+                     base_revision TEXT NOT NULL,
+                     head_commit TEXT NOT NULL,
+                     revision_id TEXT NOT NULL CHECK(length(revision_id) = 71),
+                     patch_sha256 TEXT NOT NULL CHECK(length(patch_sha256) = 71),
+                     changed_paths_json TEXT NOT NULL,
+                     status TEXT NOT NULL CHECK(status IN ('running', 'passed', 'failed', 'stale')),
+                     started_at_ms INTEGER NOT NULL,
+                     finished_at_ms INTEGER
+                 );
+                 CREATE TABLE verification_results (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     run_id INTEGER NOT NULL REFERENCES verification_runs(id) ON DELETE RESTRICT,
+                     check_id TEXT NOT NULL,
+                     argv_json TEXT NOT NULL,
+                     version_argv_json TEXT NOT NULL,
+                     working_directory TEXT NOT NULL,
+                     tool_version TEXT,
+                     version_exit_code INTEGER,
+                     exit_code INTEGER,
+                     timed_out INTEGER NOT NULL CHECK(timed_out IN (0, 1)),
+                     failure_code TEXT,
+                     stdout_sha256 TEXT NOT NULL CHECK(length(stdout_sha256) = 64),
+                     stderr_sha256 TEXT NOT NULL CHECK(length(stderr_sha256) = 64),
+                     finished_at_ms INTEGER NOT NULL,
+                     UNIQUE(run_id, check_id)
+                 );
+                 CREATE INDEX verification_runs_task_id_id ON verification_runs(task_id, id);
+                 CREATE INDEX verification_results_run_id_id ON verification_results(run_id, id);
+                 CREATE TRIGGER verification_results_no_update
+                     BEFORE UPDATE ON verification_results BEGIN
+                         SELECT RAISE(ABORT, 'verification results are immutable');
+                     END;
+                 CREATE TRIGGER verification_results_no_delete
+                     BEFORE DELETE ON verification_results BEGIN
+                         SELECT RAISE(ABORT, 'verification results are immutable');
+                     END;
+                 PRAGMA user_version = 5;",
+            )
+            .context("Cannot create verification evidence schema")?;
+        migrated_version = 5;
+    }
+    if migrated_version == 5 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE verification_results ADD COLUMN version_duration_ms INTEGER
+                     CHECK(version_duration_ms IS NULL OR version_duration_ms >= 0);
+                 ALTER TABLE verification_results ADD COLUMN duration_ms INTEGER
+                     CHECK(duration_ms IS NULL OR duration_ms >= 0);
+                 PRAGMA user_version = 6;",
+            )
+            .context("Cannot add verification duration evidence")?;
+        migrated_version = 6;
+    }
     if migrated_version != SCHEMA_VERSION {
         bail!("Cannot migrate database from unsupported schema version {migrated_version}");
     }
@@ -1800,13 +2578,16 @@ fn map_critic_review_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CriticR
         task_id: row.get(1)?,
         writer_attempt_id: row.get(2)?,
         base_revision: row.get(3)?,
-        revision_id: row.get(4)?,
-        decision: row.get(5)?,
-        summary: row.get(6)?,
-        result_json: row.get(7)?,
-        adapter: row.get(8)?,
-        adapter_version: row.get(9)?,
-        created_at_ms: row.get(10)?,
+        head_commit: row.get(4)?,
+        revision_id: row.get(5)?,
+        patch_sha256: row.get(6)?,
+        changed_paths_json: row.get(7)?,
+        decision: row.get(8)?,
+        summary: row.get(9)?,
+        result_json: row.get(10)?,
+        adapter: row.get(11)?,
+        adapter_version: row.get(12)?,
+        created_at_ms: row.get(13)?,
     })
 }
 
@@ -1817,6 +2598,54 @@ fn validate_git_revision(value: &str) -> Result<()> {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         bail!("Git revision must be a full hexadecimal object ID");
+    }
+    Ok(())
+}
+
+fn validate_sha256_id(value: &str, label: &str) -> Result<()> {
+    let Some(digest) = value.strip_prefix("sha256:") else {
+        bail!("{label} must use sha256:<64 lowercase hex characters>");
+    };
+    validate_sha256_digest(digest, label)
+}
+
+fn validate_sha256_digest(value: &str, label: &str) -> Result<()> {
+    if value.len() != 64
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+    {
+        bail!("{label} must be a 64-character lowercase SHA-256 digest");
+    }
+    Ok(())
+}
+
+fn validate_changed_paths_json(value: &str) -> Result<()> {
+    use std::path::{Component, Path};
+
+    let paths: Vec<String> =
+        serde_json::from_str(value).context("Changed project paths must be valid JSON")?;
+    if paths.is_empty() || paths.len() > 4096 {
+        bail!("Changed project paths must contain 1 to 4096 entries");
+    }
+    let mut unique = std::collections::HashSet::new();
+    for path_value in &paths {
+        let path = Path::new(path_value);
+        if path_value.len() > 1024
+            || path_value.chars().any(char::is_control)
+            || path.is_absolute()
+            || path
+                .components()
+                .any(|part| !matches!(part, Component::Normal(_)))
+            || path_value == ".talos"
+            || path_value.starts_with(".talos/")
+            || path_value == ".git"
+            || path_value.starts_with(".git/")
+            || contains_sensitive(path_value)
+            || !unique.insert(path_value)
+        {
+            bail!("Changed project path is invalid, duplicated, or outside the review scope");
+        }
     }
     Ok(())
 }
@@ -1983,9 +2812,11 @@ mod tests {
     use rusqlite::OptionalExtension;
 
     use super::{
-        CriticReviewInput, Database, TaskStatus, WriterAttemptOutcome, WriterResolutionAction,
+        CheckExecution, CriticReviewInput, Database, TaskStatus, WriterAttemptOutcome,
+        WriterResolutionAction,
     };
     use crate::project::{DiscoveryMethod, Project};
+    use crate::{checks::ProjectCheck, revision::RevisionFacts};
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -2012,11 +2843,89 @@ mod tests {
             .expect("recovery lease is available")
     }
 
+    fn prepare_approved_verification_task(
+        database: &mut Database,
+        lease_owner: &str,
+    ) -> (i64, i64, RevisionFacts, super::SupervisorLease) {
+        let check = ProjectCheck {
+            id: "unit".to_owned(),
+            argv: vec!["cargo".to_owned(), "test".to_owned()],
+            version_argv: vec!["cargo".to_owned(), "--version".to_owned()],
+            working_directory: ".".to_owned(),
+        };
+        let task = database
+            .add_task_with_checks("Verify the change", "The unit check passes", &[check])
+            .expect("create task with saved verification requirement");
+        let base = "a".repeat(40);
+        let writer = database
+            .begin_writer_attempt(task.id, &"f".repeat(64))
+            .expect("start Writer attempt");
+        database
+            .record_writer_base_revision(writer.id, &base)
+            .expect("record Writer base");
+        database
+            .finish_writer_attempt(
+                writer.id,
+                WriterAttemptOutcome::Succeeded,
+                None,
+                Some(0),
+                Some("SUCCESS"),
+                None,
+            )
+            .expect("finish Writer attempt");
+        let revision_id = format!("sha256:{}", "b".repeat(64));
+        let patch_sha256 = format!("sha256:{}", "c".repeat(64));
+        let result_json = format!(r#"{{"decision":"approve","revision_id":"{revision_id}"}}"#);
+        let review = database
+            .record_critic_review(CriticReviewInput {
+                task_id: task.id,
+                writer_attempt_id: writer.id,
+                base_revision: &base,
+                head_commit: &base,
+                revision_id: &revision_id,
+                patch_sha256: &patch_sha256,
+                changed_paths_json: r#"["src/lib.rs"]"#,
+                decision: "approve",
+                summary: "The change meets its criteria.",
+                result_json: &result_json,
+                adapter: "agy",
+                adapter_version: "1.5.10",
+            })
+            .expect("record approved Critic review");
+        let facts = RevisionFacts {
+            base_commit: base.clone(),
+            head_commit: base,
+            revision_id,
+            patch_sha256,
+            changed_paths: vec!["src/lib.rs".to_owned()],
+        };
+        let lease = recovery_lease(database, lease_owner);
+        (task.id, review.id, facts, lease)
+    }
+
+    fn passing_check_result() -> CheckExecution {
+        CheckExecution {
+            check_id: "unit".to_owned(),
+            argv: vec!["cargo".to_owned(), "test".to_owned()],
+            version_argv: vec!["cargo".to_owned(), "--version".to_owned()],
+            working_directory: ".".to_owned(),
+            tool_version: Some("cargo 1.90.0".to_owned()),
+            version_duration_ms: Some(8),
+            version_exit_code: Some(0),
+            duration_ms: Some(23),
+            exit_code: Some(0),
+            timed_out: false,
+            failure_code: None,
+            stdout_sha256: "d".repeat(64),
+            stderr_sha256: "e".repeat(64),
+        }
+    }
+
     #[test]
     fn initialization_is_idempotent_and_uses_wal() {
         let project = temp_project();
         let first = Database::open(&project).expect("initialize database");
-        assert_eq!(first.schema_version().expect("read schema version"), 4);
+        assert_eq!(first.schema_version().expect("read schema version"), 6);
         assert_eq!(
             first
                 .journal_mode()
@@ -2027,8 +2936,38 @@ mod tests {
         drop(first);
 
         let second = Database::open(&project).expect("open database again");
-        assert_eq!(second.schema_version().expect("read schema version"), 4);
+        assert_eq!(second.schema_version().expect("read schema version"), 6);
         drop(second);
+        cleanup(&project);
+    }
+
+    #[test]
+    fn schema_v5_migrates_to_v6_with_optional_check_durations() {
+        let project = temp_project();
+        let database = Database::open(&project).expect("initialize current database");
+        database
+            .connection
+            .execute_batch(
+                "ALTER TABLE verification_results DROP COLUMN duration_ms;
+                 ALTER TABLE verification_results DROP COLUMN version_duration_ms;
+                 PRAGMA user_version = 5;",
+            )
+            .expect("simulate a schema-v5 database");
+        drop(database);
+
+        let migrated = Database::open(&project).expect("migrate schema-v5 duration fields");
+        assert_eq!(migrated.schema_version().unwrap(), 6);
+        let columns: (i64, i64) = migrated
+            .connection
+            .query_row(
+                "SELECT COUNT(*) FILTER (WHERE name = 'version_duration_ms'),
+                        COUNT(*) FILTER (WHERE name = 'duration_ms')
+                 FROM pragma_table_info('verification_results')",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .expect("read migrated duration columns");
+        assert_eq!(columns, (1, 1));
         cleanup(&project);
     }
 
@@ -2057,7 +2996,252 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_migrates_to_v4_without_losing_tasks() {
+    fn task_checks_are_saved_as_an_immutable_snapshot_and_secrets_are_rejected() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("initialize database");
+        let check = ProjectCheck {
+            id: "unit".to_owned(),
+            argv: vec!["cargo".to_owned(), "test".to_owned()],
+            version_argv: vec!["cargo".to_owned(), "--version".to_owned()],
+            working_directory: ".".to_owned(),
+        };
+        let task = database
+            .add_task_with_checks(
+                "Run tests",
+                "The unit check passes",
+                std::slice::from_ref(&check),
+            )
+            .expect("save task check snapshot");
+        assert_eq!(database.task_verification_checks(task.id).unwrap(), [check]);
+        let assignment_name = ["api", "key"].join("_");
+        let protected_text = format!("{assignment_name}={}", "a".repeat(16));
+        let result = database.add_task("Do not persist", &protected_text);
+        assert!(result.is_err());
+        assert_eq!(database.list_tasks().expect("list tasks").len(), 1);
+        let unconfigured = database
+            .add_task("Attach checks later", "The saved check passes")
+            .expect("create task without check requirements");
+        let later_check = ProjectCheck {
+            id: "format".to_owned(),
+            argv: vec!["cargo".to_owned(), "fmt".to_owned(), "--all".to_owned()],
+            version_argv: vec!["cargo".to_owned(), "--version".to_owned()],
+            working_directory: ".".to_owned(),
+        };
+        database
+            .add_task_verification_checks(unconfigured.id, std::slice::from_ref(&later_check))
+            .expect("attach check before work is reviewed");
+        assert_eq!(
+            database.task_verification_checks(unconfigured.id).unwrap(),
+            [later_check]
+        );
+        cleanup(&project);
+    }
+
+    #[test]
+    fn v4_approved_tasks_reopen_for_fresh_git_facts_and_can_attach_checks() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("initialize current schema");
+        let task = database
+            .add_task("Revalidate legacy approval", "The new check passes")
+            .expect("create legacy task without checks");
+        let base = "a".repeat(40);
+        let writer = database
+            .begin_writer_attempt(task.id, &"f".repeat(64))
+            .expect("begin Writer attempt");
+        database
+            .record_writer_base_revision(writer.id, &base)
+            .expect("record Writer base");
+        database
+            .finish_writer_attempt(
+                writer.id,
+                WriterAttemptOutcome::Succeeded,
+                None,
+                Some(0),
+                Some("SUCCESS"),
+                None,
+            )
+            .expect("finish Writer attempt");
+        let revision = format!("sha256:{}", "b".repeat(64));
+        let result = format!(r#"{{"decision":"approve","revision_id":"{revision}"}}"#);
+        database
+            .record_critic_review(CriticReviewInput {
+                task_id: task.id,
+                writer_attempt_id: writer.id,
+                base_revision: &base,
+                head_commit: &base,
+                revision_id: &revision,
+                patch_sha256: &format!("sha256:{}", "c".repeat(64)),
+                changed_paths_json: r#"["src/lib.rs"]"#,
+                decision: "approve",
+                summary: "The legacy review was approved.",
+                result_json: &result,
+                adapter: "agy",
+                adapter_version: "1.5.10",
+            })
+            .expect("record approved review");
+        assert_eq!(
+            database.list_tasks().unwrap()[0].status,
+            TaskStatus::Verifying
+        );
+
+        database
+            .connection
+            .execute_batch(
+                "DROP TABLE verification_results;
+                 DROP TABLE verification_runs;
+                 DROP TABLE task_verification_checks;
+                 ALTER TABLE critic_reviews DROP COLUMN head_commit;
+                 ALTER TABLE critic_reviews DROP COLUMN patch_sha256;
+                 ALTER TABLE critic_reviews DROP COLUMN changed_paths_json;
+                 PRAGMA user_version = 4;",
+            )
+            .expect("simulate a schema-v4 database");
+        drop(database);
+
+        let mut migrated = Database::open(&project).expect("migrate the v4 approval");
+        assert_eq!(migrated.schema_version().unwrap(), 6);
+        assert_eq!(
+            migrated.list_tasks().unwrap()[0].status,
+            TaskStatus::Reviewing
+        );
+        assert_eq!(
+            migrated
+                .latest_critic_review(task.id)
+                .unwrap()
+                .unwrap()
+                .head_commit,
+            None
+        );
+        let events = migrated.task_events(Some(task.id)).unwrap();
+        assert!(
+            events
+                .iter()
+                .any(|event| event.data_json.contains("missing_git_facts"))
+        );
+        let check = ProjectCheck {
+            id: "unit".to_owned(),
+            argv: vec!["cargo".to_owned(), "test".to_owned()],
+            version_argv: vec!["cargo".to_owned(), "--version".to_owned()],
+            working_directory: ".".to_owned(),
+        };
+        migrated
+            .add_task_verification_checks(task.id, &[check])
+            .expect("attach R5 check before new Critic review");
+        cleanup(&project);
+    }
+
+    #[test]
+    fn completion_requires_all_saved_check_evidence_for_the_approved_revision() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("initialize database");
+        let (task_id, review_id, facts, lease) =
+            prepare_approved_verification_task(&mut database, "verification-test");
+
+        let empty_run = database
+            .begin_verification_run(task_id, review_id, &facts, &lease)
+            .expect("begin first run");
+        let failed = database
+            .finish_verification_run(empty_run.id, true, &lease)
+            .expect("finish without required evidence");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(
+            database.list_tasks().expect("read task")[0].status,
+            TaskStatus::Verifying
+        );
+
+        let run = database
+            .begin_verification_run(task_id, review_id, &facts, &lease)
+            .expect("begin complete run");
+        database
+            .record_verification_result(run.id, &passing_check_result(), &lease)
+            .expect("record matching check evidence");
+        let completed = database
+            .finish_verification_run(run.id, true, &lease)
+            .expect("finish with matching evidence");
+        assert_eq!(completed.status, "passed");
+        assert_eq!(
+            database.list_tasks().expect("read completed task")[0].status,
+            TaskStatus::Complete
+        );
+        let history = database
+            .verification_history(task_id)
+            .expect("read persisted verification evidence");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0].run.status, "failed");
+        assert!(history[0].checks.is_empty());
+        assert_eq!(history[1].run.id, completed.id);
+        assert_eq!(history[1].run.status, "passed");
+        assert_eq!(history[1].checks, [passing_check_result()]);
+        assert_eq!(history[1].checks[0].version_duration_ms, Some(8));
+        assert_eq!(history[1].checks[0].duration_ms, Some(23));
+        assert!(
+            database
+                .task_events(Some(task_id))
+                .expect("read evidence events")
+                .iter()
+                .any(|event| event.event_type == "verification.finished")
+        );
+        cleanup(&project);
+    }
+
+    #[test]
+    fn changed_git_facts_leave_task_open_and_mark_evidence_stale() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("initialize database");
+        let (task_id, review_id, facts, lease) =
+            prepare_approved_verification_task(&mut database, "stale-verification-test");
+        let run = database
+            .begin_verification_run(task_id, review_id, &facts, &lease)
+            .expect("begin run for approved revision");
+        database
+            .record_verification_result(run.id, &passing_check_result(), &lease)
+            .expect("record passing check");
+        let stale = database
+            .finish_verification_run(run.id, false, &lease)
+            .expect("finish after project changed");
+        assert_eq!(stale.status, "stale");
+        assert_eq!(
+            database.list_tasks().expect("read open task")[0].status,
+            TaskStatus::Verifying
+        );
+        cleanup(&project);
+    }
+
+    #[test]
+    fn changed_task_authority_finishes_the_run_as_stale() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("initialize database");
+        let (task_id, review_id, facts, lease) =
+            prepare_approved_verification_task(&mut database, "stale-authority-test");
+        let run = database
+            .begin_verification_run(task_id, review_id, &facts, &lease)
+            .expect("begin verification run");
+        database
+            .record_verification_result(run.id, &passing_check_result(), &lease)
+            .expect("record passing check");
+        database
+            .connection
+            .execute(
+                "UPDATE tasks SET status = 'reviewing' WHERE id = ?1",
+                [task_id],
+            )
+            .expect("simulate task authority change");
+
+        let stale = database
+            .finish_verification_run(run.id, true, &lease)
+            .expect("persist stale result instead of rolling back the run");
+        assert_eq!(stale.status, "stale");
+        assert_eq!(
+            database.verification_history(task_id).unwrap()[0]
+                .run
+                .status,
+            "stale"
+        );
+        cleanup(&project);
+    }
+
+    #[test]
+    fn schema_v1_migrates_to_v6_without_losing_tasks() {
         let project = temp_project();
         project
             .ensure_runtime_dir()
@@ -2099,7 +3283,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate existing database");
-        assert_eq!(database.schema_version().expect("read schema version"), 4);
+        assert_eq!(database.schema_version().expect("read schema version"), 6);
         let tasks = database.list_tasks().expect("read preserved tasks");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Existing v1 task");
@@ -2145,10 +3329,16 @@ mod tests {
                 task_id: task.id,
                 writer_attempt_id: first.id,
                 base_revision: &base,
+                head_commit: &base,
                 revision_id: &format!("sha256:{}", "a".repeat(64)),
+                patch_sha256: &format!("sha256:{}", "d".repeat(64)),
+                changed_paths_json: r#"["src/lib.rs"]"#,
                 decision: "request_changes",
                 summary: "Empty input is still rejected.",
-                result_json: r#"{"decision":"request_changes"}"#,
+                result_json: &format!(
+                    r#"{{"decision":"request_changes","revision_id":"sha256:{}"}}"#,
+                    "a".repeat(64)
+                ),
                 adapter: "agy",
                 adapter_version: "1.5.10",
             })
@@ -2161,10 +3351,16 @@ mod tests {
             task_id: task.id,
             writer_attempt_id: first.id,
             base_revision: &base,
+            head_commit: &base,
             revision_id: &format!("sha256:{}", "c".repeat(64)),
+            patch_sha256: &format!("sha256:{}", "d".repeat(64)),
+            changed_paths_json: r#"["src/lib.rs"]"#,
             decision: "approve",
             summary: "A duplicate review cannot skip the Writer fix.",
-            result_json: r#"{"decision":"approve"}"#,
+            result_json: &format!(
+                r#"{{"decision":"approve","revision_id":"sha256:{}"}}"#,
+                "c".repeat(64)
+            ),
             adapter: "agy",
             adapter_version: "1.5.10",
         });
@@ -2198,10 +3394,16 @@ mod tests {
                 task_id: task.id,
                 writer_attempt_id: fix.id,
                 base_revision: &base,
+                head_commit: &base,
                 revision_id: &format!("sha256:{}", "b".repeat(64)),
+                patch_sha256: &format!("sha256:{}", "d".repeat(64)),
+                changed_paths_json: r#"["src/lib.rs"]"#,
                 decision: "approve",
                 summary: "The revised change meets the stated criterion.",
-                result_json: r#"{"decision":"approve"}"#,
+                result_json: &format!(
+                    r#"{{"decision":"approve","revision_id":"sha256:{}"}}"#,
+                    "b".repeat(64)
+                ),
                 adapter: "agy",
                 adapter_version: "1.5.10",
             })
@@ -2282,10 +3484,16 @@ mod tests {
             task_id: review_task.id,
             writer_attempt_id: writer.id,
             base_revision: &base,
+            head_commit: &base,
             revision_id: &format!("sha256:{}", "c".repeat(64)),
+            patch_sha256: &format!("sha256:{}", "d".repeat(64)),
+            changed_paths_json: r#"["src/lib.rs"]"#,
             decision: "approve",
             summary: "The change meets the criteria.",
-            result_json: r#"{"decision":"approve"}"#,
+            result_json: &format!(
+                r#"{{"decision":"approve","revision_id":"sha256:{}"}}"#,
+                "c".repeat(64)
+            ),
             adapter: "agy",
             adapter_version: "1.5.10",
         });
@@ -2371,7 +3579,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate v2 database");
-        assert_eq!(database.schema_version().expect("read schema version"), 4);
+        assert_eq!(database.schema_version().expect("read schema version"), 6);
         assert!(
             database
                 .has_unresolved_writer_attempts()

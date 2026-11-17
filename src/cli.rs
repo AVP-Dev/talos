@@ -58,6 +58,17 @@ pub enum TaskCommand {
         /// Verifiable acceptance criteria for a later execution round.
         #[arg(long)]
         criteria: Option<String>,
+        /// Named project check from .talos/config.json; may be repeated.
+        #[arg(long = "check", action = clap::ArgAction::Append)]
+        checks: Vec<String>,
+    },
+    /// Add immutable project-check requirements to a queued or review-ready task.
+    Checks {
+        /// ID of the task that will require the checks.
+        task_id: i64,
+        /// Named project check from .talos/config.json; may be repeated.
+        #[arg(long = "check", action = clap::ArgAction::Append, required = true)]
+        checks: Vec<String>,
     },
     /// List tasks in the local queue.
     List,
@@ -69,6 +80,16 @@ pub enum TaskCommand {
     /// Review the latest successful Writer revision with a separate read-only Critic process.
     Review {
         /// ID of the task in review or awaiting fixes.
+        task_id: i64,
+    },
+    /// Run the task's recorded project checks and complete it only with matching evidence.
+    Verify {
+        /// ID of the task with an approved Critic review.
+        task_id: i64,
+    },
+    /// Show immutable project-check evidence for a task.
+    Evidence {
+        /// ID of the task whose verification history will be shown.
         task_id: i64,
     },
     /// Continue the latest eligible terminal Antigravity error conversation.
@@ -153,6 +174,94 @@ mod tests {
             panic!("expected task review command");
         };
         assert_eq!(task_id, 17);
+    }
+
+    #[test]
+    fn task_add_accepts_explicit_verification_check_ids() {
+        let cli = Cli::try_parse_from([
+            "talos",
+            "task",
+            "add",
+            "Implement a verified change",
+            "--criteria",
+            "The unit check passes",
+            "--check",
+            "unit",
+            "--check",
+            "format",
+        ])
+        .expect("parse task with saved project checks");
+        let Command::Task(TaskArgs {
+            command:
+                TaskCommand::Add {
+                    title,
+                    criteria,
+                    checks,
+                },
+        }) = cli.command
+        else {
+            panic!("expected task add command");
+        };
+        assert_eq!(title, "Implement a verified change");
+        assert_eq!(criteria.as_deref(), Some("The unit check passes"));
+        assert_eq!(checks, ["unit", "format"]);
+    }
+
+    #[test]
+    fn task_verify_parses_a_task_id() {
+        let cli = Cli::try_parse_from(["talos", "task", "verify", "17"])
+            .expect("parse task verification command");
+        let Command::Task(TaskArgs {
+            command: TaskCommand::Verify { task_id },
+        }) = cli.command
+        else {
+            panic!("expected task verify command");
+        };
+        assert_eq!(task_id, 17);
+    }
+
+    #[test]
+    fn task_evidence_parses_a_task_id() {
+        let cli = Cli::try_parse_from(["talos", "task", "evidence", "17"])
+            .expect("parse task evidence command");
+        let Command::Task(TaskArgs {
+            command: TaskCommand::Evidence { task_id },
+        }) = cli.command
+        else {
+            panic!("expected task evidence command");
+        };
+        assert_eq!(task_id, 17);
+    }
+
+    #[test]
+    fn task_checks_requires_explicit_check_names() {
+        assert!(Cli::try_parse_from(["talos", "task", "checks", "17"]).is_err());
+        let cli = Cli::try_parse_from(["talos", "task", "checks", "17", "--check", "unit"])
+            .expect("parse task checks command");
+        let Command::Task(TaskArgs {
+            command: TaskCommand::Checks { task_id, checks },
+        }) = cli.command
+        else {
+            panic!("expected task checks command");
+        };
+        assert_eq!(task_id, 17);
+        assert_eq!(checks, ["unit"]);
+    }
+
+    #[test]
+    fn task_checks_add_parses_id_and_check_names() {
+        let cli = Cli::try_parse_from([
+            "talos", "task", "checks", "17", "--check", "unit", "--check", "format",
+        ])
+        .expect("parse verification requirement command");
+        let Command::Task(TaskArgs {
+            command: TaskCommand::Checks { task_id, checks },
+        }) = cli.command
+        else {
+            panic!("expected task checks command");
+        };
+        assert_eq!(task_id, 17);
+        assert_eq!(checks, ["unit", "format"]);
     }
 
     #[test]

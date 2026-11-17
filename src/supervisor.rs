@@ -216,11 +216,16 @@ pub async fn run_critic_review(
         );
     }
     let canonical_json = response.canonical_json()?;
+    let changed_paths_json = serde_json::to_string(&snapshot.changed_paths)
+        .context("Cannot serialize Critic changed paths")?;
     let review = database.record_critic_review(CriticReviewInput {
         task_id,
         writer_attempt_id: writer.id,
         base_revision,
+        head_commit: &snapshot.head_commit,
         revision_id: &snapshot.revision_id,
+        patch_sha256: &snapshot.patch_sha256,
+        changed_paths_json: &changed_paths_json,
         decision: response.decision.as_str(),
         summary: &response.summary,
         result_json: &canonical_json,

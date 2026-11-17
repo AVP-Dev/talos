@@ -3,7 +3,10 @@ use std::{fs, path::Path};
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
-use crate::project::Project;
+use crate::{
+    checks::{ProjectCheck, validate_project_checks},
+    project::Project,
+};
 
 const CONFIG_FILE_NAME: &str = "config.json";
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
@@ -40,6 +43,7 @@ impl AdapterKind {
 pub struct ProjectConfig {
     pub writer: AdapterKind,
     pub critic: AdapterKind,
+    pub checks: Vec<ProjectCheck>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -48,6 +52,8 @@ struct FileConfig {
     schema_version: u32,
     writer: String,
     critic: String,
+    #[serde(default)]
+    checks: Vec<ProjectCheck>,
 }
 
 impl Default for ProjectConfig {
@@ -55,6 +61,7 @@ impl Default for ProjectConfig {
         Self {
             writer: AdapterKind::Agy,
             critic: AdapterKind::Agy,
+            checks: Vec::new(),
         }
     }
 }
@@ -89,15 +96,17 @@ impl ProjectConfig {
             .with_context(|| format!("Cannot read project config {}", path.display()))?;
         let parsed: FileConfig = serde_json::from_slice(&bytes)
             .with_context(|| format!("Project config {} is not valid JSON", path.display()))?;
-        if parsed.schema_version != 1 {
+        if !matches!(parsed.schema_version, 1 | 2) {
             bail!(
                 "Project config schema version {} is unsupported",
                 parsed.schema_version
             );
         }
+        validate_project_checks(&parsed.checks)?;
         Ok(Self {
             writer: parse_adapter(&parsed.writer, AgentRole::Writer)?,
             critic: parse_adapter(&parsed.critic, AgentRole::Critic)?,
+            checks: parsed.checks,
         })
     }
 
@@ -167,6 +176,47 @@ mod tests {
         .expect("write config");
         let error = ProjectConfig::load(&project).expect_err("unverified Critic must be refused");
         assert!(format!("{error:#}").contains("critic adapter"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loads_allowlisted_project_checks_from_config_version_two() {
+        let root = temp_dir();
+        let project = Project {
+            root: root.clone(),
+            discovery: crate::project::DiscoveryMethod::ProjectMarker("Cargo.toml".to_owned()),
+        };
+        project
+            .ensure_runtime_dir()
+            .expect("create runtime directory");
+        fs::write(
+            super::config_path(&root),
+            r#"{"schema_version":2,"writer":"agy","critic":"agy","checks":[{"id":"unit","argv":["cargo","test","--locked"],"version_argv":["cargo","--version"],"working_directory":"."}]}"#,
+        )
+        .expect("write verification config");
+        let config = ProjectConfig::load(&project).expect("load verification check");
+        assert_eq!(config.checks.len(), 1);
+        assert_eq!(config.checks[0].id, "unit");
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refuses_project_checks_outside_the_tool_allowlist() {
+        let root = temp_dir();
+        let project = Project {
+            root: root.clone(),
+            discovery: crate::project::DiscoveryMethod::ProjectMarker("Cargo.toml".to_owned()),
+        };
+        project
+            .ensure_runtime_dir()
+            .expect("create runtime directory");
+        fs::write(
+            super::config_path(&root),
+            r#"{"schema_version":2,"writer":"agy","critic":"agy","checks":[{"id":"unsafe","argv":["sh","-c","touch marker"],"version_argv":["sh","--version"],"working_directory":"."}]}"#,
+        )
+        .expect("write invalid verification config");
+        let error = ProjectConfig::load(&project).expect_err("unapproved tool must be refused");
+        assert!(format!("{error:#}").contains("approved check-tool allowlist"));
         let _ = fs::remove_dir_all(root);
     }
 

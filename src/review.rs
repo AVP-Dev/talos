@@ -247,6 +247,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn critic_patch_fields_are_rejected_instead_of_being_applied() {
+        let response = format!(
+            r#"{{"schema_version":1,"revision_id":"{}","decision":"approve","summary":"Approved.","findings":[],"patch":"diff --git a/a b/a"}}"#,
+            revision()
+        );
+        assert!(
+            CriticResponse::parse_and_validate(&response, &revision(), &[]).is_err(),
+            "the findings-only Critic contract must reject patch payloads"
+        );
+    }
+
     fn revision() -> String {
         "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_owned()
     }

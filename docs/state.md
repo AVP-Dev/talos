@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R4 — Independent Critic is complete for the verified macOS target.** T4.1–T4.6 are done. `task review` uses a fresh Antigravity 1.5.10 process, a bounded exact Git revision, structured findings, and a deny-write session policy. A rejection links the next Writer attempt to the prior review; approval moves to `verifying`, never `complete`. Project checks and the evidence gate remain R5 work. Linux-native build/runtime/sandbox acceptance remains deferred to the user's server under T6.5/T9.3. Backlog count: 31 of 61 scheduled tasks done (50.8% by task count, unweighted); two unscheduled ideas are recorded separately. The next planned task is T5.1.
+**R5 — Verification evidence and permissions is complete for the locally verified macOS path.** T5.1–T5.7 are done. Tasks can save named project checks, run them against the latest approved Critic revision, persist compact evidence, and complete only when all checks and Git facts pass. `task evidence` retrieves that evidence in later sessions. Semi prompts before a one-shot Writer launch. Linux-native build/runtime/sandbox acceptance remains deferred until the user provides server access under T6.5/T9.3. Backlog count: 38 of 61 scheduled tasks done (62.3% by task count, unweighted); two unscheduled ideas are recorded separately. Next task: T6.1.
 
 ## Goal and fixed direction
 
@@ -143,10 +143,11 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - A process-group probe is liveness evidence only. It does not identify the Writer or detect escaped descendants; with no saved PID, the stopped-Writer attestation is entirely operator-provided. The audit actor is recorded as the generic role `operator`.
 - The CLI application checks process-group liveness before resolution; the lower-level database method assumes its caller has performed that probe. Keep resolution behind the checked application path. Resolution immediately sets task status (`reviewing`, `queued`, or `failed`) while preserving the attempt as `unknown`; `authorize-retry` only prepares a later explicit Writer command.
 - No literal PID-reuse event or actual post-spawn/pre-PID crash was forced. Tests cover equivalent persisted states and fail-closed behavior. A hard TALOS crash may leave the 35-minute supervisor lease active until expiry.
-- Independent Critic review is implemented in R4. Automated project checks, evidence-gated completion, background workers, Semi approval, Linux verification, and packaging remain later rounds.
+- At the R4 close, automated project checks and evidence-gated completion were later work; R5 now implements them. Background workers, pause/resume, Linux verification, and packaging remain later rounds.
 - User-approved direction for R4/R7: select Writer and independent Critic CLIs separately from verified adapters; the later concurrency acceptance includes one Writer, one Critic, and at least one additional scoped agent. This is not implemented in R3.
-- TALOS currently relies on each Git project to ignore `.talos/`; `up --auto` rejects a dirty worktree, but `task add` may leave runtime files visible as untracked until the project adds an ignore rule. T5.7 tracks exclusion handling.
+- R5 now checks that `.talos/state.sqlite3` is ignored before opening the database and refuses tracked or unignored state; TALOS does not rewrite project ignore files.
 - An independent read-only review flagged a narrow numeric PGID reuse window in the process-runner's cleanup signal path. It did not identify a confirmed T3.6 resolution defect. T6.3 now tracks a focused review/fix; until resolved, do not claim OS-verified process identity.
+- Project-check timeout currently kills and reaps the direct command process, but does not yet provide the Writer runner's process-group cleanup for any descendants. A timed-out check cannot complete its task; T6.3 tracks process-group containment and the related PGID reuse review before claiming full subprocess-tree cancellation.
 
 ## Repository and runtime condition
 
@@ -155,7 +156,7 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - Product history follow-up is recorded as unscheduled idea F1, to revisit after R9. The current database stores task metadata and lifecycle events plus Writer-attempt metadata; it does not persist a separate project plan, project-creation history, or full Writer transcript.
 - Earlier smoke databases were isolated under `/private/tmp`; the R4 runtime database in this workspace is now documented below.
 - `.talos/state.sqlite3` now exists locally from R4 smoke use; it contains no queued tasks. Two accidental harness tasks were removed after a SQLite backup was made to `/private/tmp/talos-r4-db-before-cleanup.sqlite3`. The workspace database remains ignored by Git.
-- TALOS-driven Antigravity runs happened only in disposable projects. No external AI CLI has written to the TALOS source tree. There is no background worker or tmux session; `up --auto` is one-shot and `up --semi` is not implemented.
+- TALOS-driven Antigravity runs happened only in disposable projects. No external AI CLI has written to the TALOS source tree. There is no background worker or tmux session; `up --auto` and `up --semi` are one-shot.
 - The original Agent Starter Kit and pair-mailbox repositories remain untouched.
 
 ## R4 closure acceptance — 2026-11-17
@@ -181,15 +182,38 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - Normal sandbox did not allow Agy's local runtime needs; the successful live Critic and boundary probes ran with host access in disposable directories. No TALOS source files were passed to an external Writer. Probe token usage is not stored in the project database.
 - Linux-native build/runtime/sandbox checks remain unverified and deferred to the user's server.
 
+## R5 closure acceptance — 2026-11-18
+
+### Implemented
+
+- Added `src/checks.rs`, `src/policy.rs`, and `src/secrets.rs` for allowlisted project-check execution, bounded capture and hashes, Auto/Semi authorization, and deterministic credential handling.
+- Added project config schema v2 with named checks. A task saves an immutable command/version/CWD snapshot using `task add --check` or `task checks`.
+- Added `task verify` and `task evidence`. Verification takes the supervisor lease, requires the latest approved review and exact revision identity, records all check results, and completes the task only in the same transaction that closes a fully passing run. Failed, incomplete, changed, or authority-stale runs remain open and are visible in evidence history.
+- Advanced SQLite to schema v6. Existing v4 tasks with approval records lacking new Git facts return to `reviewing` and require a fresh review; existing v5 verification rows migrate with unknown historical durations. Migrations retain task/event data.
+- Added the `.talos/state.sqlite3` ignore guard before opening TALOS state. Tracked or non-ignored database files fail closed; TALOS does not edit project ignore rules.
+- Semi mode requires a TTY and prompts before its one Writer launch. Critic output remains findings-only; an unknown `patch` response field is rejected.
+- Updated `README.md`, `docs/plan.md`, `docs/tasks.md`, `docs/architecture.md`, `docs/critic-review-contract.md`, this handoff, and ADR-025. T5.3 is explicitly refined to preserve the findings-only Critic contract.
+
+### Verification results
+
+- `cargo fmt --all && ./scripts/verify-project.sh` — passed all required checks: formatting; Clippy with `-D warnings`; **103 passed / 1 ignored** (the helper is invoked by its signal-forwarding test); macOS ARM64 release build; `security-scan: clean`.
+- Tests cover schema-v4/v5 migration, immutable check snapshots, secret rejection, task completion only with all matching evidence, retrieval of run evidence including durations, changed Git facts, changed task authority, and a real allowlisted `cargo --version` check.
+- The macOS toolchain printed non-fatal `xcrun` cache-file permission warnings during Git and SQLite build steps; all required commands exited successfully.
+- Linux was not connected, installed, built, or tested. Per ADR-023, native Linux checks remain deferred until the user provides server access under T6.5/T9.3.
+
+### Next round
+
+- R5 is complete for the verified macOS path. Continue to **T6.1 — create and reconnect the tmux control session**. Keep the repository local on `master`; the user will create the hosted repository later.
+
 ### Repository and next action
 
-- Local Git remains on `master`; no remote is configured yet. The connected GitHub account is `AVP-Dev`; its connector does not expose repository creation, so use the authenticated browser UI to create the explicitly authorized private repo, then push local history. Leave topics unset because their names are public even for private repositories.
+- Local Git remains on `master`; no remote is configured. The user will create a hosted repository later. Do not add a remote or push.
 - Local `.talos/state.sqlite3` has no queued tasks. It remains ignored; an offline backup of the test DB is in `/private/tmp` until temporary probe cleanup.
-- Next task: **T5.1 — acceptance criteria and project-check evidence.** The user has asked to continue sequentially through later rounds in this same session. Start R5 after the R4 verification profile passes and its local commit is recorded.
+- Next task: **T6.1 — create and reconnect the tmux control session.** Continue sequentially through R6–R9. Do not connect to a Linux host or run Linux-native checks until the user provides server access.
 
 ## Next action
 
-Inspect the full R4 diff, commit it locally on `master`, create the authorized private GitHub repository, set its default branch to `master`, and push the local history. Then begin T5.1 as explicitly requested. Linux-native validation remains for the user's server.
+R5 has been implemented and locally verified. Commit the reviewed R5 source and documentation locally on `master`, then continue with T6.1. Keep all work local; the user will create the hosted repository later. Linux-native implementation can proceed in its planned round, but server connection and Linux-native verification are deferred until access is provided.
 
 ## Session close checklist
 

@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::{Context, Result, bail};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 const MAX_REVIEW_PATCH_BYTES: usize = 64 * 1024;
@@ -12,9 +13,20 @@ const PROJECT_PATHS: [&str; 3] = [".", ":(exclude).git", ":(exclude).talos"];
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RevisionSnapshot {
     pub base_commit: String,
+    pub head_commit: String,
     pub revision_id: String,
+    pub patch_sha256: String,
     pub changed_paths: Vec<String>,
     pub patch: String,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct RevisionFacts {
+    pub base_commit: String,
+    pub head_commit: String,
+    pub revision_id: String,
+    pub patch_sha256: String,
+    pub changed_paths: Vec<String>,
 }
 
 /// Capture a Git base revision for a new Writer task. Existing changes are rejected so that
@@ -129,18 +141,33 @@ impl RevisionSnapshot {
         changed_paths.dedup();
         let patch = String::from_utf8(patch)
             .context("The Git patch is not valid UTF-8 and cannot be sent to the Critic")?;
+        let head_commit = git_head(project_root)?
+            .context("Critic revision facts require a committed Git HEAD")?;
         let mut digest = Sha256::new();
         digest.update(base_commit.as_bytes());
         digest.update([0]);
         digest.update(patch.as_bytes());
         let revision_id = format!("sha256:{}", lower_hex(&digest.finalize()));
+        let patch_sha256 = format!("sha256:{}", lower_hex(&Sha256::digest(patch.as_bytes())));
 
         Ok(Self {
             base_commit: base_commit.to_owned(),
+            head_commit,
             revision_id,
+            patch_sha256,
             changed_paths,
             patch,
         })
+    }
+
+    pub fn facts(&self) -> RevisionFacts {
+        RevisionFacts {
+            base_commit: self.base_commit.clone(),
+            head_commit: self.head_commit.clone(),
+            revision_id: self.revision_id.clone(),
+            patch_sha256: self.patch_sha256.clone(),
+            changed_paths: self.changed_paths.clone(),
+        }
     }
 }
 
@@ -279,6 +306,8 @@ mod tests {
 
         let snapshot = RevisionSnapshot::capture(&root, &base).expect("capture complete diff");
         assert_eq!(snapshot.changed_paths, ["new.txt", "tracked.txt"]);
+        assert_eq!(snapshot.head_commit, base);
+        assert!(snapshot.patch_sha256.starts_with("sha256:"));
         assert!(snapshot.patch.contains("tracked.txt"));
         assert!(snapshot.patch.contains("new.txt"));
         assert!(snapshot.patch.contains("new file"));
