@@ -13,7 +13,6 @@ pub mod secrets;
 pub mod supervisor;
 pub mod tmux;
 
-#[cfg(test)]
 mod process_identity;
 
 pub use app::run;

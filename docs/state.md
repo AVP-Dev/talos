@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R6 — Runtime and resumption is in progress.** T6.1 and T6.2 are complete. T6.3 implementation adds cooperative stop/cancellation, process-group cleanup for project checks, and early stale-lease reclaim when the recorded supervisor PID is absent. T6.3 behavior tests and full-profile verification remain pending. R5 and R6.2 pass the local macOS profile. Linux-native build/runtime/sandbox acceptance remains deferred until the user provides server access under T6.5/T9.3. Backlog count: 40 of 61 scheduled tasks done (65.6% by task count, unweighted); two unscheduled ideas are recorded separately.
+**R6 — Runtime and resumption is in progress.** T6.1 and T6.2 are complete. T6.3 implementation adds cooperative stop/cancellation, process-group cleanup for project checks, and early stale-lease reclaim when the recorded supervisor PID is absent. T6.4's macOS SSH reconnect scenario and T6.3 behavior/profile verification remain pending. T6.5 implementation adds schema-v9 Linux `/proc` fingerprints and recovery reporting; Linux-native build/runtime/sandbox acceptance is deferred until the user provides server access. R5 and R6.2 pass the local macOS profile. Backlog count: 40 of 61 scheduled tasks done (65.6% by task count, unweighted); two unscheduled ideas are recorded separately.
 
 ## Goal and fixed direction
 
@@ -240,11 +240,20 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - Added best-effort early supervisor-lease reclaim: only a parseable `talos-task-*` owner PID that returns ESRCH can be treated as gone; an alive, reused, inaccessible, or unknown PID fails closed. Recovery advances the fencing token and still quarantines unfinished attempts as `unknown`.
 - Updated README, plan, backlog, architecture, and ADR-027 with command behavior, failure boundaries, and the normal-exit descendant limitation.
 - `cargo fmt --all` and `cargo check --all-targets --all-features` passed on macOS. The newly added behavior tests and full verification profile have not been run in this batch; mark T6.3 in progress until those acceptance checks are completed. No Linux host was contacted.
-- Working tree changes are not committed yet. The repository remains local on `master`, with no remote. Linux-native checks remain deferred until the user provides server access.
+- R6.3 is committed locally as `173d736`; the repository remains on `master` with no remote. Linux-native checks remain deferred until the user provides server access.
+
+## R6.4–R6.5 progress — 2026-11-18
+
+- T6.4 uses the existing project-scoped tmux shell and durable project database. The required macOS SSH disconnect/reconnect scenario has not been run; Linux boot recovery/systemd autostart remains deferred.
+- Advanced SQLite to schema v9 with an optional immutable-at-launch process fingerprint. On Linux, capture uses `/proc/<pid>/stat` fields for process group and start ticks plus `/proc/sys/kernel/random/boot_id`; on other platforms capture returns unavailable.
+- Writer launch stores the fingerprint when capture succeeds. `task recover` compares saved and current values and reports `matches`, `different_process`, `unavailable`, or `not_recorded`. Recovery events retain the recorded value. This remains lifecycle evidence only and does not change quarantine, stop, resolution, or retry rules.
+- Updated the README, architecture, plan, backlog, and this handoff. The v1–v8 SQLite migrations remain in sequence; schema-v9 migration coverage was added but not executed.
+- `cargo fmt --all && cargo check --all-targets --all-features` passed on macOS after the T6.5 edits. Behavior tests and the schema migration tests were not executed. No Linux host was contacted. R6.4/T6.5 are not complete until the relevant reconnect/server acceptance is observed.
+- T6.3 code and docs are committed locally as `173d736`; T6.5 changes are uncommitted. Branch remains `master`, with no remote.
 
 ## Next action
 
-Continue R6 in order. T6.3 is implemented but still in progress pending its behavior and full-profile checks. Then take T6.4 (SSH reconnect), T6.5 (Linux process identity and server acceptance), and T6.6 (interactive handoff). Do not connect to a Linux host or run Linux-native checks until the user provides access. Keep all work local; the user will create the hosted repository later.
+Continue R6 in order. T6.3 behavior/profile checks and T6.4 macOS SSH reconnect remain open. T6.5 code now stores Linux process identity and reports it without changing recovery authority; run the macOS compile check, then defer Linux build/runtime/Agy acceptance until server access. Next is T6.6 (interactive handoff), then continue R7–R9 in order. Keep all work local; the user will create the hosted repository later.
 
 ## Session close checklist
 

@@ -15,7 +15,7 @@ use crate::{
     secrets::contains_sensitive,
 };
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -85,6 +85,7 @@ pub struct WriterAttemptRecord {
     pub source_attempt_id: Option<i64>,
     pub base_revision: Option<String>,
     pub source_review_id: Option<i64>,
+    pub process_identity_fingerprint: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -188,6 +189,7 @@ type WriterFinalizationState = (
     Option<i64>,
     Option<String>,
     Option<i64>,
+    Option<String>,
 );
 
 type CriticReviewSnapshot = (
@@ -1118,6 +1120,7 @@ impl Database {
             source_attempt_id: None,
             base_revision: revision_source.as_ref().map(|(_, base)| base.clone()),
             source_review_id: revision_source.map(|(review_id, _)| review_id),
+            process_identity_fingerprint: None,
         })
     }
 
@@ -1171,8 +1174,25 @@ impl Database {
     }
 
     pub fn mark_writer_attempt_running(&mut self, attempt_id: i64, process_id: u32) -> Result<()> {
+        self.mark_writer_attempt_running_with_identity(attempt_id, process_id, None)
+    }
+
+    pub fn mark_writer_attempt_running_with_identity(
+        &mut self,
+        attempt_id: i64,
+        process_id: u32,
+        process_identity_fingerprint: Option<&str>,
+    ) -> Result<()> {
         if process_id == 0 {
             bail!("Writer process ID must be greater than zero");
+        }
+        if let Some(fingerprint) = process_identity_fingerprint {
+            validate_record_text("Process identity fingerprint", fingerprint, 256)?;
+            if !fingerprint.bytes().all(|byte| {
+                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b':' || byte == b'-'
+            }) {
+                bail!("Process identity fingerprint contains unsupported characters");
+            }
         }
         let transaction = self
             .connection
@@ -1189,8 +1209,14 @@ impl Database {
             bail!("Writer attempt #{attempt_id} is missing or is not awaiting launch");
         };
         let changed = transaction.execute(
-            "UPDATE writer_attempts SET state = 'running', process_id = ?1 WHERE id = ?2 AND state = 'launching'",
-            params![i64::from(process_id), attempt_id],
+            "UPDATE writer_attempts
+             SET state = 'running', process_id = ?1, process_identity_fingerprint = ?2
+             WHERE id = ?3 AND state = 'launching'",
+            params![
+                i64::from(process_id),
+                process_identity_fingerprint,
+                attempt_id
+            ],
         )?;
         if changed != 1 {
             bail!("Writer attempt #{attempt_id} changed during process launch");
@@ -1199,6 +1225,7 @@ impl Database {
         let event_data = serde_json::to_string(&serde_json::json!({
             "attempt_id": attempt_id,
             "process_id": process_id,
+            "process_identity_recorded": process_identity_fingerprint.is_some(),
         }))?;
         transaction.execute(
             "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
@@ -1283,7 +1310,7 @@ impl Database {
                 "SELECT id, task_id, state, process_id, started_at_ms, finished_at_ms,
                         prompt_sha256, conversation_id, exit_code, agent_status, error_code,
                         operator_resolution, resolved_at_ms, resolution_reason, source_attempt_id,
-                        base_revision, source_review_id
+                        base_revision, source_review_id, process_identity_fingerprint
                  FROM writer_attempts WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
                 [task_id],
                 map_writer_attempt_record,
@@ -1337,7 +1364,7 @@ impl Database {
                 "SELECT id, task_id, state, process_id, started_at_ms, finished_at_ms,
                         prompt_sha256, conversation_id, exit_code, agent_status, error_code,
                         operator_resolution, resolved_at_ms, resolution_reason, source_attempt_id,
-                        base_revision, source_review_id
+                        base_revision, source_review_id, process_identity_fingerprint
                  FROM writer_attempts WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
                 [task_id],
                 map_writer_attempt_record,
@@ -1420,6 +1447,7 @@ impl Database {
             source_attempt_id: Some(source_attempt_id),
             base_revision: source.base_revision,
             source_review_id: source.source_review_id,
+            process_identity_fingerprint: None,
         })
     }
 
@@ -1451,7 +1479,8 @@ impl Database {
         let current: Option<WriterFinalizationState> = transaction
             .query_row(
                 "SELECT task_id, state, prompt_sha256, process_id, started_at_ms, conversation_id,
-                        source_attempt_id, base_revision, source_review_id
+                        source_attempt_id, base_revision, source_review_id,
+                        process_identity_fingerprint
                  FROM writer_attempts WHERE id = ?1",
                 [attempt_id],
                 |row| {
@@ -1465,6 +1494,7 @@ impl Database {
                         row.get(6)?,
                         row.get(7)?,
                         row.get(8)?,
+                        row.get(9)?,
                     ))
                 },
             )
@@ -1479,6 +1509,7 @@ impl Database {
             source_attempt_id,
             base_revision,
             source_review_id,
+            process_identity_fingerprint,
         )) = current
         else {
             bail!("Writer attempt #{attempt_id} does not exist");
@@ -1619,6 +1650,7 @@ impl Database {
             source_attempt_id,
             base_revision,
             source_review_id,
+            process_identity_fingerprint,
         })
     }
 
@@ -1768,7 +1800,7 @@ impl Database {
         }
         let unfinished = {
             let mut statement = transaction.prepare(
-                "SELECT id, task_id, state, process_id FROM writer_attempts
+                "SELECT id, task_id, state, process_id, process_identity_fingerprint FROM writer_attempts
                  WHERE state IN ('launching', 'running') ORDER BY id",
             )?;
             statement
@@ -1778,12 +1810,15 @@ impl Database {
                         row.get::<_, i64>(1)?,
                         row.get::<_, String>(2)?,
                         row.get::<_, Option<i64>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
                     ))
                 })?
                 .collect::<rusqlite::Result<Vec<_>>>()?
         };
 
-        for (attempt_id, task_id, previous_state, process_id) in &unfinished {
+        for (attempt_id, task_id, previous_state, process_id, process_identity_fingerprint) in
+            &unfinished
+        {
             let task_status: String = transaction.query_row(
                 "SELECT status FROM tasks WHERE id = ?1",
                 [task_id],
@@ -1833,6 +1868,7 @@ impl Database {
                 "from": previous_state,
                 "to": "unknown",
                 "recorded_process_id": process_id,
+                "recorded_process_identity_fingerprint": process_identity_fingerprint,
                 "lease_fencing_token": lease.fencing_token,
             }))?;
             transaction.execute(
@@ -1876,7 +1912,7 @@ impl Database {
             "SELECT id, task_id, state, process_id, started_at_ms, finished_at_ms,
                     prompt_sha256, conversation_id, exit_code, agent_status, error_code,
                     operator_resolution, resolved_at_ms, resolution_reason, source_attempt_id,
-                    base_revision, source_review_id
+                    base_revision, source_review_id, process_identity_fingerprint
              FROM writer_attempts WHERE (?1 IS NULL OR task_id = ?1) ORDER BY id",
         )?;
         let attempts = statement
@@ -2936,6 +2972,18 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .context("Cannot add durable Writer stop requests")?;
         migrated_version = 8;
     }
+    if migrated_version == 8 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE writer_attempts
+                     ADD COLUMN process_identity_fingerprint TEXT
+                         CHECK(process_identity_fingerprint IS NULL
+                               OR length(process_identity_fingerprint) BETWEEN 1 AND 256);
+                 PRAGMA user_version = 9;",
+            )
+            .context("Cannot add durable Writer process identity")?;
+        migrated_version = 9;
+    }
     if migrated_version != SCHEMA_VERSION {
         bail!("Cannot migrate database from unsupported schema version {migrated_version}");
     }
@@ -3065,6 +3113,7 @@ fn map_writer_attempt_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Writer
         source_attempt_id: row.get(14)?,
         base_revision: row.get(15)?,
         source_review_id: row.get(16)?,
+        process_identity_fingerprint: row.get(17)?,
     })
 }
 
@@ -3422,7 +3471,7 @@ mod tests {
     fn initialization_is_idempotent_and_uses_wal() {
         let project = temp_project();
         let first = Database::open(&project).expect("initialize database");
-        assert_eq!(first.schema_version().expect("read schema version"), 8);
+        assert_eq!(first.schema_version().expect("read schema version"), 9);
         assert_eq!(
             first
                 .journal_mode()
@@ -3433,19 +3482,20 @@ mod tests {
         drop(first);
 
         let second = Database::open(&project).expect("open database again");
-        assert_eq!(second.schema_version().expect("read schema version"), 8);
+        assert_eq!(second.schema_version().expect("read schema version"), 9);
         drop(second);
         cleanup(&project);
     }
 
     #[test]
-    fn schema_v5_migrates_to_v8_with_optional_check_durations_and_control_state() {
+    fn schema_v5_migrates_to_v9_with_optional_check_durations_and_control_state() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
         database
             .connection
             .execute_batch(
-                "ALTER TABLE verification_results DROP COLUMN duration_ms;
+                "ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
+                 ALTER TABLE verification_results DROP COLUMN duration_ms;
                  ALTER TABLE verification_results DROP COLUMN version_duration_ms;
                  DROP TABLE project_control_events;
                  DROP TABLE project_control_state;
@@ -3455,7 +3505,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema-v5 duration fields");
-        assert_eq!(migrated.schema_version().unwrap(), 8);
+        assert_eq!(migrated.schema_version().unwrap(), 9);
         let columns: (i64, i64) = migrated
             .connection
             .query_row(
@@ -3472,7 +3522,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v6_migrates_to_v8_without_losing_tasks() {
+    fn schema_v6_migrates_to_v9_without_losing_tasks() {
         let project = temp_project();
         let mut database = Database::open(&project).expect("initialize current database");
         let task = database
@@ -3481,7 +3531,8 @@ mod tests {
         database
             .connection
             .execute_batch(
-                "DROP TABLE project_control_events;
+                "ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
+                 DROP TABLE project_control_events;
                  DROP TABLE project_control_state;
                  PRAGMA user_version = 6;",
             )
@@ -3489,7 +3540,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v6");
-        assert_eq!(migrated.schema_version().unwrap(), 8);
+        assert_eq!(migrated.schema_version().unwrap(), 9);
         assert_eq!(migrated.list_tasks().unwrap()[0].id, task.id);
         assert!(!migrated.project_control_state().unwrap().queue_paused);
         cleanup(&project);
@@ -3502,20 +3553,46 @@ mod tests {
         database
             .connection
             .execute_batch(
-                "ALTER TABLE project_control_state DROP COLUMN stop_requested_attempt_id;
+                "ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
+                 ALTER TABLE project_control_state DROP COLUMN stop_requested_attempt_id;
                  PRAGMA user_version = 7;",
             )
             .expect("simulate schema v7");
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v7");
-        assert_eq!(migrated.schema_version().unwrap(), 8);
+        assert_eq!(migrated.schema_version().unwrap(), 9);
         assert_eq!(
             migrated
                 .project_control_state()
                 .unwrap()
                 .stop_requested_attempt_id,
             None
+        );
+        cleanup(&project);
+    }
+
+    #[test]
+    fn schema_v8_migrates_with_no_recorded_process_identity() {
+        let project = temp_project();
+        let database = Database::open(&project).expect("initialize current database");
+        database
+            .connection
+            .execute_batch(
+                "ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
+                 PRAGMA user_version = 8;",
+            )
+            .expect("simulate schema v8");
+        drop(database);
+
+        let migrated = Database::open(&project).expect("migrate schema v8");
+        assert_eq!(migrated.schema_version().unwrap(), 9);
+        assert!(
+            migrated
+                .writer_attempts(None)
+                .unwrap()
+                .iter()
+                .all(|attempt| attempt.process_identity_fingerprint.is_none())
         );
         cleanup(&project);
     }
@@ -3850,6 +3927,7 @@ mod tests {
                  ALTER TABLE critic_reviews DROP COLUMN head_commit;
                  ALTER TABLE critic_reviews DROP COLUMN patch_sha256;
                  ALTER TABLE critic_reviews DROP COLUMN changed_paths_json;
+                 ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
                  DROP TABLE project_control_events;
                  DROP TABLE project_control_state;
                  PRAGMA user_version = 4;",
@@ -3858,7 +3936,7 @@ mod tests {
         drop(database);
 
         let mut migrated = Database::open(&project).expect("migrate the v4 approval");
-        assert_eq!(migrated.schema_version().unwrap(), 8);
+        assert_eq!(migrated.schema_version().unwrap(), 9);
         assert_eq!(
             migrated.list_tasks().unwrap()[0].status,
             TaskStatus::Reviewing
@@ -4000,7 +4078,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_migrates_to_v8_without_losing_tasks() {
+    fn schema_v1_migrates_to_v9_without_losing_tasks() {
         let project = temp_project();
         project
             .ensure_runtime_dir()
@@ -4042,7 +4120,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate existing database");
-        assert_eq!(database.schema_version().expect("read schema version"), 8);
+        assert_eq!(database.schema_version().expect("read schema version"), 9);
         let tasks = database.list_tasks().expect("read preserved tasks");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Existing v1 task");
@@ -4338,7 +4416,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate v2 database");
-        assert_eq!(database.schema_version().expect("read schema version"), 8);
+        assert_eq!(database.schema_version().expect("read schema version"), 9);
         assert!(
             database
                 .has_unresolved_writer_attempts()

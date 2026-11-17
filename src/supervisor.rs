@@ -417,7 +417,18 @@ async fn run_writer_attempt_inner(
         },
         |event| match event {
             AgyProcessEvent::Started(process_id) => {
-                database.mark_writer_attempt_running(attempt.id, process_id)
+                let process_identity = match crate::process_identity::capture(process_id) {
+                    Ok(identity) => Some(identity.fingerprint),
+                    Err(error) => {
+                        tracing::debug!(%error, process_id, "Writer process identity is unavailable");
+                        None
+                    }
+                };
+                database.mark_writer_attempt_running_with_identity(
+                    attempt.id,
+                    process_id,
+                    process_identity.as_deref(),
+                )
             }
             AgyProcessEvent::ConversationId(conversation_id) => {
                 database.record_writer_conversation_id(attempt.id, &conversation_id)

@@ -1,4 +1,6 @@
-use anyhow::{Context, Result, bail};
+#[cfg(any(test, target_os = "linux"))]
+use anyhow::Context;
+use anyhow::{Result, bail};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct ProcessIdentity {
@@ -72,6 +74,7 @@ fn capture_platform(_process_id: u32) -> Result<ProcessIdentity> {
     bail!("A supported public process identity source is unavailable on this platform")
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn parse_linux_stat(value: &str) -> Result<(u32, u32, u64)> {
     let open_paren = value
         .find('(')
@@ -103,6 +106,7 @@ fn parse_linux_stat(value: &str) -> Result<(u32, u32, u64)> {
     Ok((process_id, process_group_id, start_time_ticks))
 }
 
+#[cfg(any(test, target_os = "linux"))]
 fn normalize_linux_boot_id(value: &str) -> Result<String> {
     let value = value.trim().to_ascii_lowercase();
     let bytes = value.as_bytes();

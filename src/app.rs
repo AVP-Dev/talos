@@ -1348,6 +1348,20 @@ fn recover_writer_attempts(json_output: bool, database: &mut Database) -> Result
                 || (attempt.state == "unknown" && attempt.operator_resolution.is_none())
         })
         .collect::<Vec<_>>();
+    let process_identity_checks = unresolved_attempts
+        .iter()
+        .map(|attempt| {
+            json!({
+                "attempt_id": attempt.id,
+                "status": crate::process_identity::compare(
+                    attempt.process_id,
+                    attempt.process_identity_fingerprint.as_deref(),
+                )
+                .as_str(),
+                "lifecycle_evidence_only": true,
+            })
+        })
+        .collect::<Vec<_>>();
 
     if json_output {
         print_json(&json!({
@@ -1358,6 +1372,7 @@ fn recover_writer_attempts(json_output: bool, database: &mut Database) -> Result
             },
             "newly_quarantined": quarantined_count,
             "unresolved_attempts": unresolved_attempts,
+            "process_identity_checks": process_identity_checks,
             "writer_launched": false,
             "automatic_retry": false,
         }))?;
@@ -1380,12 +1395,20 @@ fn recover_writer_attempts(json_output: bool, database: &mut Database) -> Result
                 .map(|pid| pid.to_string())
                 .unwrap_or_else(|| "not recorded".to_owned());
             println!(
-                "Attempt #{} for task #{} is {} (recorded PID: {}).",
-                attempt.id, attempt.task_id, attempt.state, recorded_pid
+                "Attempt #{} for task #{} is {} (recorded PID: {}, process identity: {}).",
+                attempt.id,
+                attempt.task_id,
+                attempt.state,
+                recorded_pid,
+                crate::process_identity::compare(
+                    attempt.process_id,
+                    attempt.process_identity_fingerprint.as_deref(),
+                )
+                .as_str()
             );
         }
         println!(
-            "An unresolved Writer may still be running or may have changed project files. TALOS did not inspect or signal processes, resume a conversation, or retry an attempt. Inspect process and project state before deciding how to proceed."
+            "Process identity is lifecycle evidence only and does not establish a Writer outcome. An unresolved Writer may still be running or may have changed project files. TALOS did not inspect or signal processes, resume a conversation, or retry an attempt. Inspect process and project state before deciding how to proceed."
         );
     }
     Ok(())

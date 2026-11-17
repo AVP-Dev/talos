@@ -55,7 +55,7 @@ Checks use argument arrays from a fixed executable allowlist; TALOS does not inv
 
 For an explicit task instead of Auto, use `talos task run <ID>`. If Agy returns a terminal `ERROR` with exit code zero and a valid public conversation ID, inspect the project and continue only with `talos task continue <ID> --confirm-project-inspected`. TALOS resumes that exact conversation, checks the matching `init` ID before sending one follow-up, and leaves success in `reviewing`.
 
-After an interrupted or crashed Writer run, use `talos task recover` to quarantine persisted `launching` and `running` attempts as `unknown`. TALOS will not infer their outcome, signal, resume, or retry them. Inspect both process and project state before resolving an attempt:
+After an interrupted or crashed Writer run, use `talos task recover` to quarantine persisted `launching` and `running` attempts as `unknown`. On Linux, TALOS stores a `/proc` process fingerprint and reports whether it still matches; on macOS, the check remains unavailable. This is lifecycle evidence only. TALOS will not infer an attempt outcome, signal, resume, or retry it. Inspect both process and project state before resolving an attempt:
 
 ```sh
 talos task resolve <ATTEMPT_ID> --action accept-for-review \

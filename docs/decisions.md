@@ -153,7 +153,7 @@ No schema change for process identity is selected or implemented. The separate s
 
 ## ADR-017 — macOS restart recovery uses fail-closed operator attestation
 
-- **Status:** accepted by the user.
+- **Status:** accepted by the user; macOS policy remains active. Linux process lifecycle reporting is extended by ADR-028.
 - **Decision:** on macOS, process identity is unavailable unless a stable public API is verified. Recovery quarantines ambiguous attempts and does not use private `libproc`, parse `ps`, send process signals, resume an unknown attempt, or retry automatically. To resolve an unknown attempt, require an auditable operator attestation that the Writer is stopped, the project was inspected, and a non-empty reason was supplied.
 - **Reason:** no acceptable public macOS process-start identity source has been established, and PID/session/diff observations alone cannot prove the Writer outcome.
 - **Consequence:** durably record actor, timestamp, chosen action, reason, and the operator's stopped/inspected attestations. Resolution immediately sets the task to `reviewing` for `accept-for-review`, `queued` for `authorize-retry`, or `failed` for `abandon`; the Writer attempt itself remains `unknown`. No resolution action launches a process or completes/reviews the task. A retry can start only through a later explicit `task run` or one-shot `up --auto`; it never makes `task continue` eligible for an `unknown` attempt. The attestation is an operator declaration, not an OS-verified fact.
@@ -227,3 +227,10 @@ No schema change for process identity is selected or implemented. The separate s
 - **Decision:** persist an operator stop request against the active Writer attempt and let its supervisor terminate the process group. On Unix, keep the leader unreaped while sending SIGTERM, waiting a bounded grace interval, and sending SIGKILL. If cleanup is cancelled, an armed guard sends SIGKILL. Disarm only after the leader is reaped. Never signal a numeric PGID after reap because the identifier may have been reused. Reclaim an unexpired supervisor lease early only when its recorded TALOS PID is parseable and absent; otherwise fail closed.
 - **Reason:** process-group IDs are numeric and can be recycled. Recovery should shorten the stale-lease wait after a hard crash when evidence is available without inferring an attempt outcome or taking a live supervisor's lease.
 - **Consequence:** `talos stop` is cooperative and may report that shutdown was not confirmed. `task recover` remains required after TALOS loss and still quarantines ambiguous Writer outcomes. Detached descendants after normal CLI exit may remain because safely signalling their old group cannot be proved. PID reuse or unsupported identity keeps the lease protected until its regular expiration.
+
+## ADR-028 — Persist Linux process identity as lifecycle evidence only
+
+- **Status:** implemented in T6.5; Linux-native verification pending.
+- **Decision:** on Linux, capture `/proc/<pid>/stat` process-group and start-time fields plus `/proc/sys/kernel/random/boot_id` when the Writer starts. Persist the versioned fingerprint in the attempt row. During `task recover`, compare the saved fingerprint with current procfs data and report a match, different process, unavailable identity, or missing record. On platforms without a supported public collector, report unavailable.
+- **Reason:** after PID reuse, operators need to know whether a recorded numeric PID still describes the same process, while preserving the rule that process identity cannot establish what the Writer did to project files.
+- **Consequence:** identity comparison is diagnostic only. It does not permit TALOS to signal, resume, retry, accept, abandon, or resolve an attempt; unresolved work still requires process/project inspection and explicit operator attestations. Linux support remains unverified until native server acceptance passes.
