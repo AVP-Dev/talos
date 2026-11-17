@@ -15,7 +15,11 @@ use crate::{
     secrets::contains_sensitive,
 };
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
+const MAX_CHILD_TASK_ALLOWED_PATHS: usize = 64;
+const MAX_CHILD_TASK_SCOPE_BYTES: usize = 16 * 1024;
+const MIN_CHILD_TASK_TIMEOUT_MS: i64 = 1_000;
+const MAX_CHILD_TASK_TIMEOUT_MS: i64 = 30 * 60 * 1_000;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -60,6 +64,26 @@ pub struct TaskDependencyRecord {
     pub task_id: i64,
     pub prerequisite_task_id: i64,
     pub prerequisite_status: TaskStatus,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct ChildTaskContract {
+    pub child_task_id: i64,
+    pub parent_task_id: i64,
+    pub allowed_paths: Vec<String>,
+    pub timeout_ms: i64,
+    pub created_at_ms: i64,
+}
+
+impl ChildTaskContract {
+    pub fn permits_path(&self, changed_path: &str) -> bool {
+        self.allowed_paths.iter().any(|allowed| {
+            changed_path == allowed
+                || changed_path
+                    .strip_prefix(allowed)
+                    .is_some_and(|suffix| suffix.starts_with('/'))
+        })
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -404,6 +428,126 @@ impl Database {
             created_at_ms: now,
             updated_at_ms: now,
         })
+    }
+
+    pub fn add_child_task(
+        &mut self,
+        parent_task_id: i64,
+        title: &str,
+        acceptance_criteria: &str,
+        allowed_paths: &[String],
+        timeout_ms: i64,
+    ) -> Result<(TaskRecord, ChildTaskContract)> {
+        validate_child_task_text(title, acceptance_criteria)?;
+        let allowed_paths = validate_child_task_allowed_paths(allowed_paths)?;
+        if !(MIN_CHILD_TASK_TIMEOUT_MS..=MAX_CHILD_TASK_TIMEOUT_MS).contains(&timeout_ms) {
+            bail!("Child task timeout must be between 1 second and 30 minutes");
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot start child-task creation transaction")?;
+        let parent_status: Option<String> = transaction
+            .query_row(
+                "SELECT status FROM tasks WHERE id = ?1",
+                [parent_task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(parent_status) = parent_status else {
+            bail!("Parent task #{parent_task_id} does not exist");
+        };
+        if parent_status != TaskStatus::Queued.as_str() {
+            bail!("A child task can only be added while its parent is queued");
+        }
+        let now = now_ms()?;
+        transaction.execute(
+            "INSERT INTO tasks (title, acceptance_criteria, status, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, 'queued', ?3, ?3)",
+            params![title, acceptance_criteria, now],
+        )?;
+        let child_task_id = transaction.last_insert_rowid();
+        let allowed_paths_json = serde_json::to_string(&allowed_paths)?;
+        transaction.execute(
+            "INSERT INTO child_task_contracts
+                 (child_task_id, parent_task_id, allowed_paths_json, timeout_ms, created_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                child_task_id,
+                parent_task_id,
+                allowed_paths_json,
+                timeout_ms,
+                now
+            ],
+        )?;
+        transaction.execute(
+            "INSERT INTO task_dependencies (task_id, depends_on_task_id, created_at_ms)
+             VALUES (?1, ?2, ?3)",
+            params![parent_task_id, child_task_id, now],
+        )?;
+        let child_data = serde_json::to_string(&serde_json::json!({
+            "parent_task_id": parent_task_id,
+            "allowed_paths": allowed_paths,
+            "timeout_ms": timeout_ms,
+            "report_schema": "talos-child-task-report-v1",
+        }))?;
+        transaction.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, 'talos', 'task.child_created', 'Bounded child task added; parent waits for its completion', ?3)",
+            params![child_task_id, now, child_data],
+        )?;
+        let dependency_data = serde_json::to_string(&serde_json::json!({
+            "prerequisite_task_id": child_task_id,
+            "child_task": true,
+        }))?;
+        transaction.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, 'talos', 'task.dependency_added', 'Parent waits for bounded child task completion', ?3)",
+            params![parent_task_id, now, dependency_data],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot commit child-task creation")?;
+        Ok((
+            TaskRecord {
+                id: child_task_id,
+                title: title.to_owned(),
+                acceptance_criteria: acceptance_criteria.to_owned(),
+                status: TaskStatus::Queued,
+                created_at_ms: now,
+                updated_at_ms: now,
+            },
+            ChildTaskContract {
+                child_task_id,
+                parent_task_id,
+                allowed_paths,
+                timeout_ms,
+                created_at_ms: now,
+            },
+        ))
+    }
+
+    pub fn child_task_contract(&self, child_task_id: i64) -> Result<Option<ChildTaskContract>> {
+        self.connection
+            .query_row(
+                "SELECT child_task_id, parent_task_id, allowed_paths_json, timeout_ms, created_at_ms
+                 FROM child_task_contracts WHERE child_task_id = ?1",
+                [child_task_id],
+                map_child_task_contract,
+            )
+            .optional()
+            .context("Cannot read child-task contract")
+    }
+
+    pub fn children_for_parent(&self, parent_task_id: i64) -> Result<Vec<ChildTaskContract>> {
+        let mut statement = self.connection.prepare(
+            "SELECT child_task_id, parent_task_id, allowed_paths_json, timeout_ms, created_at_ms
+             FROM child_task_contracts WHERE parent_task_id = ?1 ORDER BY child_task_id",
+        )?;
+        statement
+            .query_map([parent_task_id], map_child_task_contract)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("Cannot list child-task contracts")
     }
 
     pub fn add_task_dependency(&mut self, task_id: i64, prerequisite_task_id: i64) -> Result<bool> {
@@ -3175,6 +3319,32 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .context("Cannot add task dependency graph")?;
         migrated_version = 10;
     }
+    if migrated_version == 10 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE child_task_contracts (
+                     child_task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE RESTRICT,
+                     parent_task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+                     allowed_paths_json TEXT NOT NULL,
+                     timeout_ms INTEGER NOT NULL CHECK(timeout_ms BETWEEN 1000 AND 1800000),
+                     created_at_ms INTEGER NOT NULL,
+                     CHECK(child_task_id <> parent_task_id)
+                 );
+                 CREATE INDEX child_task_contracts_parent_id
+                     ON child_task_contracts(parent_task_id, child_task_id);
+                 CREATE TRIGGER child_task_contracts_no_update
+                     BEFORE UPDATE ON child_task_contracts BEGIN
+                         SELECT RAISE(ABORT, 'child task contracts are immutable');
+                     END;
+                 CREATE TRIGGER child_task_contracts_no_delete
+                     BEFORE DELETE ON child_task_contracts BEGIN
+                         SELECT RAISE(ABORT, 'child task contracts are immutable');
+                     END;
+                 PRAGMA user_version = 11;",
+            )
+            .context("Cannot add bounded child-task contracts")?;
+        migrated_version = 11;
+    }
     if migrated_version != SCHEMA_VERSION {
         bail!("Cannot migrate database from unsupported schema version {migrated_version}");
     }
@@ -3308,6 +3478,20 @@ fn map_writer_attempt_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<Writer
     })
 }
 
+fn map_child_task_contract(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChildTaskContract> {
+    let allowed_paths_json: String = row.get(2)?;
+    let allowed_paths = serde_json::from_str(&allowed_paths_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(2, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(ChildTaskContract {
+        child_task_id: row.get(0)?,
+        parent_task_id: row.get(1)?,
+        allowed_paths,
+        timeout_ms: row.get(3)?,
+        created_at_ms: row.get(4)?,
+    })
+}
+
 fn map_critic_review_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CriticReviewRecord> {
     Ok(CriticReviewRecord {
         id: row.get(0)?,
@@ -3384,6 +3568,56 @@ fn validate_changed_paths_json(value: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_child_task_text(title: &str, acceptance_criteria: &str) -> Result<()> {
+    if title.trim().is_empty() || title.len() > 2_000 {
+        bail!("Child task title must be non-empty and at most 2000 bytes");
+    }
+    if acceptance_criteria.len() > 8_000 {
+        bail!("Child task acceptance criteria must be at most 8000 bytes");
+    }
+    if contains_sensitive(title) || contains_sensitive(acceptance_criteria) {
+        bail!("Child task text contains secret-like text");
+    }
+    Ok(())
+}
+
+fn validate_child_task_allowed_paths(paths: &[String]) -> Result<Vec<String>> {
+    use std::collections::BTreeSet;
+
+    if paths.is_empty() || paths.len() > MAX_CHILD_TASK_ALLOWED_PATHS {
+        bail!("A child task requires between 1 and 64 allowed paths");
+    }
+    let mut normalized = BTreeSet::new();
+    let mut total_bytes = 0_usize;
+    for path in paths {
+        if path.is_empty()
+            || path.len() > 512
+            || path.trim() != path
+            || path.starts_with('/')
+            || path.contains('\\')
+            || path.chars().any(char::is_control)
+            || path.chars().any(|ch| matches!(ch, '*' | '?' | '[' | ']'))
+        {
+            bail!("Child task paths must be bounded, relative paths without glob syntax");
+        }
+        let parts = path.split('/').collect::<Vec<_>>();
+        if parts
+            .iter()
+            .any(|part| part.is_empty() || *part == "." || *part == "..")
+        {
+            bail!("Child task paths cannot contain empty, current, or parent segments");
+        }
+        total_bytes = total_bytes
+            .checked_add(path.len())
+            .context("Child task path scope is too large")?;
+        if total_bytes > MAX_CHILD_TASK_SCOPE_BYTES {
+            bail!("Child task allowed paths exceed the 16 KiB scope budget");
+        }
+        normalized.insert(path.clone());
+    }
+    Ok(normalized.into_iter().collect())
 }
 
 fn validate_review_revision_id(value: &str) -> Result<()> {
@@ -3662,7 +3896,7 @@ mod tests {
     fn initialization_is_idempotent_and_uses_wal() {
         let project = temp_project();
         let first = Database::open(&project).expect("initialize database");
-        assert_eq!(first.schema_version().expect("read schema version"), 10);
+        assert_eq!(first.schema_version().expect("read schema version"), 11);
         assert_eq!(
             first
                 .journal_mode()
@@ -3673,19 +3907,20 @@ mod tests {
         drop(first);
 
         let second = Database::open(&project).expect("open database again");
-        assert_eq!(second.schema_version().expect("read schema version"), 10);
+        assert_eq!(second.schema_version().expect("read schema version"), 11);
         drop(second);
         cleanup(&project);
     }
 
     #[test]
-    fn schema_v5_migrates_to_v10_with_optional_check_durations_and_control_state() {
+    fn schema_v5_migrates_to_v11_with_optional_check_durations_and_control_state() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
         database
             .connection
             .execute_batch(
-                "DROP TABLE task_dependencies;
+                "DROP TABLE child_task_contracts;
+                 DROP TABLE task_dependencies;
                  ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
                  ALTER TABLE verification_results DROP COLUMN duration_ms;
                  ALTER TABLE verification_results DROP COLUMN version_duration_ms;
@@ -3697,7 +3932,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema-v5 duration fields");
-        assert_eq!(migrated.schema_version().unwrap(), 10);
+        assert_eq!(migrated.schema_version().unwrap(), 11);
         let columns: (i64, i64) = migrated
             .connection
             .query_row(
@@ -3714,7 +3949,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v6_migrates_to_v10_without_losing_tasks() {
+    fn schema_v6_migrates_to_v11_without_losing_tasks() {
         let project = temp_project();
         let mut database = Database::open(&project).expect("initialize current database");
         let task = database
@@ -3723,7 +3958,8 @@ mod tests {
         database
             .connection
             .execute_batch(
-                "DROP TABLE task_dependencies;
+                "DROP TABLE child_task_contracts;
+                 DROP TABLE task_dependencies;
                  ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
                  DROP TABLE project_control_events;
                  DROP TABLE project_control_state;
@@ -3733,7 +3969,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v6");
-        assert_eq!(migrated.schema_version().unwrap(), 10);
+        assert_eq!(migrated.schema_version().unwrap(), 11);
         assert_eq!(migrated.list_tasks().unwrap()[0].id, task.id);
         assert!(!migrated.project_control_state().unwrap().queue_paused);
         cleanup(&project);
@@ -3746,7 +3982,8 @@ mod tests {
         database
             .connection
             .execute_batch(
-                "DROP TABLE task_dependencies;
+                "DROP TABLE child_task_contracts;
+                 DROP TABLE task_dependencies;
                  ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
                  ALTER TABLE project_control_state DROP COLUMN stop_requested_attempt_id;
                  PRAGMA user_version = 7;",
@@ -3755,7 +3992,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v7");
-        assert_eq!(migrated.schema_version().unwrap(), 10);
+        assert_eq!(migrated.schema_version().unwrap(), 11);
         assert_eq!(
             migrated
                 .project_control_state()
@@ -3773,7 +4010,8 @@ mod tests {
         database
             .connection
             .execute_batch(
-                "DROP TABLE task_dependencies;
+                "DROP TABLE child_task_contracts;
+                 DROP TABLE task_dependencies;
                  ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
                  PRAGMA user_version = 8;",
             )
@@ -3781,7 +4019,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v8");
-        assert_eq!(migrated.schema_version().unwrap(), 10);
+        assert_eq!(migrated.schema_version().unwrap(), 11);
         assert!(
             migrated
                 .writer_attempts(None)
@@ -3793,20 +4031,21 @@ mod tests {
     }
 
     #[test]
-    fn schema_v9_migrates_to_v10_with_dependency_tables() {
+    fn schema_v9_migrates_to_v11_with_dependency_tables() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
         database
             .connection
             .execute_batch(
-                "DROP TABLE task_dependencies;
+                "DROP TABLE child_task_contracts;
+                 DROP TABLE task_dependencies;
                  PRAGMA user_version = 9;",
             )
             .expect("simulate schema v9");
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v9");
-        assert_eq!(migrated.schema_version().unwrap(), 10);
+        assert_eq!(migrated.schema_version().unwrap(), 11);
         let dependencies_table_exists: bool = migrated
             .connection
             .query_row(
@@ -3816,6 +4055,33 @@ mod tests {
             )
             .expect("inspect migrated dependency table");
         assert!(dependencies_table_exists);
+        cleanup(&project);
+    }
+
+    #[test]
+    fn schema_v10_migrates_to_v11_with_child_task_contracts() {
+        let project = temp_project();
+        let database = Database::open(&project).expect("initialize current database");
+        database
+            .connection
+            .execute_batch(
+                "DROP TABLE child_task_contracts;
+                 PRAGMA user_version = 10;",
+            )
+            .expect("simulate schema v10");
+        drop(database);
+
+        let migrated = Database::open(&project).expect("migrate schema v10");
+        assert_eq!(migrated.schema_version().unwrap(), 11);
+        let contracts_table_exists: bool = migrated
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'child_task_contracts')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect migrated child-task table");
+        assert!(contracts_table_exists);
         cleanup(&project);
     }
 
@@ -4149,6 +4415,7 @@ mod tests {
                  ALTER TABLE critic_reviews DROP COLUMN head_commit;
                  ALTER TABLE critic_reviews DROP COLUMN patch_sha256;
                  ALTER TABLE critic_reviews DROP COLUMN changed_paths_json;
+                 DROP TABLE child_task_contracts;
                  DROP TABLE task_dependencies;
                  ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
                  DROP TABLE project_control_events;
@@ -4159,7 +4426,7 @@ mod tests {
         drop(database);
 
         let mut migrated = Database::open(&project).expect("migrate the v4 approval");
-        assert_eq!(migrated.schema_version().unwrap(), 10);
+        assert_eq!(migrated.schema_version().unwrap(), 11);
         assert_eq!(
             migrated.list_tasks().unwrap()[0].status,
             TaskStatus::Reviewing
@@ -4301,7 +4568,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_migrates_to_v10_without_losing_tasks() {
+    fn schema_v1_migrates_to_v11_without_losing_tasks() {
         let project = temp_project();
         project
             .ensure_runtime_dir()
@@ -4343,7 +4610,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate existing database");
-        assert_eq!(database.schema_version().expect("read schema version"), 10);
+        assert_eq!(database.schema_version().expect("read schema version"), 11);
         let tasks = database.list_tasks().expect("read preserved tasks");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Existing v1 task");
@@ -4639,7 +4906,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate v2 database");
-        assert_eq!(database.schema_version().expect("read schema version"), 10);
+        assert_eq!(database.schema_version().expect("read schema version"), 11);
         assert!(
             database
                 .has_unresolved_writer_attempts()

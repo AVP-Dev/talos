@@ -44,6 +44,8 @@ Schema v9 can store a Linux process fingerprint containing the boot ID, PID, pro
 
 Schema v10 stores task prerequisite edges in an append-only DAG. A recursive dependency check rejects cycles before an edge is committed. Only queued tasks can receive dependencies, and a task cannot start until each prerequisite is complete. Auto selects the first runnable queued task and reports queued tasks waiting on prerequisites; it does not skip the dependency gate for explicit runs.
 
+Schema v11 stores child-task contracts with a parent, bounded relative path allowlist, and timeout. Creating a child also adds an edge that keeps the parent queued until the child reaches `complete`. The Writer prompt carries the scope and timeout; Critic review checks the full changed-path set and adds a deterministic blocker for out-of-scope files. This scope check governs task acceptance but is not an OS sandbox. `task child-report` builds its fixed report from existing rows on demand rather than storing a duplicate transcript or report payload.
+
 ## Phased delivery
 
 1. Bootstrap: apply and adapt the Agent Starter Kit, inspect pair-mailbox, and measure local CLI capabilities.

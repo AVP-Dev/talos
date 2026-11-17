@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R6 — Runtime and resumption remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. T6.5 implementation adds schema-v9 Linux `/proc` fingerprints and recovery reporting; Linux-native checks are deferred until server access. R7.1 implementation has started while those external acceptance gates remain documented. Backlog count: 40 of 61 scheduled tasks done (65.6% by task count, unweighted); two unscheduled ideas are recorded separately.
+**R6 — Runtime and resumption remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. T6.5 implementation adds schema-v9 Linux `/proc` fingerprints and recovery reporting; Linux-native checks are deferred until server access. T7.1 and T7.2 code are in progress while those external acceptance gates remain documented. Backlog count: 40 of 61 scheduled tasks done (65.6% by task count, unweighted); two unscheduled ideas are recorded separately.
 
 ## Goal and fixed direction
 
@@ -259,9 +259,17 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - Added schema-v9-to-v10 migration coverage. `cargo fmt --all && cargo check --all-targets --all-features` and `git diff --check` passed on macOS. Migration, DAG cycle, eligibility, and command behavior tests have not been run. This R7.1 implementation is not complete until those checks pass.
 - R6.3 and R6.5 code are committed locally as `173d736` and `098f7b1`. R7.1 changes are uncommitted. The repository remains local on `master` with no remote; no Linux host or external service was contacted.
 
+## R7.2 progress — 2026-11-18
+
+- Advanced SQLite to schema v11 with immutable child-task contracts. Each contract stores its parent ID, normalized relative path allowlist, timeout, and creation time. Creating a child inserts its task, contract, and parent-waits-for-child edge atomically.
+- Added `task child`, `task children`, and `task child-report`. The report is versioned as `talos-child-task-report-v1` and is derived from existing task, Writer attempt, Critic, and verification rows; no duplicate report or full transcript is stored.
+- Writer prompts include allowed paths and timeout; the saved timeout overrides the general Writer timeout. Critic review receives the scope, and TALOS adds a deterministic blocker if any changed path is outside the contract. The scope is a review gate, not an OS security boundary.
+- Added v10→v11 migration coverage. `cargo fmt --all && cargo check --all-targets --all-features` passed on macOS. Migration, child creation, timeout, report, and scope-enforcement tests have not run; T7.2 remains in progress.
+- R7.1 commit: `da33ccf`. R7.2 changes are uncommitted. Repository remains local on `master`; no remote or Linux host was contacted.
+
 ## Next action
 
-Finish the R7.1 local compile check, then implement T7.2's bounded child-task contract. R6 acceptance gates remain open: T6.3 behavior/full-profile checks, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6's TUI trust/handoff scenario. No Linux connection or trust-setting change has been made. Continue R7–R9 implementation locally while keeping these checks unclaimed. Keep all work on `master`; the user will create the hosted repository later.
+Next implement T7.3 native-subagent capability detection, then T7.4 worktree lifecycle and T7.5 bounded integration. T7.1 and T7.2 still need behavior/migration checks. R6 acceptance gates also remain open: T6.3 behavior/full-profile checks, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6's TUI trust/handoff scenario. No Linux connection or trust-setting change has been made. Continue R7–R9 implementation locally while keeping these checks unclaimed. Keep all work on `master`; the user will create the hosted repository later.
 
 ## Session close checklist
 

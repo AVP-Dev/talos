@@ -242,6 +242,67 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
+            TaskCommand::Child {
+                parent_task_id,
+                title,
+                criteria,
+                allowed_paths,
+                timeout_seconds,
+            } => {
+                let timeout_ms = i64::try_from(timeout_seconds)
+                    .context("Child timeout seconds are out of range")?
+                    .checked_mul(1_000)
+                    .context("Child timeout is out of range")?;
+                let (task, contract) = database.add_child_task(
+                    parent_task_id,
+                    &title,
+                    &criteria,
+                    &allowed_paths,
+                    timeout_ms,
+                )?;
+                if cli.json {
+                    print_json(&json!({ "task": task, "contract": contract }))?;
+                } else {
+                    println!(
+                        "Created child task #{} under parent #{} ({} allowed path(s), {} second timeout).",
+                        task.id,
+                        parent_task_id,
+                        contract.allowed_paths.len(),
+                        contract.timeout_ms / 1_000,
+                    );
+                    println!("Parent task #{parent_task_id} now waits for this child to complete.");
+                }
+            }
+            TaskCommand::Children { parent_task_id } => {
+                if !database
+                    .list_tasks()?
+                    .iter()
+                    .any(|task| task.id == parent_task_id)
+                {
+                    bail!("Parent task #{parent_task_id} does not exist");
+                }
+                let children = database.children_for_parent(parent_task_id)?;
+                if cli.json {
+                    print_json(&json!({
+                        "parent_task_id": parent_task_id,
+                        "children": children,
+                    }))?;
+                } else if children.is_empty() {
+                    println!("Task #{parent_task_id} has no child tasks.");
+                } else {
+                    for child in children {
+                        println!(
+                            "Child #{}: allowed paths [{}], timeout {} seconds.",
+                            child.child_task_id,
+                            child.allowed_paths.join(", "),
+                            child.timeout_ms / 1_000,
+                        );
+                    }
+                }
+            }
+            TaskCommand::ChildReport { task_id } => {
+                print_child_task_report(cli.json, &database, task_id)?;
+            }
             TaskCommand::List => {
                 let tasks = database.list_tasks()?;
                 if cli.json {
@@ -782,6 +843,86 @@ struct VerificationReport {
     status: String,
     task_status: &'static str,
     checks: Vec<CheckExecution>,
+}
+
+fn print_child_task_report(json_output: bool, database: &Database, task_id: i64) -> Result<()> {
+    let task = database
+        .list_tasks()?
+        .into_iter()
+        .find(|task| task.id == task_id)
+        .with_context(|| format!("Task #{task_id} does not exist"))?;
+    let contract = database
+        .child_task_contract(task_id)?
+        .with_context(|| format!("Task #{task_id} has no bounded child-task contract"))?;
+    let latest_attempt = database
+        .writer_attempts(Some(task_id))?
+        .into_iter()
+        .last()
+        .map(|attempt| {
+            json!({
+                "attempt_id": attempt.id,
+                "state": attempt.state,
+                "error_code": attempt.error_code,
+                "exit_code": attempt.exit_code,
+            })
+        });
+    let latest_review = database.latest_critic_review(task_id)?.map(|review| {
+        json!({
+            "review_id": review.id,
+            "decision": review.decision,
+            "summary": review.summary,
+            "revision_id": review.revision_id,
+        })
+    });
+    let latest_verification = database
+        .verification_history(task_id)?
+        .into_iter()
+        .last()
+        .map(|evidence| {
+            json!({
+                "run_id": evidence.run.id,
+                "status": evidence.run.status,
+                "revision_id": evidence.run.revision_id,
+                "check_count": evidence.checks.len(),
+            })
+        });
+    let report = json!({
+        "schema_version": "talos-child-task-report-v1",
+        "parent_task_id": contract.parent_task_id,
+        "child_task_id": task.id,
+        "task_status": task.status.as_str(),
+        "acceptance_criteria": task.acceptance_criteria,
+        "allowed_paths": contract.allowed_paths,
+        "timeout_ms": contract.timeout_ms,
+        "latest_writer_attempt": latest_attempt,
+        "latest_critic_review": latest_review,
+        "latest_verification": latest_verification,
+        "ready_for_parent": task.status == crate::db::TaskStatus::Complete,
+    });
+    if json_output {
+        print_json(&report)?;
+    } else {
+        println!(
+            "Child task #{} report ({}) for parent #{}.",
+            task.id,
+            task.status.as_str(),
+            contract.parent_task_id
+        );
+        println!("Allowed paths: {}", contract.allowed_paths.join(", "));
+        println!(
+            "Acceptance criteria: {}",
+            redact_sensitive(&task.acceptance_criteria)
+        );
+        println!(
+            "Ready for parent: {}.",
+            if task.status == crate::db::TaskStatus::Complete {
+                "yes"
+            } else {
+                "no; review and verification are still required"
+            }
+        );
+    }
+    Ok(())
 }
 
 async fn run_task_verification(

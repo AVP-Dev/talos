@@ -18,7 +18,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     adapter::agy_process::{AgyProcessEvent, AgyRunConfig, AgyRunResult, TerminationReason},
     db::{
-        CriticReviewInput, CriticReviewRecord, Database, TaskRecord, TaskStatus,
+        ChildTaskContract, CriticReviewInput, CriticReviewRecord, Database, TaskRecord, TaskStatus,
         WriterAttemptOutcome, WriterAttemptRecord,
     },
     project::{DiscoveryMethod, Project},
@@ -220,8 +220,17 @@ pub async fn run_critic_review(
     if snapshot.changed_paths.is_empty() {
         bail!("Critic review requires a non-empty project diff");
     }
+    let child_contract = database.child_task_contract(task_id)?;
+    let mut review_task = task.clone();
+    if let Some(contract) = &child_contract {
+        let allowed_paths = serde_json::to_string(&contract.allowed_paths)?;
+        review_task.acceptance_criteria = format!(
+            "{}\n\nChild-task scope: only these project-relative paths may change: {allowed_paths}. Treat every changed path outside this list as a blocker.",
+            review_task.acceptance_criteria
+        );
+    }
     let request = ReviewRequest::new(
-        &task,
+        &review_task,
         writer.id,
         &snapshot.base_commit,
         &snapshot.revision_id,
@@ -262,7 +271,7 @@ pub async fn run_critic_review(
             "Critic response exceeds the {MAX_CRITIC_RESPONSE_BYTES}-byte result budget; no approval was recorded"
         );
     }
-    let response = CriticResponse::parse_and_validate(
+    let mut response = CriticResponse::parse_and_validate(
         execution
             .response
             .as_deref()
@@ -270,6 +279,30 @@ pub async fn run_critic_review(
         &snapshot.revision_id,
         &snapshot.changed_paths,
     )?;
+    if let Some(contract) = &child_contract
+        && let Some(out_of_scope) = snapshot
+            .changed_paths
+            .iter()
+            .find(|path| !contract.permits_path(path))
+    {
+        response.decision = crate::review::ReviewDecision::RequestChanges;
+        if response.findings.len() >= 100 {
+            response.findings.truncate(99);
+        }
+        response.findings.push(crate::review::CriticFinding {
+            severity: crate::review::FindingSeverity::Blocker,
+            path: out_of_scope.clone(),
+            line: None,
+            title: "Child task changed a path outside its allowed scope".to_owned(),
+            reason: "The child-task contract does not permit this changed path. Revert the out-of-scope change or move it to a separately scoped task.".to_owned(),
+        });
+        if response.summary.len() <= 3_800 {
+            response
+                .summary
+                .push_str(" Deterministic child-scope validation found an out-of-scope path.");
+        }
+        response.validate(&snapshot.revision_id, &snapshot.changed_paths)?;
+    }
     let current_snapshot = RevisionSnapshot::capture(&project.root, base_revision)?;
     if current_snapshot.revision_id != snapshot.revision_id {
         bail!(
@@ -323,6 +356,16 @@ async fn run_writer_attempt_inner(
         .into_iter()
         .find(|task| task.id == task_id)
         .with_context(|| format!("Task #{task_id} does not exist"))?;
+    let child_contract = database.child_task_contract(task_id)?;
+    let effective_timeout = child_contract
+        .as_ref()
+        .map(|contract| {
+            u64::try_from(contract.timeout_ms)
+                .map(Duration::from_millis)
+                .context("Child task timeout is out of range")
+        })
+        .transpose()?
+        .unwrap_or(timeout);
     let revision_review = match &continuation {
         Some(continuation) => {
             let latest = database
@@ -373,6 +416,10 @@ async fn run_writer_attempt_inner(
     } else {
         build_writer_prompt(&task)
     };
+    let prompt = match child_contract.as_ref() {
+        Some(contract) => append_child_task_contract(prompt, contract)?,
+        None => prompt,
+    };
     let prompt_sha256 = encode_lower_hex(&Sha256::digest(prompt.as_bytes()));
     let attempt = if let Some(continuation) = &continuation {
         database.begin_writer_continuation(
@@ -413,7 +460,7 @@ async fn run_writer_attempt_inner(
             conversation_id: continuation
                 .as_ref()
                 .map(|value| value.conversation_id.clone()),
-            timeout,
+            timeout: effective_timeout,
         },
         |event| match event {
             AgyProcessEvent::Started(process_id) => {
@@ -571,6 +618,21 @@ fn build_writer_prompt(task: &TaskRecord) -> String {
          Acceptance criteria: {}",
         task.id, task.title, criteria
     )
+}
+
+fn append_child_task_contract(mut prompt: String, contract: &ChildTaskContract) -> Result<String> {
+    let allowed_paths = serde_json::to_string(&contract.allowed_paths)?;
+    prompt.push_str(&format!(
+        "\n\nBOUNDED CHILD-TASK CONTRACT:\n\
+         Parent task ID: {}\n\
+         Allowed project-relative paths (JSON): {}\n\
+         Change files only inside these paths. Do not edit or create files outside this scope.\n\
+         Writer timeout budget: {} milliseconds.\n\
+         Return a concise English final summary with changed files, completed work, and remaining work.\
+         TALOS will validate the changed paths and must finish Critic review and project verification before the parent can run.",
+        contract.parent_task_id, allowed_paths, contract.timeout_ms
+    ));
+    Ok(prompt)
 }
 
 fn build_writer_revision_prompt(task: &TaskRecord, review: &CriticReviewRecord) -> String {

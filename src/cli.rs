@@ -105,6 +105,32 @@ pub enum TaskCommand {
         /// ID of the dependent task.
         task_id: i64,
     },
+    /// Create a bounded child task and make its parent wait for completion.
+    Child {
+        /// ID of the queued parent task.
+        parent_task_id: i64,
+        /// Short description of the child task.
+        title: String,
+        /// Verifiable child acceptance criteria.
+        #[arg(long)]
+        criteria: String,
+        /// Project-relative path or directory the child may change; repeat for multiple paths.
+        #[arg(long = "allow", action = clap::ArgAction::Append, required = true)]
+        allowed_paths: Vec<String>,
+        /// Maximum Writer runtime in seconds, from 1 through 1800.
+        #[arg(long, default_value_t = 1800)]
+        timeout_seconds: u64,
+    },
+    /// List a parent's bounded child-task contracts.
+    Children {
+        /// ID of the parent task.
+        parent_task_id: i64,
+    },
+    /// Print the compact, versioned result report for a child task.
+    ChildReport {
+        /// ID of the child task.
+        task_id: i64,
+    },
     /// List tasks in the local queue.
     List,
     /// Run one queued task or a Critic-requested fix with the configured Writer.

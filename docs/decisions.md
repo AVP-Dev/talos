@@ -241,3 +241,10 @@ No schema change for process identity is selected or implemented. The separate s
 - **Decision:** persist task-to-prerequisite edges in SQLite. Reject self-dependencies and any edge that closes a cycle. Allow adding an edge only while the dependent task is queued. A task is runnable only after every prerequisite reaches `complete`; explicit Writer launch and Auto share this gate.
 - **Reason:** the queue must represent task order durably and must not start dependent work early or produce a scheduler that can deadlock on a cycle.
 - **Consequence:** dependency edges are append-only and visible through `task dependencies`. Auto reports queued tasks waiting on open prerequisites. Dependencies do not change task success criteria, Critic review, or verification evidence.
+
+## ADR-030 — Bound child tasks with contracts and compact reports
+
+- **Status:** implemented in T7.2; migration and behavior verification pending.
+- **Decision:** create child tasks with one queued parent, normalized project-relative allowed paths, explicit acceptance criteria, and a Writer timeout capped at 30 minutes. Add the parent→child prerequisite edge in the same transaction. Pass scope and timeout to the Writer, and make any changed path outside the scope a deterministic Critic blocker. Generate `talos-child-task-report-v1` from existing task/review/verification rows instead of storing duplicate report text or transcripts.
+- **Reason:** delegated work needs an owner, bounded file scope, time limit, and predictable result packet while keeping the durable database compact.
+- **Consequence:** the scope is a review gate, not an OS sandbox. A child does not unblock its parent until Critic review and project verification mark it complete. Existing reports remain derived data; full Writer transcripts are not saved.
