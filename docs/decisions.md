@@ -248,3 +248,10 @@ No schema change for process identity is selected or implemented. The separate s
 - **Decision:** create child tasks with one queued parent, normalized project-relative allowed paths, explicit acceptance criteria, and a Writer timeout capped at 30 minutes. Add the parent→child prerequisite edge in the same transaction. Pass scope and timeout to the Writer, and make any changed path outside the scope a deterministic Critic blocker. Generate `talos-child-task-report-v1` from existing task/review/verification rows instead of storing duplicate report text or transcripts.
 - **Reason:** delegated work needs an owner, bounded file scope, time limit, and predictable result packet while keeping the durable database compact.
 - **Consequence:** the scope is a review gate, not an OS sandbox. A child does not unblock its parent until Critic review and project verification mark it complete. Existing reports remain derived data; full Writer transcripts are not saved.
+
+## ADR-031 — Keep native subagent delegation disabled until verified
+
+- **Status:** implemented in T7.3; live invocation and configured-agent discovery remain unverified.
+- **Decision:** report native subagent invocation as `advertised` only when the CLI help exposes its public invocation tool. Otherwise report `not_tested` unless the CLI explicitly reports that the feature is unsupported. Do not start native delegation until the installed CLI, configured agent roster, and a harmless live invocation are verified.
+- **Reason:** an agent-listing command or an agent-definition format does not prove that TALOS can invoke a scoped subagent in a headless run, or that the installed session exposes the delegation tool.
+- **Consequence:** native delegation stays disabled while its capability is unknown. Manual child tasks, their contracts, and DAG scheduling remain available independently.

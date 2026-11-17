@@ -53,6 +53,8 @@ pub struct AgyCapabilities {
     pub auto_mode: CapabilityState,
     pub filesystem_write_scope: CapabilityState,
     pub safe_unattended_write: CapabilityState,
+    /// Advertised only when the CLI exposes the public native invocation tool.
+    pub native_subagents: CapabilityState,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -121,7 +123,7 @@ impl AgyProbe {
             version,
             capabilities: parse_capabilities(&help),
             note: Some(
-                "Capability flags are based on local help output. This probe does not evaluate session-specific file permissions; explicit writes are enabled only for the Agy version covered by TALOS's disposable-project boundary probe.".to_owned(),
+                "Advertised CLI flags are based on local help output. Native subagent invocation remains not tested until the configured agent roster and a harmless live delegation are verified. This probe does not evaluate session-specific file permissions; explicit writes are enabled only for the Agy version covered by TALOS's disposable-project boundary probe.".to_owned(),
             ),
         }
     }
@@ -141,6 +143,11 @@ fn parse_capabilities(help: &str) -> AgyCapabilities {
         auto_mode: state_for(help.contains("--mode") && help.contains("auto")),
         filesystem_write_scope: CapabilityState::NotTested,
         safe_unattended_write: CapabilityState::NotTested,
+        native_subagents: if help.contains("invoke_subagent") {
+            CapabilityState::Advertised
+        } else {
+            CapabilityState::NotTested
+        },
     }
 }
 
@@ -161,6 +168,7 @@ fn unavailable_capabilities() -> AgyCapabilities {
         auto_mode: CapabilityState::NotInstalled,
         filesystem_write_scope: CapabilityState::NotTested,
         safe_unattended_write: CapabilityState::NotTested,
+        native_subagents: CapabilityState::NotInstalled,
     }
 }
 
@@ -259,6 +267,20 @@ mod tests {
         assert!(matches!(
             capabilities.safe_unattended_write,
             CapabilityState::NotTested
+        ));
+        assert!(matches!(
+            capabilities.native_subagents,
+            CapabilityState::NotTested
+        ));
+    }
+
+    #[test]
+    fn explicit_native_subagent_tool_is_reported_as_advertised() {
+        let capabilities = parse_capabilities("Available tools: invoke_subagent");
+
+        assert!(matches!(
+            capabilities.native_subagents,
+            CapabilityState::Advertised
         ));
     }
 }

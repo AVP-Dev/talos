@@ -14,7 +14,7 @@ clap CLI ── task/control API ── SQLite WAL
                  └── Git worktree / tmux integration
 ```
 
-Adapters are replaceable modules selected by role from the adapters that have been implemented and verified. Each owns CLI-specific discovery, command arguments, structured output, and session behavior; shared orchestration must not assume all CLIs have the same session model, output format, approval policy, or subagent support. The current tree has an Agy probe in `src/adapter/agy.rs` and its headless process protocol in `src/adapter/agy_process.rs`. Extract a shared low-level process runner only when a second real adapter demonstrates the common contract.
+Adapters are replaceable modules selected by role from the adapters that have been implemented and verified. Each owns CLI-specific discovery, command arguments, structured output, and session behavior; shared orchestration must not assume all CLIs have the same session model, output format, approval policy, or subagent support. The current tree has an Agy probe in `src/adapter/agy.rs` and its headless process protocol in `src/adapter/agy_process.rs`. Native subagent invocation remains disabled while the configured roster and a harmless live invocation are unverified; manual child tasks do not depend on that capability. Extract a shared low-level process runner only when a second real adapter demonstrates the common contract.
 
 ## Persistent state
 

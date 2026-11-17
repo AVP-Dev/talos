@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R6 — Runtime and resumption remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. T6.5 implementation adds schema-v9 Linux `/proc` fingerprints and recovery reporting; Linux-native checks are deferred until server access. T7.1 and T7.2 code are in progress while those external acceptance gates remain documented. Backlog count: 40 of 61 scheduled tasks done (65.6% by task count, unweighted); two unscheduled ideas are recorded separately.
+**R6 — Runtime and resumption remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. T6.5 implementation adds schema-v9 Linux `/proc` fingerprints and recovery reporting; Linux-native checks are deferred until server access. T7.1–T7.3 implementation is advancing while behavior checks and external acceptance gates remain documented. Backlog count: 40 of 61 scheduled tasks done (65.6% by task count, unweighted); two unscheduled ideas are recorded separately.
 
 ## Goal and fixed direction
 
@@ -257,7 +257,7 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - Added `task depends <TASK> --on <PREREQUISITE>` and `task dependencies <TASK>`. Dependencies are accepted only for queued tasks; self-edges and cycles are refused, and duplicate additions are idempotent.
 - Added a shared runnable-task gate: explicit Writer starts check all prerequisites inside the creation transaction, while `up --auto` selects only queued tasks whose prerequisites are `complete`. Auto reports blocked queued tasks and their prerequisites instead of claiming the queue is empty.
 - Added schema-v9-to-v10 migration coverage. `cargo fmt --all && cargo check --all-targets --all-features` and `git diff --check` passed on macOS. Migration, DAG cycle, eligibility, and command behavior tests have not been run. This R7.1 implementation is not complete until those checks pass.
-- R6.3 and R6.5 code are committed locally as `173d736` and `098f7b1`. R7.1 changes are uncommitted. The repository remains local on `master` with no remote; no Linux host or external service was contacted.
+- R6.3, R6.5, and R7.1 code are committed locally as `173d736`, `098f7b1`, and `da33ccf`. The repository remains local on `master` with no remote; no Linux host was contacted.
 
 ## R7.2 progress — 2026-11-18
 
@@ -265,11 +265,17 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - Added `task child`, `task children`, and `task child-report`. The report is versioned as `talos-child-task-report-v1` and is derived from existing task, Writer attempt, Critic, and verification rows; no duplicate report or full transcript is stored.
 - Writer prompts include allowed paths and timeout; the saved timeout overrides the general Writer timeout. Critic review receives the scope, and TALOS adds a deterministic blocker if any changed path is outside the contract. The scope is a review gate, not an OS security boundary.
 - Added v10→v11 migration coverage. `cargo fmt --all && cargo check --all-targets --all-features` passed on macOS. Migration, child creation, timeout, report, and scope-enforcement tests have not run; T7.2 remains in progress.
-- R7.1 commit: `da33ccf`. R7.2 changes are uncommitted. Repository remains local on `master`; no remote or Linux host was contacted.
+- Local commit: `1058870`. Repository remains local on `master`; no remote or Linux host was contacted.
+
+## R7.3 progress — 2026-11-18
+
+- Added `native_subagents` to Agy capability discovery and `talos doctor` output. TALOS reports it as advertised only if `agy --help` exposes the public `invoke_subagent` tool; otherwise it stays `not_tested` and native delegation stays disabled. A missing or unknown native capability does not disable manual child tasks.
+- Current `agy --version` reports `1.5.10`; local `agy --help` does not expose `invoke_subagent`. The `agy agents` listing could not be inspected: this sandbox blocked the CLI's attempt to create files under `~/.gemini` and bind its local language-server port. No Agy settings or project data were changed.
+- `cargo fmt --all && cargo check --all-targets --all-features && git diff --check` passed on macOS. Capability parser tests are recorded but not run; T7.3 remains in progress pending a harmless runtime probe. No Linux host was contacted.
 
 ## Next action
 
-Next implement T7.3 native-subagent capability detection, then T7.4 worktree lifecycle and T7.5 bounded integration. T7.1 and T7.2 still need behavior/migration checks. R6 acceptance gates also remain open: T6.3 behavior/full-profile checks, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6's TUI trust/handoff scenario. No Linux connection or trust-setting change has been made. Continue R7–R9 implementation locally while keeping these checks unclaimed. Keep all work on `master`; the user will create the hosted repository later.
+Next commit T7.3's capability-reporting slice, then implement T7.4 worktree lifecycle and T7.5 bounded integration. T7.1 and T7.2 still need behavior/migration checks. R6 acceptance gates also remain open: T6.3 behavior/full-profile checks, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6's TUI trust/handoff scenario. No Linux connection or trust-setting change has been made. Continue R7–R9 implementation locally while keeping these checks unclaimed. Keep all work on `master`; the user will create the hosted repository later.
 
 ## Session close checklist
 

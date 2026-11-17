@@ -86,7 +86,7 @@ Each round ends with a usable, verifiable result, an updated backlog, and a sess
 | R4 | Independent Critic | Read-only review, real blocker finding, denied write probe, linked Writer fix, immutable review history, and per-project role selection. Complete for verified macOS Antigravity 1.5.10. |
 | R5 | Verification and permissions | Configured checks, exact Git facts, Auto/Semi policy, redaction, and evidence-gated completion. Complete on macOS; see R5 acceptance below. |
 | R6 | Persistent runtime and recovery | In progress: T6.1 adds a project-scoped tmux control shell; T6.2 adds durable pause/resume and manual-change reconciliation; T6.3 adds cooperative stop and safer recovery; T6.4 SSH reconnect and T6.5 Linux identity/server acceptance remain open. R6.3 behavior/profile verification is pending. |
-| R7 | Decomposition and parallel work | In progress: T7.1 implements dependency edges and runnable-task filtering; child-task contracts, verified subagent support, worktrees, and bounded integration remain open. |
+| R7 | Decomposition and parallel work | In progress: T7.1 dependency scheduling and T7.2 child-task contracts are implemented with behavior checks pending; T7.3 reports Agy native-subagent support as untested until its configured roster and a harmless invocation can be verified. Worktrees and bounded integration remain open. |
 | R8 | GitHub workflow | Authorized branch, push and PR, CI monitoring, and report; no automatic merge. |
 | R9 | Hardening and release | Resilience, long-running checks, macOS install/update/uninstall, complete operator documentation, and Linux build/runtime/package acceptance. |
 

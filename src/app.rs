@@ -688,6 +688,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                         .safe_unattended_write
                         .as_str()
                 );
+                println!(
+                    "  Native subagents: {}",
+                    report.antigravity.capabilities.native_subagents.as_str()
+                );
                 if let Some(note) = &report.antigravity.note {
                     println!("  Note: {}", redact_sensitive(note));
                 }

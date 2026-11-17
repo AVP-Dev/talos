@@ -2,7 +2,7 @@
 
 TALOS is a Rust CLI-first orchestrator for local AI coding CLIs. It stores tasks, Writer attempts, and events in a durable local SQLite database, supervises one verified Antigravity Writer at a time, and preserves ambiguous work for operator review.
 
-> **Current status:** R6 implementation is in progress, with macOS reconnect, process-recovery behavior, interactive handoff, and Linux server acceptance still open. R7.1 dependency scheduling and R7.2 bounded child contracts are implemented but still need behavior/migration verification. Linux-specific checks are deferred to the user's server; Linux support remains unverified. No Docker or VM is required. Antigravity 1.5.10 is the only Writer- and Critic-verified adapter. Critic approval moves a task to `verifying`; TALOS completes it only after saved project checks pass for the same approved Git revision. `up --auto` runs at most one task per explicit call. `up --semi` prompts before a Writer launch and requires an interactive terminal.
+> **Current status:** R6 implementation is in progress, with macOS reconnect, process-recovery behavior, interactive handoff, and Linux server acceptance still open. R7.1 dependency scheduling and R7.2 bounded child contracts are implemented but still need behavior/migration verification. T7.3 reports native subagent invocation as untested until a configured agent and harmless live invocation are verified; manual child tasks remain available. Linux-specific checks are deferred to the user's server; Linux support remains unverified. No Docker or VM is required. Antigravity 1.5.10 is the only Writer- and Critic-verified adapter. Critic approval moves a task to `verifying`; TALOS completes it only after saved project checks pass for the same approved Git revision. `up --auto` runs at most one task per explicit call. `up --semi` prompts before a Writer launch and requires an interactive terminal.
 
 ## Start here
 
@@ -50,6 +50,8 @@ talos task review <ID>
 Tasks can be linked into a directed acyclic graph. `task depends <TASK> --on <PREREQUISITE>` adds an append-only edge; self-dependencies and cycles are refused. Explicit runs and Auto both wait until all prerequisites have status `complete`. Use `task dependencies <TASK>` to inspect prerequisite states.
 
 `task child <PARENT> <TITLE> --criteria ... --allow <PATH>` creates a bounded child contract with up to 64 project-relative paths and a Writer timeout of 1–1800 seconds. The parent automatically waits for each child to complete. TALOS includes the path scope in the Writer and Critic inputs and deterministically blocks Critic approval if the child diff changes an out-of-scope path. This is a review gate, not an OS sandbox. `task child-report <ID>` returns the compact `talos-child-task-report-v1` shape from existing task, review, and verification rows; TALOS does not store a second copy of the report or a full Writer transcript.
+
+`talos doctor` reports native subagent invocation as advertised only when the installed CLI help exposes its public invocation tool. Otherwise the capability remains untested and native delegation stays disabled until the configured agent roster and a harmless invocation are verified. Manual child tasks remain available.
 
 The Critic uses a fresh read-only process. A rejection moves the task to `implementing`; run the task again to start a linked Writer fix, then review the new revision. Approval moves the task to `verifying`. Configure named project checks in `.talos/config.json` and save them to a task:
 
