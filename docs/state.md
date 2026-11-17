@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R5 — Verification evidence and permissions is complete for the locally verified macOS path.** T5.1–T5.7 are done. Tasks can save named project checks, run them against the latest approved Critic revision, persist compact evidence, and complete only when all checks and Git facts pass. `task evidence` retrieves that evidence in later sessions. Semi prompts before a one-shot Writer launch. Linux-native build/runtime/sandbox acceptance remains deferred until the user provides server access under T6.5/T9.3. Backlog count: 38 of 61 scheduled tasks done (62.3% by task count, unweighted); two unscheduled ideas are recorded separately. Next task: T6.1.
+**R6 — Runtime and resumption is in progress.** T6.1 is complete: `talos attach` now creates/reuses a project-scoped tmux control shell without starting a worker. T6.2 is next. R5 remains complete for the locally verified macOS path. Linux-native build/runtime/sandbox acceptance remains deferred until the user provides server access under T6.5/T9.3. Backlog count: 39 of 61 scheduled tasks done (63.9% by task count, unweighted); two unscheduled ideas are recorded separately.
 
 ## Goal and fixed direction
 
@@ -151,7 +151,7 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 
 ## Repository and runtime condition
 
-- A local Git repository is initialized on the `master` branch. Initial snapshot commit: `76fa40d` (`chore: initialize local project history`). Latest completed round: `1e76675` (`feat: add evidence-gated project verification`). The project remains local; no remote is configured, and no push or publication is planned until the user creates a hosted repository.
+- A local Git repository is initialized on the `master` branch. Initial snapshot commit: `76fa40d` (`chore: initialize local project history`). Latest completed round: `1e76675` (`feat: add evidence-gated project verification`). R6.1 work is in progress and not committed yet. The project remains local; no remote is configured, and no push or publication is planned until the user creates a hosted repository.
 - The staged snapshot contained 38 project files; `.gitignore` excluded `.DS_Store` and `target/`. `git diff --cached --check` passed. One redundant blank line at the end of `Cargo.toml` was removed before the initial commit. No Rust tests or builds were run for this repository/documentation setup batch.
 - Product history follow-up is recorded as unscheduled idea F1, to revisit after R9. The current database stores task metadata and lifecycle events plus Writer-attempt metadata; it does not persist a separate project plan, project-creation history, or full Writer transcript.
 - Earlier smoke databases were isolated under `/private/tmp`; the R4 runtime database in this workspace is now documented below.
@@ -203,17 +203,27 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 
 ### Next round
 
-- R5 is complete for the verified macOS path. Continue to **T6.1 — create and reconnect the tmux control session**. Keep the repository local on `master`; the user will create the hosted repository later.
+- R5 is complete for the verified macOS path. T6.1 is now complete; continue with **T6.2 — support pause/resume and manual takeover**. Keep the repository local on `master`; the user will create the hosted repository later.
+
+## R6.1 progress — 2026-11-18
+
+- Added `src/tmux.rs` with a read-only tmux version probe, stable project-scoped session naming, duplicate-safe detached session creation, outside attach, and inside-client switching. Added the `talos attach` command and `doctor` tmux reporting.
+- A TALOS control session contains the user's shell only. It does not start a worker or create the SQLite runtime; existing foreground commands remain available if tmux is missing.
+- Installed tmux is 3.8. Current docs were checked with Context7: [tmux Getting Started](https://github.com/tmux/tmux/wiki/Getting-Started) and the [tmux manual](https://github.com/tmux/tmux/blob/master/tmux.1). TALOS uses detached session creation, exact session targets, and attach/switch behavior; it does not use the `new-session -A` attach path.
+- `cargo test --locked --lib tmux::tests::reuses_one_project_session_with_fake_tmux` — passed in the default sandbox and verified the project session is created once.
+- `cargo test --locked --lib tmux::tests::creates_only_one_control_session_for_a_project -- --ignored --nocapture` — passed with a separately isolated tmux 3.8 server and `/private/tmp` socket. The test killed its own server. The integration test is ignored by the default suite because the sandbox blocks Unix-socket creation; the fake-client idempotence test remains in the normal suite.
+- `cargo fmt --all && ./scripts/verify-project.sh` — passed: format, Clippy (`-D warnings`), **106 passed / 2 ignored**, macOS ARM64 release build, and `security-scan: clean`. One ignored helper is invoked by its signal-forwarding test; the real tmux socket smoke is run separately as above.
+- macOS `xcrun` emitted non-fatal cache-file warnings; all required profile commands exited successfully. Next task is T6.2.
 
 ### Repository and next action
 
 - Local Git remains on `master`; no remote is configured. The user will create a hosted repository later. Do not add a remote or push.
 - Local `.talos/state.sqlite3` has no queued tasks. It remains ignored; an offline backup of the test DB is in `/private/tmp` until temporary probe cleanup.
-- Next task: **T6.1 — create and reconnect the tmux control session.** Continue sequentially through R6–R9. Do not connect to a Linux host or run Linux-native checks until the user provides server access.
+- Next task: **T6.2 — support pause/resume and manual takeover.** Continue sequentially through R6–R9. Do not connect to a Linux host or run Linux-native checks until the user provides server access.
 
 ## Next action
 
-R5 is implemented, locally verified, and committed as `1e76675` on `master`. Continue with **T6.1 — create and reconnect the tmux control session**. Keep all work local; the user will create the hosted repository later. Linux-native implementation can proceed in its planned round, but server connection and Linux-native verification are deferred until access is provided.
+R5 is implemented, locally verified, and committed as `1e76675` on `master`. T6.1 is complete; continue with **T6.2 — support pause/resume and manual takeover**. Keep all work local; the user will create the hosted repository later. Linux-native implementation can proceed in its planned round, but server connection and Linux-native verification are deferred until access is provided.
 
 ## Session close checklist
 

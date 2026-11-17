@@ -93,7 +93,7 @@ Dependency: R3 and R5.
 
 | ID | Status | Task | Exit criteria |
 |---|---|---|---|
-| T6.1 | planned | Create and reconnect tmux control session | Repeated launch creates no duplicate workers/panes; without tmux, foreground mode is clear. |
+| T6.1 | done | Create and reconnect tmux control session | `talos attach` creates one detached, project-scoped user shell or reuses it; it attaches from outside tmux and switches the current client from inside. Session identity is a stable hash of the canonical root. The command does not start a worker or database; foreground commands still work without tmux and attach gives a clear fallback error. A fake tmux test verifies idempotence, and a host smoke test verified a real isolated tmux 3.8 server. |
 | T6.2 | planned | Support pause/resume/stop and manual takeover | Pause preserves tasks; manual edits are detected and reconciled before continuing. |
 | T6.3 | planned | Recover after CLI/TALOS exit and SIGTERM/SIGKILL | Test separate failure points; transitions preserve the last confirmed write. Extend bounded process-group cleanup to project-check subprocess trees. Address stale 35-minute lease recovery after a hard crash. Review the narrow numeric process-group ID reuse window in runner cleanup and ensure cleanup cannot signal an unrelated group; if the platform cannot prove the target, fail closed. |
 | T6.4 | planned | Check SSH reconnect on macOS and record deferred Linux boot recovery | macOS state and status remain visible after reattach. Linux boot recovery and systemd user autostart remain deferred until Linux runtime support is implemented under T6.5/T9.3. |

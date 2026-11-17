@@ -26,6 +26,7 @@ use crate::{
         VERIFIED_AGY_CRITIC_VERSION, VERIFIED_AGY_WRITE_VERSION, WriterContinuation,
         continue_writer_attempt, run_critic_review, run_writer_attempt, validate_project_scope,
     },
+    tmux::{TmuxClient, TmuxProbe},
 };
 
 const WRITER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -53,6 +54,7 @@ struct DoctorReport {
     writer_adapter: &'static str,
     critic_adapter: &'static str,
     project_checks: Vec<String>,
+    tmux: TmuxProbe,
     antigravity: AgyProbe,
     git: &'static str,
 }
@@ -71,6 +73,27 @@ pub async fn run(cli: Cli) -> Result<()> {
             )
     ) {
         validate_project_scope(&project)?;
+    }
+
+    if matches!(&cli.command, Command::Attach) {
+        let tmux = TmuxClient::default();
+        let probe = tmux.probe();
+        if !probe.available {
+            bail!("tmux is unavailable; use TALOS foreground commands or install tmux");
+        }
+        let session_name = tmux.ensure_project_session(&project.root)?;
+        if cli.json {
+            print_json(&json!({
+                "mode": "tmux_attach",
+                "project_root": project.root,
+                "session_name": session_name,
+                "worker_started": false,
+            }))?;
+        } else {
+            println!("TALOS control session: {session_name}");
+        }
+        tmux.attach_project_session(&session_name)?;
+        return Ok(());
     }
 
     ensure_talos_ignored(&project)?;
@@ -336,6 +359,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     .iter()
                     .map(|check| check.id.clone())
                     .collect(),
+                tmux: TmuxClient::default().probe(),
                 antigravity,
                 git,
             };
@@ -358,6 +382,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                     println!("Project checks: none configured");
                 } else {
                     println!("Project checks: {}", report.project_checks.join(", "));
+                }
+                match (&report.tmux.available, &report.tmux.version) {
+                    (true, Some(version)) => println!("tmux: {version}"),
+                    (true, None) => println!("tmux: available, version unknown"),
+                    (false, _) => println!("tmux: unavailable; foreground mode remains available"),
                 }
                 println!("Antigravity CLI: {}", report.antigravity.status.as_str());
                 if let Some(executable) = &report.antigravity.executable {
@@ -418,6 +447,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Attach => bail!("Attach command was not dispatched before runtime initialization"),
     }
     Ok(())
 }

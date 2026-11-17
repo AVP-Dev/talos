@@ -23,7 +23,10 @@ talos task add "Describe the change" --criteria "Describe how to verify it"
 talos task list
 talos up --auto
 talos status
+talos attach
 ```
+
+`talos attach` creates or reconnects to one persistent tmux shell for the current project. It does not start a worker. Run the existing TALOS commands in that shell, or keep using them directly in the foreground when tmux is unavailable.
 
 `up --auto` requires a clean Git worktree with `.talos/` ignored and processes the first queued task once. It reports the Writer response and changed Git paths. A successful attempt remains `reviewing`. Use the independent Critic for a structured review:
 

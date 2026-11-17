@@ -10,6 +10,7 @@ pub mod review;
 pub mod revision;
 pub mod secrets;
 pub mod supervisor;
+pub mod tmux;
 
 #[cfg(test)]
 mod process_identity;

@@ -28,6 +28,8 @@ pub enum Command {
     Logs(LogsArgs),
     /// Check local project and database readiness.
     Doctor,
+    /// Create or reconnect to this project's persistent tmux control shell.
+    Attach,
 }
 
 #[derive(Debug, Args)]
@@ -231,6 +233,13 @@ mod tests {
             panic!("expected task evidence command");
         };
         assert_eq!(task_id, 17);
+    }
+
+    #[test]
+    fn attach_parses_without_starting_a_worker_option() {
+        let cli = Cli::try_parse_from(["talos", "attach"])
+            .expect("parse persistent control-session command");
+        assert!(matches!(cli.command, Command::Attach));
     }
 
     #[test]
