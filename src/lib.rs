@@ -12,6 +12,7 @@ pub mod revision;
 pub mod secrets;
 pub mod supervisor;
 pub mod tmux;
+pub mod worktree;
 
 mod process_identity;
 

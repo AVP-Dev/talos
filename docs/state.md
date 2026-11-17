@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R6 — Runtime and resumption remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. T6.5 implementation adds schema-v9 Linux `/proc` fingerprints and recovery reporting; Linux-native checks are deferred until server access. T7.1–T7.3 implementation is advancing while behavior checks and external acceptance gates remain documented. Backlog count: 40 of 61 scheduled tasks done (65.6% by task count, unweighted); two unscheduled ideas are recorded separately.
+**R6 — Runtime and resumption remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. T6.5 implementation adds schema-v9 Linux `/proc` fingerprints and recovery reporting; Linux-native checks are deferred until server access. R7 code slices T7.1–T7.4 are implemented or in progress while behavior checks and external acceptance gates remain documented. Backlog count: 40 of 61 scheduled tasks done (65.6% by task count, unweighted); two unscheduled ideas are recorded separately.
 
 ## Goal and fixed direction
 
@@ -271,11 +271,18 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 
 - Added `native_subagents` to Agy capability discovery and `talos doctor` output. TALOS reports it as advertised only if `agy --help` exposes the public `invoke_subagent` tool; otherwise it stays `not_tested` and native delegation stays disabled. A missing or unknown native capability does not disable manual child tasks.
 - Current `agy --version` reports `1.5.10`; local `agy --help` does not expose `invoke_subagent`. The `agy agents` listing could not be inspected: this sandbox blocked the CLI's attempt to create files under `~/.gemini` and bind its local language-server port. No Agy settings or project data were changed.
-- `cargo fmt --all && cargo check --all-targets --all-features && git diff --check` passed on macOS. Capability parser tests are recorded but not run; T7.3 remains in progress pending a harmless runtime probe. No Linux host was contacted.
+- Commit: `9bbd2d7`. `cargo fmt --all && cargo check --all-targets --all-features && git diff --check` passed on macOS. Capability parser tests are recorded but not run; T7.3 remains in progress pending a harmless runtime probe. No Linux host was contacted.
+
+## R7.4 progress — 2026-11-18
+
+- Added schema-v12 task worktree records and append-only lifecycle events. Explicit `task worktree create/list/reconcile/remove` commands create a linked branch from a clean base, track interrupted creation, and preserve the branch after worktree removal.
+- Worktrees use a private sibling `.talos-worktrees/<project-hash>` directory so Git metadata and `.talos` state stay outside the checked-out source. Removal refuses any tracked changes, untracked files, or ignored files; there is no force option or automatic deletion.
+- Writer/Critic/verification still operate on the primary project root. T7.5 must separate the agent execution root from the shared project state/config root before worktree execution is enabled.
+- `cargo fmt --all && cargo check --all-targets --all-features && git diff --check` passed on macOS. T7.4 implementation is uncommitted; lifecycle behavior is unverified. No worktree was created, no Linux host was contacted, and no tests were run.
 
 ## Next action
 
-Next commit T7.3's capability-reporting slice, then implement T7.4 worktree lifecycle and T7.5 bounded integration. T7.1 and T7.2 still need behavior/migration checks. R6 acceptance gates also remain open: T6.3 behavior/full-profile checks, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6's TUI trust/handoff scenario. No Linux connection or trust-setting change has been made. Continue R7–R9 implementation locally while keeping these checks unclaimed. Keep all work on `master`; the user will create the hosted repository later.
+Proceed to T7.5 bounded worktree integration. T7.1–T7.4 still need behavior/migration checks, and T7.3 needs a harmless native-delegation probe. R6 acceptance gates also remain open: T6.3 behavior/full-profile checks, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6's TUI trust/handoff scenario. No Linux connection or trust-setting change has been made. Continue R7–R9 implementation locally while keeping these checks unclaimed. Keep all work on `master`; the user will create the hosted repository later.
 
 ## Session close checklist
 

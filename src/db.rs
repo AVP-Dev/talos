@@ -15,7 +15,7 @@ use crate::{
     secrets::contains_sensitive,
 };
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 const MAX_CHILD_TASK_ALLOWED_PATHS: usize = 64;
 const MAX_CHILD_TASK_SCOPE_BYTES: usize = 16 * 1024;
 const MIN_CHILD_TASK_TIMEOUT_MS: i64 = 1_000;
@@ -73,6 +73,40 @@ pub struct ChildTaskContract {
     pub allowed_paths: Vec<String>,
     pub timeout_ms: i64,
     pub created_at_ms: i64,
+}
+
+#[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskWorktreeState {
+    Creating,
+    Active,
+    Failed,
+    NeedsAttention,
+    Retired,
+}
+
+impl TaskWorktreeState {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Creating => "creating",
+            Self::Active => "active",
+            Self::Failed => "failed",
+            Self::NeedsAttention => "needs_attention",
+            Self::Retired => "retired",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct TaskWorktreeRecord {
+    pub task_id: i64,
+    pub worktree_path: String,
+    pub branch_name: String,
+    pub base_commit: String,
+    pub state: TaskWorktreeState,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub retired_at_ms: Option<i64>,
 }
 
 impl ChildTaskContract {
@@ -548,6 +582,206 @@ impl Database {
             .query_map([parent_task_id], map_child_task_contract)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("Cannot list child-task contracts")
+    }
+
+    pub fn begin_task_worktree(
+        &mut self,
+        task_id: i64,
+        worktree_path: &str,
+        branch_name: &str,
+        base_commit: &str,
+    ) -> Result<TaskWorktreeRecord> {
+        validate_record_text("Worktree path", worktree_path, 4_096)?;
+        validate_record_text("Worktree branch", branch_name, 200)?;
+        validate_git_revision(base_commit)?;
+        if !Path::new(worktree_path).is_absolute()
+            || worktree_path.chars().any(char::is_control)
+            || !branch_name.starts_with("talos/task/")
+            || !branch_name
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'-' | b'_'))
+        {
+            bail!("Worktree path or branch name is not in TALOS's safe format");
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot start worktree lifecycle transaction")?;
+        let task_status: Option<String> = transaction
+            .query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        let Some(task_status) = task_status else {
+            bail!("Task #{task_id} does not exist");
+        };
+        if task_status != TaskStatus::Queued.as_str() {
+            bail!("A task worktree can only be created for a queued task");
+        }
+
+        let existing: Option<TaskWorktreeRecord> = transaction
+            .query_row(
+                "SELECT task_id, worktree_path, branch_name, base_commit, state,
+                        created_at_ms, updated_at_ms, retired_at_ms
+                 FROM task_worktrees WHERE task_id = ?1",
+                [task_id],
+                map_task_worktree,
+            )
+            .optional()?;
+        let now = now_ms()?;
+        let event_type;
+        if let Some(existing) = existing {
+            if existing.worktree_path != worktree_path
+                || existing.branch_name != branch_name
+                || existing.base_commit != base_commit
+            {
+                bail!("Task #{task_id} already has a worktree record with different identity");
+            }
+            if existing.state != TaskWorktreeState::Failed {
+                bail!(
+                    "Task #{task_id} already has a worktree in state {}",
+                    existing.state.as_str()
+                );
+            }
+            transaction.execute(
+                "UPDATE task_worktrees SET state = 'creating', updated_at_ms = ?1
+                 WHERE task_id = ?2 AND state = 'failed'",
+                params![now, task_id],
+            )?;
+            event_type = "task.worktree_creation_retried";
+        } else {
+            transaction.execute(
+                "INSERT INTO task_worktrees
+                     (task_id, worktree_path, branch_name, base_commit, state, created_at_ms, updated_at_ms)
+                 VALUES (?1, ?2, ?3, ?4, 'creating', ?5, ?5)",
+                params![task_id, worktree_path, branch_name, base_commit, now],
+            )?;
+            event_type = "task.worktree_creation_started";
+        }
+        let event_data = serde_json::to_string(&serde_json::json!({
+            "worktree_path": worktree_path,
+            "branch_name": branch_name,
+            "base_commit": base_commit,
+        }))?;
+        transaction.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, 'talos', ?3, 'TALOS began explicit task worktree creation', ?4)",
+            params![task_id, now, event_type, event_data],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot record worktree creation start")?;
+        self.task_worktree(task_id)?
+            .context("Worktree creation record disappeared")
+    }
+
+    pub fn task_worktree(&self, task_id: i64) -> Result<Option<TaskWorktreeRecord>> {
+        self.connection
+            .query_row(
+                "SELECT task_id, worktree_path, branch_name, base_commit, state,
+                        created_at_ms, updated_at_ms, retired_at_ms
+                 FROM task_worktrees WHERE task_id = ?1",
+                [task_id],
+                map_task_worktree,
+            )
+            .optional()
+            .context("Cannot read task worktree")
+    }
+
+    pub fn task_worktrees(&self) -> Result<Vec<TaskWorktreeRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT task_id, worktree_path, branch_name, base_commit, state,
+                    created_at_ms, updated_at_ms, retired_at_ms
+             FROM task_worktrees ORDER BY task_id",
+        )?;
+        statement
+            .query_map([], map_task_worktree)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("Cannot list task worktrees")
+    }
+
+    pub fn update_task_worktree_state(
+        &mut self,
+        task_id: i64,
+        target: TaskWorktreeState,
+        reason: &str,
+    ) -> Result<TaskWorktreeRecord> {
+        validate_record_text("Worktree state reason", reason, 1_000)?;
+        if contains_sensitive(reason) {
+            bail!("Worktree state reason must not contain credentials or private keys");
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot update task worktree state")?;
+        let current = transaction
+            .query_row(
+                "SELECT task_id, worktree_path, branch_name, base_commit, state,
+                        created_at_ms, updated_at_ms, retired_at_ms
+                 FROM task_worktrees WHERE task_id = ?1",
+                [task_id],
+                map_task_worktree,
+            )
+            .optional()?
+            .with_context(|| format!("Task #{task_id} has no worktree record"))?;
+        let allowed = matches!(
+            (&current.state, &target),
+            (TaskWorktreeState::Creating, TaskWorktreeState::Active)
+                | (TaskWorktreeState::Creating, TaskWorktreeState::Failed)
+                | (
+                    TaskWorktreeState::Creating,
+                    TaskWorktreeState::NeedsAttention
+                )
+                | (TaskWorktreeState::Active, TaskWorktreeState::NeedsAttention)
+                | (TaskWorktreeState::Active, TaskWorktreeState::Retired)
+        );
+        if !allowed {
+            bail!(
+                "Invalid worktree state transition for task #{task_id}: {} to {}",
+                current.state.as_str(),
+                target.as_str()
+            );
+        }
+        let now = now_ms()?;
+        let retired_at = if target == TaskWorktreeState::Retired {
+            Some(now)
+        } else {
+            None
+        };
+        transaction.execute(
+            "UPDATE task_worktrees SET state = ?1, updated_at_ms = ?2, retired_at_ms = ?3
+             WHERE task_id = ?4 AND state = ?5",
+            params![
+                target.as_str(),
+                now,
+                retired_at,
+                task_id,
+                current.state.as_str()
+            ],
+        )?;
+        let event_type = match target {
+            TaskWorktreeState::Active => "task.worktree_created",
+            TaskWorktreeState::Failed => "task.worktree_creation_failed",
+            TaskWorktreeState::NeedsAttention => "task.worktree_needs_attention",
+            TaskWorktreeState::Retired => "task.worktree_retired",
+            TaskWorktreeState::Creating => unreachable!("creating is not a transition target"),
+        };
+        let event_data = serde_json::to_string(&serde_json::json!({
+            "worktree_path": current.worktree_path,
+            "branch_name": current.branch_name,
+            "state": target.as_str(),
+        }))?;
+        transaction.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, 'talos', ?3, ?4, ?5)",
+            params![task_id, now, event_type, reason, event_data],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot commit task worktree state")?;
+        self.task_worktree(task_id)?
+            .context("Task worktree disappeared after state update")
     }
 
     pub fn add_task_dependency(&mut self, task_id: i64, prerequisite_task_id: i64) -> Result<bool> {
@@ -3345,6 +3579,44 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .context("Cannot add bounded child-task contracts")?;
         migrated_version = 11;
     }
+    if migrated_version == 11 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE task_worktrees (
+                     task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE RESTRICT,
+                     worktree_path TEXT NOT NULL UNIQUE,
+                     branch_name TEXT NOT NULL UNIQUE,
+                     base_commit TEXT NOT NULL CHECK(length(base_commit) IN (40, 64)),
+                     state TEXT NOT NULL CHECK(state IN ('creating', 'active', 'failed', 'needs_attention', 'retired')),
+                     created_at_ms INTEGER NOT NULL,
+                     updated_at_ms INTEGER NOT NULL,
+                     retired_at_ms INTEGER,
+                     CHECK(updated_at_ms >= created_at_ms),
+                     CHECK((state = 'retired' AND retired_at_ms IS NOT NULL)
+                           OR (state <> 'retired' AND retired_at_ms IS NULL))
+                 );
+                 CREATE TRIGGER task_worktrees_identity_immutable
+                     BEFORE UPDATE OF task_id, worktree_path, branch_name, base_commit, created_at_ms ON task_worktrees BEGIN
+                         SELECT RAISE(ABORT, 'task worktree identity is immutable');
+                     END;
+                 CREATE TRIGGER task_worktrees_state_transition
+                     BEFORE UPDATE OF state ON task_worktrees
+                     WHEN NOT (
+                         (OLD.state = 'creating' AND NEW.state IN ('active', 'failed', 'needs_attention'))
+                         OR (OLD.state = 'failed' AND NEW.state = 'creating')
+                         OR (OLD.state = 'active' AND NEW.state IN ('needs_attention', 'retired'))
+                     ) BEGIN
+                         SELECT RAISE(ABORT, 'invalid task worktree state transition');
+                     END;
+                 CREATE TRIGGER task_worktrees_no_delete
+                     BEFORE DELETE ON task_worktrees BEGIN
+                         SELECT RAISE(ABORT, 'task worktree history is append-only');
+                     END;
+                 PRAGMA user_version = 12;",
+            )
+            .context("Cannot add task worktree lifecycle records")?;
+        migrated_version = 12;
+    }
     if migrated_version != SCHEMA_VERSION {
         bail!("Cannot migrate database from unsupported schema version {migrated_version}");
     }
@@ -3489,6 +3761,34 @@ fn map_child_task_contract(row: &rusqlite::Row<'_>) -> rusqlite::Result<ChildTas
         allowed_paths,
         timeout_ms: row.get(3)?,
         created_at_ms: row.get(4)?,
+    })
+}
+
+fn map_task_worktree(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskWorktreeRecord> {
+    let state_value: String = row.get(4)?;
+    let state = match state_value.as_str() {
+        "creating" => TaskWorktreeState::Creating,
+        "active" => TaskWorktreeState::Active,
+        "failed" => TaskWorktreeState::Failed,
+        "needs_attention" => TaskWorktreeState::NeedsAttention,
+        "retired" => TaskWorktreeState::Retired,
+        _ => {
+            return Err(rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Text,
+                format!("unknown task worktree state {state_value:?}").into(),
+            ));
+        }
+    };
+    Ok(TaskWorktreeRecord {
+        task_id: row.get(0)?,
+        worktree_path: row.get(1)?,
+        branch_name: row.get(2)?,
+        base_commit: row.get(3)?,
+        state,
+        created_at_ms: row.get(5)?,
+        updated_at_ms: row.get(6)?,
+        retired_at_ms: row.get(7)?,
     })
 }
 
@@ -3896,7 +4196,7 @@ mod tests {
     fn initialization_is_idempotent_and_uses_wal() {
         let project = temp_project();
         let first = Database::open(&project).expect("initialize database");
-        assert_eq!(first.schema_version().expect("read schema version"), 11);
+        assert_eq!(first.schema_version().expect("read schema version"), 12);
         assert_eq!(
             first
                 .journal_mode()
@@ -3907,19 +4207,20 @@ mod tests {
         drop(first);
 
         let second = Database::open(&project).expect("open database again");
-        assert_eq!(second.schema_version().expect("read schema version"), 11);
+        assert_eq!(second.schema_version().expect("read schema version"), 12);
         drop(second);
         cleanup(&project);
     }
 
     #[test]
-    fn schema_v5_migrates_to_v11_with_optional_check_durations_and_control_state() {
+    fn schema_v5_migrates_to_v12_with_optional_check_durations_and_control_state() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
         database
             .connection
             .execute_batch(
-                "DROP TABLE child_task_contracts;
+                "DROP TABLE task_worktrees;
+                 DROP TABLE child_task_contracts;
                  DROP TABLE task_dependencies;
                  ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
                  ALTER TABLE verification_results DROP COLUMN duration_ms;
@@ -3932,7 +4233,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema-v5 duration fields");
-        assert_eq!(migrated.schema_version().unwrap(), 11);
+        assert_eq!(migrated.schema_version().unwrap(), 12);
         let columns: (i64, i64) = migrated
             .connection
             .query_row(
@@ -3949,7 +4250,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v6_migrates_to_v11_without_losing_tasks() {
+    fn schema_v6_migrates_to_v12_without_losing_tasks() {
         let project = temp_project();
         let mut database = Database::open(&project).expect("initialize current database");
         let task = database
@@ -3958,7 +4259,8 @@ mod tests {
         database
             .connection
             .execute_batch(
-                "DROP TABLE child_task_contracts;
+                "DROP TABLE task_worktrees;
+                 DROP TABLE child_task_contracts;
                  DROP TABLE task_dependencies;
                  ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
                  DROP TABLE project_control_events;
@@ -3969,7 +4271,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v6");
-        assert_eq!(migrated.schema_version().unwrap(), 11);
+        assert_eq!(migrated.schema_version().unwrap(), 12);
         assert_eq!(migrated.list_tasks().unwrap()[0].id, task.id);
         assert!(!migrated.project_control_state().unwrap().queue_paused);
         cleanup(&project);
@@ -3982,7 +4284,8 @@ mod tests {
         database
             .connection
             .execute_batch(
-                "DROP TABLE child_task_contracts;
+                "DROP TABLE task_worktrees;
+                 DROP TABLE child_task_contracts;
                  DROP TABLE task_dependencies;
                  ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
                  ALTER TABLE project_control_state DROP COLUMN stop_requested_attempt_id;
@@ -3992,7 +4295,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v7");
-        assert_eq!(migrated.schema_version().unwrap(), 11);
+        assert_eq!(migrated.schema_version().unwrap(), 12);
         assert_eq!(
             migrated
                 .project_control_state()
@@ -4010,7 +4313,8 @@ mod tests {
         database
             .connection
             .execute_batch(
-                "DROP TABLE child_task_contracts;
+                "DROP TABLE task_worktrees;
+                 DROP TABLE child_task_contracts;
                  DROP TABLE task_dependencies;
                  ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
                  PRAGMA user_version = 8;",
@@ -4019,7 +4323,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v8");
-        assert_eq!(migrated.schema_version().unwrap(), 11);
+        assert_eq!(migrated.schema_version().unwrap(), 12);
         assert!(
             migrated
                 .writer_attempts(None)
@@ -4031,13 +4335,14 @@ mod tests {
     }
 
     #[test]
-    fn schema_v9_migrates_to_v11_with_dependency_tables() {
+    fn schema_v9_migrates_to_v12_with_dependency_tables() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
         database
             .connection
             .execute_batch(
-                "DROP TABLE child_task_contracts;
+                "DROP TABLE task_worktrees;
+                 DROP TABLE child_task_contracts;
                  DROP TABLE task_dependencies;
                  PRAGMA user_version = 9;",
             )
@@ -4045,7 +4350,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v9");
-        assert_eq!(migrated.schema_version().unwrap(), 11);
+        assert_eq!(migrated.schema_version().unwrap(), 12);
         let dependencies_table_exists: bool = migrated
             .connection
             .query_row(
@@ -4059,20 +4364,21 @@ mod tests {
     }
 
     #[test]
-    fn schema_v10_migrates_to_v11_with_child_task_contracts() {
+    fn schema_v10_migrates_to_v12_with_child_task_contracts() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
         database
             .connection
             .execute_batch(
-                "DROP TABLE child_task_contracts;
+                "DROP TABLE task_worktrees;
+                 DROP TABLE child_task_contracts;
                  PRAGMA user_version = 10;",
             )
             .expect("simulate schema v10");
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v10");
-        assert_eq!(migrated.schema_version().unwrap(), 11);
+        assert_eq!(migrated.schema_version().unwrap(), 12);
         let contracts_table_exists: bool = migrated
             .connection
             .query_row(
@@ -4415,6 +4721,7 @@ mod tests {
                  ALTER TABLE critic_reviews DROP COLUMN head_commit;
                  ALTER TABLE critic_reviews DROP COLUMN patch_sha256;
                  ALTER TABLE critic_reviews DROP COLUMN changed_paths_json;
+                 DROP TABLE task_worktrees;
                  DROP TABLE child_task_contracts;
                  DROP TABLE task_dependencies;
                  ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
@@ -4426,7 +4733,7 @@ mod tests {
         drop(database);
 
         let mut migrated = Database::open(&project).expect("migrate the v4 approval");
-        assert_eq!(migrated.schema_version().unwrap(), 11);
+        assert_eq!(migrated.schema_version().unwrap(), 12);
         assert_eq!(
             migrated.list_tasks().unwrap()[0].status,
             TaskStatus::Reviewing
@@ -4568,7 +4875,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_migrates_to_v11_without_losing_tasks() {
+    fn schema_v1_migrates_to_v12_without_losing_tasks() {
         let project = temp_project();
         project
             .ensure_runtime_dir()
@@ -4610,7 +4917,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate existing database");
-        assert_eq!(database.schema_version().expect("read schema version"), 11);
+        assert_eq!(database.schema_version().expect("read schema version"), 12);
         let tasks = database.list_tasks().expect("read preserved tasks");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Existing v1 task");
@@ -4906,7 +5213,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate v2 database");
-        assert_eq!(database.schema_version().expect("read schema version"), 11);
+        assert_eq!(database.schema_version().expect("read schema version"), 12);
         assert!(
             database
                 .has_unresolved_writer_attempts()

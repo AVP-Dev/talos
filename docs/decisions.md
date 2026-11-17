@@ -255,3 +255,10 @@ No schema change for process identity is selected or implemented. The separate s
 - **Decision:** report native subagent invocation as `advertised` only when the CLI help exposes its public invocation tool. Otherwise report `not_tested` unless the CLI explicitly reports that the feature is unsupported. Do not start native delegation until the installed CLI, configured agent roster, and a harmless live invocation are verified.
 - **Reason:** an agent-listing command or an agent-definition format does not prove that TALOS can invoke a scoped subagent in a headless run, or that the installed session exposes the delegation tool.
 - **Consequence:** native delegation stays disabled while its capability is unknown. Manual child tasks, their contracts, and DAG scheduling remain available independently.
+
+## ADR-032 — Manage task worktrees explicitly and preserve dirty directories
+
+- **Status:** implemented in T7.4; lifecycle verification and Writer routing remain pending.
+- **Decision:** create a linked worktree only through an explicit task command, from a clean Git base and for a queued task. Store it in a private sibling `.talos-worktrees/<project-hash>` directory and persist its branch, path, base commit, state, and transitions in SQLite. Reconcile interrupted lifecycle states explicitly. Remove only an explicitly selected active worktree after checking tracked, untracked, and ignored files; never force removal or delete its branch.
+- **Reason:** worktrees provide separate files for later scoped delegation, but they are not a sandbox and may contain operator data. An interrupted filesystem operation must remain inspectable.
+- **Consequence:** current Writer, Critic, and verification flows still use the primary project root. T7.5 must split execution root from the shared `.talos` state/config root before TALOS routes agents through a task worktree.

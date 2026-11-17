@@ -12,7 +12,7 @@ use serde_json::json;
 use crate::{
     adapter::agy::AgyProbe,
     checks::{CheckExecution, ProjectCheck, run_project_check, validate_selected_checks},
-    cli::{Cli, Command, ResolveAction, TaskCommand},
+    cli::{Cli, Command, ResolveAction, TaskCommand, TaskWorktreeCommand},
     config::{AdapterKind, AgentRole, ProjectConfig},
     db::{
         Database, ProjectControlEvent, QueueSummary, ResumeProjectOutcome, StopRequestOutcome,
@@ -27,6 +27,7 @@ use crate::{
         continue_writer_attempt, run_critic_review, run_writer_attempt, validate_project_scope,
     },
     tmux::{TmuxClient, TmuxProbe},
+    worktree,
 };
 
 const WRITER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
@@ -303,6 +304,32 @@ pub async fn run(cli: Cli) -> Result<()> {
             TaskCommand::ChildReport { task_id } => {
                 print_child_task_report(cli.json, &database, task_id)?;
             }
+            TaskCommand::Worktree { command } => match command {
+                TaskWorktreeCommand::Create { task_id } => {
+                    let record = worktree::create(&project, &mut database, task_id)?;
+                    print_task_worktree(cli.json, "created", &record)?;
+                }
+                TaskWorktreeCommand::List => {
+                    let worktrees = worktree::list(&database)?;
+                    if cli.json {
+                        print_json(&json!({ "worktrees": worktrees }))?;
+                    } else if worktrees.is_empty() {
+                        println!("No TALOS-managed task worktrees.");
+                    } else {
+                        for record in worktrees {
+                            print_task_worktree(false, "", &record)?;
+                        }
+                    }
+                }
+                TaskWorktreeCommand::Reconcile { task_id } => {
+                    let record = worktree::reconcile(&project, &mut database, task_id)?;
+                    print_task_worktree(cli.json, "reconciled", &record)?;
+                }
+                TaskWorktreeCommand::Remove { task_id } => {
+                    let record = worktree::remove(&project, &mut database, task_id)?;
+                    print_task_worktree(cli.json, "retired", &record)?;
+                }
+            },
             TaskCommand::List => {
                 let tasks = database.list_tasks()?;
                 if cli.json {
@@ -847,6 +874,35 @@ struct VerificationReport {
     status: String,
     task_status: &'static str,
     checks: Vec<CheckExecution>,
+}
+
+fn print_task_worktree(
+    json_output: bool,
+    action: &str,
+    record: &crate::db::TaskWorktreeRecord,
+) -> Result<()> {
+    if json_output {
+        print_json(&json!({
+            "action": if action.is_empty() { None } else { Some(action) },
+            "worktree": record,
+        }))?;
+    } else {
+        if !action.is_empty() {
+            println!("Task worktree {action}.");
+        }
+        println!(
+            "Task #{}: {} on branch {}.",
+            record.task_id,
+            record.state.as_str(),
+            redact_sensitive(&record.branch_name),
+        );
+        println!(
+            "  Path: {}; base: {}",
+            redact_sensitive(&record.worktree_path),
+            record.base_commit
+        );
+    }
+    Ok(())
 }
 
 fn print_child_task_report(json_output: bool, database: &Database, task_id: i64) -> Result<()> {

@@ -131,6 +131,11 @@ pub enum TaskCommand {
         /// ID of the child task.
         task_id: i64,
     },
+    /// Explicitly create, inspect, reconcile, or remove a task worktree.
+    Worktree {
+        #[command(subcommand)]
+        command: TaskWorktreeCommand,
+    },
     /// List tasks in the local queue.
     List,
     /// Run one queued task or a Critic-requested fix with the configured Writer.
@@ -179,6 +184,27 @@ pub enum TaskCommand {
         /// Reason for the operator's decision, saved to the event journal.
         #[arg(long)]
         reason: String,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum TaskWorktreeCommand {
+    /// Create an isolated linked worktree for a queued task.
+    Create {
+        /// ID of the queued task.
+        task_id: i64,
+    },
+    /// List TALOS-managed task worktrees.
+    List,
+    /// Reconcile a recorded worktree after an interrupted lifecycle operation.
+    Reconcile {
+        /// ID of the task whose worktree should be reconciled.
+        task_id: i64,
+    },
+    /// Remove an explicitly selected worktree only if it has no changes or ignored files.
+    Remove {
+        /// ID of the task whose clean worktree should be removed.
+        task_id: i64,
     },
 }
 
