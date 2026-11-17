@@ -15,8 +15,8 @@ use crate::{
     cli::{Cli, Command, ResolveAction, TaskCommand},
     config::{AdapterKind, AgentRole, ProjectConfig},
     db::{
-        Database, ProjectControlEvent, QueueSummary, ResumeProjectOutcome, TaskEvent, TaskRecord,
-        WriterResolutionAction, WriterResolutionRecord,
+        Database, ProjectControlEvent, QueueSummary, ResumeProjectOutcome, StopRequestOutcome,
+        TaskEvent, TaskRecord, WriterResolutionAction, WriterResolutionRecord,
     },
     policy::{self, Action as PolicyAction, Authorization, ExecutionMode},
     project::{DiscoveryMethod, Project},
@@ -42,6 +42,7 @@ struct StatusReport {
     queue: QueueSummary,
     queue_paused: bool,
     pause_reason: Option<String>,
+    stop_requested_attempt_id: Option<i64>,
     supervisor: &'static str,
 }
 
@@ -122,6 +123,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     "queue": queue,
                     "queue_paused": control.queue_paused,
                     "pause_reason": control.pause_reason,
+                    "stop_requested_attempt_id": control.stop_requested_attempt_id,
                     "worker_started": false,
                 }))?;
             } else {
@@ -145,6 +147,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 .unwrap_or("no reason recorded"),
                         )
                     );
+                }
+                if let Some(attempt_id) = control.stop_requested_attempt_id {
+                    println!("Writer stop requested for attempt #{attempt_id}.");
                 }
                 println!("No agent or worker was started.");
             }
@@ -311,6 +316,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 queue: database.queue_summary()?,
                 queue_paused: control.queue_paused,
                 pause_reason: control.pause_reason,
+                stop_requested_attempt_id: control.stop_requested_attempt_id,
                 supervisor: "not running",
             };
             if cli.json {
@@ -343,6 +349,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                     );
                 } else {
                     println!("Queue: running");
+                }
+                if let Some(attempt_id) = report.stop_requested_attempt_id {
+                    println!("Writer stop requested for attempt #{attempt_id}.");
                 }
                 println!("Supervisor: {}", report.supervisor);
             }
@@ -452,6 +461,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
+        }
+        Command::Stop => {
+            stop_writer(cli.json, &mut database).await?;
         }
         Command::Doctor => {
             let git = if matches!(&project.discovery, crate::project::DiscoveryMethod::Git) {
@@ -613,6 +625,69 @@ fn current_project_revision_id(project: &Project) -> Option<String> {
         .map(|snapshot| snapshot.revision_id)
 }
 
+async fn stop_writer(json_output: bool, database: &mut Database) -> Result<()> {
+    let attempt_id = match database.request_writer_stop()? {
+        StopRequestOutcome::NoActiveWriter => {
+            if json_output {
+                print_json(&json!({
+                    "stop_requested": false,
+                    "result": "no_active_writer",
+                }))?;
+            } else {
+                println!("No active Writer attempt; nothing to stop.");
+            }
+            return Ok(());
+        }
+        StopRequestOutcome::Requested { attempt_id } => attempt_id,
+    };
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let attempt = database
+            .writer_attempts(None)?
+            .into_iter()
+            .find(|attempt| attempt.id == attempt_id)
+            .with_context(|| format!("Writer attempt #{attempt_id} disappeared while stopping"))?;
+        if !matches!(attempt.state.as_str(), "launching" | "running") {
+            let stop_confirmed =
+                attempt.error_code.as_deref() == Some("writer_stopped_by_operator");
+            if json_output {
+                print_json(&json!({
+                    "stop_requested": true,
+                    "stop_confirmed": stop_confirmed,
+                    "attempt_id": attempt_id,
+                    "attempt_state": attempt.state,
+                }))?;
+            } else if stop_confirmed {
+                println!("Writer attempt #{attempt_id} stopped after the request.");
+            } else {
+                println!(
+                    "Writer attempt #{attempt_id} finished as {} before the stop request took effect.",
+                    attempt.state
+                );
+            }
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            if json_output {
+                print_json(&json!({
+                    "stop_requested": true,
+                    "stop_confirmed": false,
+                    "attempt_id": attempt_id,
+                    "attempt_state": attempt.state,
+                }))?;
+            } else {
+                println!("Stop request recorded for Writer attempt #{attempt_id}.");
+                println!(
+                    "The Writer has not confirmed shutdown yet; inspect `talos status` and `talos task recover` before any retry."
+                );
+            }
+            return Ok(());
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
 async fn continue_task(
     json_output: bool,
     project: &Project,
@@ -707,10 +782,13 @@ async fn run_task_verification(
         let run = database.begin_verification_run(task_id, review.id, &facts, &lease)?;
         let started = tokio::time::Instant::now();
         let mut results = Vec::with_capacity(checks.len());
+        let mut interrupted = false;
         for check in &checks {
             let elapsed = started.elapsed();
             let remaining = VERIFICATION_BUDGET.saturating_sub(elapsed);
-            let result = if remaining.is_zero() {
+            let result = if interrupted {
+                failed_check_execution(check, "interrupted")
+            } else if remaining.is_zero() {
                 failed_check_execution(check, "verification_budget_exhausted")
             } else {
                 match run_project_check(&project.root, check, remaining).await {
@@ -718,6 +796,7 @@ async fn run_task_verification(
                     Err(_) => failed_check_execution(check, "check_runner_failed"),
                 }
             };
+            interrupted |= result.failure_code.as_deref() == Some("interrupted");
             database.record_verification_result(run.id, &result, &lease)?;
             results.push(result);
         }
@@ -1253,9 +1332,7 @@ fn recover_writer_attempts(json_output: bool, database: &mut Database) -> Result
     let owner_id = format!("talos-task-recover-{}-{now}", std::process::id());
     let lease_duration_ms = i64::try_from(SUPERVISOR_LEASE.as_millis())
         .context("Supervisor lease duration is out of range")?;
-    let lease = database
-        .acquire_supervisor_lease(&owner_id, now, lease_duration_ms)?
-        .context("Another TALOS supervisor currently owns the project lease")?;
+    let lease = acquire_recovery_lease(database, &owner_id, now, lease_duration_ms)?;
 
     let quarantine_result = database.quarantine_unfinished_writer_attempts(&lease);
     let lease_released = database.release_supervisor_lease(&lease)?;
@@ -1312,6 +1389,63 @@ fn recover_writer_attempts(json_output: bool, database: &mut Database) -> Result
         );
     }
     Ok(())
+}
+
+fn acquire_recovery_lease(
+    database: &mut Database,
+    owner_id: &str,
+    now: i64,
+    duration_ms: i64,
+) -> Result<crate::db::SupervisorLease> {
+    if let Some(lease) = database.acquire_supervisor_lease(owner_id, now, duration_ms)? {
+        return Ok(lease);
+    }
+
+    #[cfg(unix)]
+    {
+        let current = database
+            .current_supervisor_lease()?
+            .context("Another TALOS supervisor currently owns the project lease")?;
+        let owner_pid = talos_lease_owner_pid(&current.owner_id)
+            .context("Another TALOS supervisor currently owns the project lease")?;
+        if process_id_is_alive(owner_pid)? {
+            bail!(
+                "Another TALOS supervisor process is still alive; recovery will not steal its lease"
+            );
+        }
+        if !database.expire_supervisor_lease_if_matches(&current, now)? {
+            bail!("The supervisor lease changed while checking its owner; retry recovery");
+        }
+        return database
+            .acquire_supervisor_lease(owner_id, now, duration_ms)?
+            .context("Another TALOS supervisor acquired the project lease during recovery");
+    }
+
+    #[cfg(not(unix))]
+    {
+        bail!("Another TALOS supervisor currently owns the project lease")
+    }
+}
+
+fn talos_lease_owner_pid(owner_id: &str) -> Option<u32> {
+    if !owner_id.starts_with("talos-task-") {
+        return None;
+    }
+    let process_id = owner_id.rsplit('-').nth(1)?.parse::<u32>().ok()?;
+    (process_id > 0).then_some(process_id)
+}
+
+#[cfg(unix)]
+fn process_id_is_alive(process_id: u32) -> Result<bool> {
+    let process_id = i32::try_from(process_id).context("Supervisor process ID is out of range")?;
+    if unsafe { libc::kill(process_id, 0) } == 0 {
+        return Ok(true);
+    }
+    match std::io::Error::last_os_error().raw_os_error() {
+        Some(libc::ESRCH) => Ok(false),
+        Some(libc::EPERM) => Ok(true),
+        _ => bail!("Cannot determine whether the prior TALOS supervisor process is alive"),
+    }
 }
 
 fn resolve_writer_attempt(
@@ -1495,8 +1629,8 @@ mod tests {
     };
 
     use super::{
-        ResolveAction, SUPERVISOR_LEASE, ensure_talos_ignored, now_ms, recover_writer_attempts,
-        resolve_writer_attempt, run_task_verification,
+        ResolveAction, SUPERVISOR_LEASE, acquire_recovery_lease, ensure_talos_ignored, now_ms,
+        recover_writer_attempts, resolve_writer_attempt, run_task_verification,
     };
     use crate::{
         checks::ProjectCheck,
@@ -1738,6 +1872,37 @@ mod tests {
             database.list_tasks().expect("read recovered task")[0].status,
             TaskStatus::Blocked
         );
+        fs::remove_dir_all(&project.root).expect("remove temporary project");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_reclaims_a_lease_when_its_recorded_supervisor_pid_is_gone() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("initialize database");
+        let mut owner_process = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("start temporary lease owner process");
+        let now = now_ms().expect("read time");
+        let duration_ms = i64::try_from(SUPERVISOR_LEASE.as_millis())
+            .expect("lease duration fits in SQLite integer");
+        let old_owner_id = format!("talos-task-run-{}-{now}", owner_process.id());
+        let old_lease = database
+            .acquire_supervisor_lease(&old_owner_id, now, duration_ms)
+            .expect("acquire old supervisor lease")
+            .expect("old lease is available");
+        owner_process.kill().expect("kill temporary lease owner");
+        owner_process.wait().expect("reap temporary lease owner");
+
+        let recovery_now = now_ms().expect("read recovery time");
+        let new_owner_id = format!("talos-task-recover-{}-{recovery_now}", std::process::id());
+        let recovered =
+            acquire_recovery_lease(&mut database, &new_owner_id, recovery_now, duration_ms)
+                .expect("reclaim a lease only after its owner process is absent");
+        assert_ne!(recovered.owner_id, old_lease.owner_id);
+        assert_eq!(recovered.fencing_token, old_lease.fencing_token + 1);
+        assert!(database.release_supervisor_lease(&recovered).unwrap());
         fs::remove_dir_all(&project.root).expect("remove temporary project");
     }
 

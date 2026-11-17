@@ -30,6 +30,8 @@ pub enum Command {
     Pause(PauseArgs),
     /// Resume a paused project queue after checking for manual edits.
     Resume(ResumeArgs),
+    /// Request graceful shutdown of the active Writer process group.
+    Stop,
     /// Check local project and database readiness.
     Doctor,
     /// Create or reconnect to this project's persistent tmux control shell.
@@ -284,6 +286,13 @@ mod tests {
         };
         assert!(arguments.project);
         assert_eq!(arguments.task_id, None);
+
+        assert!(matches!(
+            Cli::try_parse_from(["talos", "stop"])
+                .expect("parse graceful Writer stop")
+                .command,
+            Command::Stop
+        ));
     }
 
     #[test]

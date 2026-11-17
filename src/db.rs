@@ -15,7 +15,7 @@ use crate::{
     secrets::contains_sensitive,
 };
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -147,6 +147,7 @@ pub struct ProjectControlState {
     pub paused_at_ms: Option<i64>,
     pub pause_reason: Option<String>,
     pub pause_revision_id: Option<String>,
+    pub stop_requested_attempt_id: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -169,6 +170,12 @@ pub enum ResumeProjectOutcome {
         reconciled_manual_changes: bool,
         reopened_task_ids: Vec<i64>,
     },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StopRequestOutcome {
+    NoActiveWriter,
+    Requested { attempt_id: i64 },
 }
 
 type WriterFinalizationState = (
@@ -618,7 +625,8 @@ impl Database {
     pub fn project_control_state(&self) -> Result<ProjectControlState> {
         self.connection
             .query_row(
-                "SELECT queue_paused, paused_at_ms, pause_reason, pause_revision_id
+                "SELECT queue_paused, paused_at_ms, pause_reason, pause_revision_id,
+                        stop_requested_attempt_id
                  FROM project_control_state WHERE singleton = 1",
                 [],
                 |row| {
@@ -627,6 +635,7 @@ impl Database {
                         paused_at_ms: row.get(1)?,
                         pause_reason: row.get(2)?,
                         pause_revision_id: row.get(3)?,
+                        stop_requested_attempt_id: row.get(4)?,
                     })
                 },
             )
@@ -650,7 +659,8 @@ impl Database {
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Cannot pause the project queue")?;
         let existing = transaction.query_row(
-            "SELECT queue_paused, paused_at_ms, pause_reason, pause_revision_id
+            "SELECT queue_paused, paused_at_ms, pause_reason, pause_revision_id,
+                    stop_requested_attempt_id
              FROM project_control_state WHERE singleton = 1",
             [],
             |row| {
@@ -659,6 +669,7 @@ impl Database {
                     paused_at_ms: row.get(1)?,
                     pause_reason: row.get(2)?,
                     pause_revision_id: row.get(3)?,
+                    stop_requested_attempt_id: row.get(4)?,
                 })
             },
         )?;
@@ -684,7 +695,67 @@ impl Database {
             paused_at_ms: Some(now),
             pause_reason: Some(reason.to_owned()),
             pause_revision_id: pause_revision_id.map(str::to_owned),
+            stop_requested_attempt_id: existing.stop_requested_attempt_id,
         })
+    }
+
+    pub fn request_writer_stop(&mut self) -> Result<StopRequestOutcome> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot request Writer shutdown")?;
+        let active_attempt: Option<i64> = transaction
+            .query_row(
+                "SELECT id FROM writer_attempts
+                 WHERE state IN ('launching', 'running') ORDER BY id DESC LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(attempt_id) = active_attempt else {
+            transaction.commit()?;
+            return Ok(StopRequestOutcome::NoActiveWriter);
+        };
+        let existing: Option<i64> = transaction.query_row(
+            "SELECT stop_requested_attempt_id FROM project_control_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if existing == Some(attempt_id) {
+            transaction.commit()?;
+            return Ok(StopRequestOutcome::Requested { attempt_id });
+        }
+        let now = now_ms()?;
+        transaction.execute(
+            "UPDATE project_control_state SET stop_requested_attempt_id = ?1, updated_at_ms = ?2
+             WHERE singleton = 1",
+            params![attempt_id, now],
+        )?;
+        let data_json = serde_json::to_string(&serde_json::json!({ "attempt_id": attempt_id }))?;
+        insert_project_control_event(
+            &transaction,
+            now,
+            "writer.stop_requested",
+            "Operator requested graceful Writer shutdown",
+            &data_json,
+        )?;
+        transaction
+            .commit()
+            .context("Cannot commit Writer stop request")?;
+        Ok(StopRequestOutcome::Requested { attempt_id })
+    }
+
+    pub fn writer_stop_requested(&self, attempt_id: i64) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT stop_requested_attempt_id = ?1
+                 FROM project_control_state WHERE singleton = 1",
+                [attempt_id],
+                |row| row.get::<_, Option<bool>>(0),
+            )
+            .optional()
+            .map(|value| value.flatten().unwrap_or(false))
+            .context("Cannot inspect Writer stop request")
     }
 
     pub fn resume_project(
@@ -1493,6 +1564,39 @@ impl Database {
              VALUES (?1, ?2, 'talos', 'task.status_changed', ?3, ?4)",
             params![task_id, now, reason, transition_data],
         )?;
+        let stop_requested: Option<i64> = transaction.query_row(
+            "SELECT stop_requested_attempt_id FROM project_control_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if stop_requested == Some(attempt_id) {
+            transaction.execute(
+                "UPDATE project_control_state SET stop_requested_attempt_id = NULL, updated_at_ms = ?1
+                 WHERE singleton = 1 AND stop_requested_attempt_id = ?2",
+                params![now, attempt_id],
+            )?;
+            let stopped_by_request = error_code == Some("writer_stopped_by_operator");
+            let data_json = serde_json::to_string(&serde_json::json!({
+                "attempt_id": attempt_id,
+                "stop_request_honored": stopped_by_request,
+                "attempt_outcome": outcome.as_str(),
+            }))?;
+            insert_project_control_event(
+                &transaction,
+                now,
+                if stopped_by_request {
+                    "writer.stop_completed"
+                } else {
+                    "writer.stop_request_closed"
+                },
+                if stopped_by_request {
+                    "Writer stopped after the operator request"
+                } else {
+                    "Writer attempt ended before the stop request took effect"
+                },
+                &data_json,
+            )?;
+        }
         transaction
             .commit()
             .context("Cannot commit Writer attempt completion")?;
@@ -1736,6 +1840,29 @@ impl Database {
                  VALUES (?1, ?2, 'talos', 'writer_attempt.quarantined', 'Writer outcome is unknown; process and project state require operator inspection', ?3)",
                 params![task_id, now, event_data],
             )?;
+            let stop_requested: Option<i64> = transaction.query_row(
+                "SELECT stop_requested_attempt_id FROM project_control_state WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )?;
+            if stop_requested == Some(*attempt_id) {
+                transaction.execute(
+                    "UPDATE project_control_state SET stop_requested_attempt_id = NULL, updated_at_ms = ?1
+                     WHERE singleton = 1 AND stop_requested_attempt_id = ?2",
+                    params![now, attempt_id],
+                )?;
+                let stop_data = serde_json::to_string(&serde_json::json!({
+                    "attempt_id": attempt_id,
+                    "attempt_state": "unknown",
+                }))?;
+                insert_project_control_event(
+                    &transaction,
+                    now,
+                    "writer.stop_request_interrupted_by_recovery",
+                    "TALOS exited before confirming the Writer stop request",
+                    &stop_data,
+                )?;
+            }
         }
 
         transaction
@@ -2436,6 +2563,45 @@ impl Database {
         )?;
         Ok(changed == 1)
     }
+
+    pub fn current_supervisor_lease(&self) -> Result<Option<SupervisorLease>> {
+        self.connection
+            .query_row(
+                "SELECT owner_id, fencing_token, expires_at_ms
+                 FROM supervisor_lease WHERE singleton = 1",
+                [],
+                |row| {
+                    Ok(SupervisorLease {
+                        owner_id: row.get(0)?,
+                        fencing_token: row.get(1)?,
+                        expires_at_ms: row.get(2)?,
+                    })
+                },
+            )
+            .optional()
+            .context("Cannot inspect the current supervisor lease")
+    }
+
+    pub(crate) fn expire_supervisor_lease_if_matches(
+        &mut self,
+        lease: &SupervisorLease,
+        now: i64,
+    ) -> Result<bool> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot start stale supervisor lease recovery")?;
+        let changed = transaction.execute(
+            "UPDATE supervisor_lease SET expires_at_ms = 0
+             WHERE singleton = 1 AND owner_id = ?1 AND fencing_token = ?2
+               AND expires_at_ms > ?3",
+            params![lease.owner_id, lease.fencing_token, now],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot commit stale supervisor lease recovery")?;
+        Ok(changed == 1)
+    }
 }
 
 fn migrate(connection: &mut Connection) -> Result<()> {
@@ -2758,6 +2924,17 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             )
             .context("Cannot add durable project pause state")?;
         migrated_version = 7;
+    }
+    if migrated_version == 7 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE project_control_state
+                     ADD COLUMN stop_requested_attempt_id INTEGER
+                         REFERENCES writer_attempts(id) ON DELETE RESTRICT;
+                 PRAGMA user_version = 8;",
+            )
+            .context("Cannot add durable Writer stop requests")?;
+        migrated_version = 8;
     }
     if migrated_version != SCHEMA_VERSION {
         bail!("Cannot migrate database from unsupported schema version {migrated_version}");
@@ -3132,8 +3309,8 @@ mod tests {
     use rusqlite::OptionalExtension;
 
     use super::{
-        CheckExecution, CriticReviewInput, Database, ResumeProjectOutcome, TaskStatus,
-        WriterAttemptOutcome, WriterResolutionAction,
+        CheckExecution, CriticReviewInput, Database, ResumeProjectOutcome, StopRequestOutcome,
+        TaskStatus, WriterAttemptOutcome, WriterResolutionAction,
     };
     use crate::project::{DiscoveryMethod, Project};
     use crate::{checks::ProjectCheck, revision::RevisionFacts};
@@ -3245,7 +3422,7 @@ mod tests {
     fn initialization_is_idempotent_and_uses_wal() {
         let project = temp_project();
         let first = Database::open(&project).expect("initialize database");
-        assert_eq!(first.schema_version().expect("read schema version"), 7);
+        assert_eq!(first.schema_version().expect("read schema version"), 8);
         assert_eq!(
             first
                 .journal_mode()
@@ -3256,13 +3433,13 @@ mod tests {
         drop(first);
 
         let second = Database::open(&project).expect("open database again");
-        assert_eq!(second.schema_version().expect("read schema version"), 7);
+        assert_eq!(second.schema_version().expect("read schema version"), 8);
         drop(second);
         cleanup(&project);
     }
 
     #[test]
-    fn schema_v5_migrates_to_v7_with_optional_check_durations_and_control_state() {
+    fn schema_v5_migrates_to_v8_with_optional_check_durations_and_control_state() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
         database
@@ -3278,7 +3455,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema-v5 duration fields");
-        assert_eq!(migrated.schema_version().unwrap(), 7);
+        assert_eq!(migrated.schema_version().unwrap(), 8);
         let columns: (i64, i64) = migrated
             .connection
             .query_row(
@@ -3295,7 +3472,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v6_migrates_without_losing_tasks() {
+    fn schema_v6_migrates_to_v8_without_losing_tasks() {
         let project = temp_project();
         let mut database = Database::open(&project).expect("initialize current database");
         let task = database
@@ -3312,9 +3489,34 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v6");
-        assert_eq!(migrated.schema_version().unwrap(), 7);
+        assert_eq!(migrated.schema_version().unwrap(), 8);
         assert_eq!(migrated.list_tasks().unwrap()[0].id, task.id);
         assert!(!migrated.project_control_state().unwrap().queue_paused);
+        cleanup(&project);
+    }
+
+    #[test]
+    fn schema_v7_migrates_with_no_pending_stop_request() {
+        let project = temp_project();
+        let database = Database::open(&project).expect("initialize current database");
+        database
+            .connection
+            .execute_batch(
+                "ALTER TABLE project_control_state DROP COLUMN stop_requested_attempt_id;
+                 PRAGMA user_version = 7;",
+            )
+            .expect("simulate schema v7");
+        drop(database);
+
+        let migrated = Database::open(&project).expect("migrate schema v7");
+        assert_eq!(migrated.schema_version().unwrap(), 8);
+        assert_eq!(
+            migrated
+                .project_control_state()
+                .unwrap()
+                .stop_requested_attempt_id,
+            None
+        );
         cleanup(&project);
     }
 
@@ -3356,6 +3558,49 @@ mod tests {
             }
         );
         assert_eq!(reopened.project_control_events().unwrap().len(), 2);
+        cleanup(&project);
+    }
+
+    #[test]
+    fn stop_request_is_idempotent_observable_and_closed_by_attempt_finalization() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("initialize database");
+        assert_eq!(
+            database.request_writer_stop().unwrap(),
+            StopRequestOutcome::NoActiveWriter
+        );
+        let task = database.add_task("Stop a Writer", "").expect("add task");
+        let attempt = database
+            .begin_writer_attempt(task.id, &"b2".repeat(32))
+            .expect("begin Writer attempt");
+        assert_eq!(
+            database.request_writer_stop().unwrap(),
+            StopRequestOutcome::Requested {
+                attempt_id: attempt.id,
+            }
+        );
+        assert!(database.writer_stop_requested(attempt.id).unwrap());
+        assert_eq!(
+            database.request_writer_stop().unwrap(),
+            StopRequestOutcome::Requested {
+                attempt_id: attempt.id,
+            }
+        );
+        database
+            .finish_writer_attempt(
+                attempt.id,
+                WriterAttemptOutcome::Interrupted,
+                None,
+                None,
+                None,
+                Some("writer_stopped_by_operator"),
+            )
+            .expect("finalize stopped Writer attempt");
+        assert!(!database.writer_stop_requested(attempt.id).unwrap());
+        let events = database.project_control_events().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event_type, "writer.stop_requested");
+        assert_eq!(events[1].event_type, "writer.stop_completed");
         cleanup(&project);
     }
 
@@ -3613,7 +3858,7 @@ mod tests {
         drop(database);
 
         let mut migrated = Database::open(&project).expect("migrate the v4 approval");
-        assert_eq!(migrated.schema_version().unwrap(), 7);
+        assert_eq!(migrated.schema_version().unwrap(), 8);
         assert_eq!(
             migrated.list_tasks().unwrap()[0].status,
             TaskStatus::Reviewing
@@ -3755,7 +4000,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_migrates_to_v7_without_losing_tasks() {
+    fn schema_v1_migrates_to_v8_without_losing_tasks() {
         let project = temp_project();
         project
             .ensure_runtime_dir()
@@ -3797,7 +4042,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate existing database");
-        assert_eq!(database.schema_version().expect("read schema version"), 7);
+        assert_eq!(database.schema_version().expect("read schema version"), 8);
         let tasks = database.list_tasks().expect("read preserved tasks");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Existing v1 task");
@@ -4093,7 +4338,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate v2 database");
-        assert_eq!(database.schema_version().expect("read schema version"), 7);
+        assert_eq!(database.schema_version().expect("read schema version"), 8);
         assert!(
             database
                 .has_unresolved_writer_attempts()

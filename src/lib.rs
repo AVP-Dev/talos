@@ -5,6 +5,7 @@ pub mod cli;
 pub mod config;
 pub mod db;
 pub mod policy;
+pub mod process_group;
 pub mod project;
 pub mod review;
 pub mod revision;

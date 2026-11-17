@@ -6,14 +6,14 @@ use tokio::{
     io::{AsyncRead, AsyncReadExt, AsyncWriteExt},
     process::{Child, Command},
     task::JoinHandle,
-    time::{self, Instant},
+    time,
 };
+
+use crate::process_group::ProcessGroupGuard;
 
 const MAX_CAPTURE_BYTES: usize = 2 * 1024 * 1024;
 const MAX_EVENT_LINE_BYTES: usize = 64 * 1024;
 const STREAM_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
-#[cfg(unix)]
-const TERMINATION_GRACE: Duration = Duration::from_millis(750);
 
 #[derive(Clone, Debug)]
 pub struct AgyRunConfig {
@@ -31,6 +31,7 @@ pub enum TerminationReason {
     TimedOut,
     InterruptedByCtrlC,
     InterruptedByTerminateSignal,
+    StoppedByOperator,
 }
 
 #[derive(Clone, Debug)]
@@ -90,6 +91,7 @@ enum WaitOutcome {
     TimedOut,
     InterruptedByCtrlC,
     InterruptedByTerminateSignal,
+    StoppedByOperator,
 }
 
 /// Run one bounded Antigravity turn without putting its prompt in the process argv.
@@ -101,7 +103,19 @@ pub async fn run<F>(config: AgyRunConfig, mut on_event: F) -> Result<AgyRunResul
 where
     F: FnMut(AgyProcessEvent) -> Result<()>,
 {
-    run_with_mode(config, "accept-edits", &mut on_event).await
+    run_with_mode(config, "accept-edits", &mut on_event, None).await
+}
+
+/// Run a Writer turn that can receive an explicit stop request from the project control state.
+pub async fn run_with_stop_request<F>(
+    config: AgyRunConfig,
+    mut on_event: F,
+    stop_request: tokio::sync::watch::Receiver<bool>,
+) -> Result<AgyRunResult>
+where
+    F: FnMut(AgyProcessEvent) -> Result<()>,
+{
+    run_with_mode(config, "accept-edits", &mut on_event, Some(stop_request)).await
 }
 
 /// Run an independent Antigravity turn in plan mode. The caller must also supply a session
@@ -110,13 +124,14 @@ pub async fn run_read_only<F>(config: AgyRunConfig, mut on_event: F) -> Result<A
 where
     F: FnMut(AgyProcessEvent) -> Result<()>,
 {
-    run_with_mode(config, "plan", &mut on_event).await
+    run_with_mode(config, "plan", &mut on_event, None).await
 }
 
 async fn run_with_mode<F>(
     config: AgyRunConfig,
     mode: &'static str,
     mut on_event: F,
+    mut stop_request: Option<tokio::sync::watch::Receiver<bool>>,
 ) -> Result<AgyRunResult>
 where
     F: FnMut(AgyProcessEvent) -> Result<()>,
@@ -171,7 +186,7 @@ where
         .context("Antigravity did not report a process ID")?;
     let mut process_group_guard = ProcessGroupGuard::new(process_id)?;
     if let Err(error) = on_event(AgyProcessEvent::Started(process_id)) {
-        stop_process_group(&mut child, process_id)
+        stop_process_group(&mut child, &mut process_group_guard)
             .await
             .context("Cannot stop Antigravity after recording its PID failed")?;
         return Err(error).context("Cannot persist Antigravity process identity");
@@ -200,24 +215,49 @@ where
     let input_task = if let Some(expected_id) = config.conversation_id.as_deref() {
         let handshake = tokio::select! {
             status = child.wait() => {
-                let _ = status.context("Cannot wait for Antigravity before continuation handshake")?;
+                match status {
+                    Ok(_) => process_group_guard.disarm(),
+                    Err(error) => return Err(error).context("Cannot wait for Antigravity before continuation handshake"),
+                }
                 bail!("Antigravity exited before confirming the requested conversation ID; the attempt remains unresolved")
             },
             event = conversation_rx.recv() => event,
             _ = &mut deadline => {
-                let _ = stop_process_group(&mut child, process_id).await
+                let _ = stop_process_group(&mut child, &mut process_group_guard).await
                     .context("Cannot stop Antigravity after continuation handshake timeout")?;
                 bail!("Antigravity did not confirm the requested conversation ID before timeout; the attempt remains unresolved")
             },
             _ = &mut ctrl_c => {
-                let _ = stop_process_group(&mut child, process_id).await
+                let _ = stop_process_group(&mut child, &mut process_group_guard).await
                     .context("Cannot stop Antigravity after continuation cancellation")?;
                 bail!("Antigravity continuation was interrupted before the conversation ID was confirmed; the attempt remains unresolved")
             },
             _ = wait_for_terminate_signal(&mut terminate_signal) => {
-                let _ = stop_process_group(&mut child, process_id).await
+                let _ = stop_process_group(&mut child, &mut process_group_guard).await
                     .context("Cannot stop Antigravity after termination signal")?;
                 bail!("Antigravity continuation was terminated before the conversation ID was confirmed; the attempt remains unresolved")
+            },
+            _ = wait_for_stop_request(&mut stop_request) => {
+                let status = stop_process_group(&mut child, &mut process_group_guard)
+                    .await
+                    .context("Cannot stop Antigravity after an operator stop request")?;
+                drop(stdin);
+                let stdout = finish_capture(stdout_task).await?;
+                let stderr = finish_capture(stderr_task).await?;
+                let stream = parse_output_stream(&stdout.bytes);
+                return Ok(AgyRunResult {
+                    process_id,
+                    exit_code: status.code(),
+                    termination: TerminationReason::StoppedByOperator,
+                    conversation_id: stream.conversation_id,
+                    agent_status: stream.status,
+                    response: stream.response,
+                    agent_error: stream.error,
+                    stderr_excerpt: excerpt(&stderr.bytes),
+                    stdout_truncated: stdout.truncated,
+                    stderr_truncated: stderr.truncated,
+                    input_error: None,
+                });
             },
         };
         let Some(Some(reported_id)) = handshake else {
@@ -226,7 +266,7 @@ where
             );
         };
         if reported_id != expected_id {
-            let _ = stop_process_group(&mut child, process_id)
+            let _ = stop_process_group(&mut child, &mut process_group_guard)
                 .await
                 .context("Cannot stop Antigravity after a continuation session mismatch")?;
             bail!(
@@ -243,7 +283,12 @@ where
 
     let outcome = loop {
         let completed = tokio::select! {
-            status = child.wait() => Some(WaitOutcome::Exited(status)),
+            status = child.wait() => {
+                if status.is_ok() {
+                    process_group_guard.disarm();
+                }
+                Some(WaitOutcome::Exited(status))
+            },
             event = conversation_rx.recv(), if !session_recorded => {
                 match event {
                     Some(Some(conversation_id)) => {
@@ -261,6 +306,7 @@ where
             _ = &mut deadline => Some(WaitOutcome::TimedOut),
             _ = &mut ctrl_c => Some(WaitOutcome::InterruptedByCtrlC),
             _ = wait_for_terminate_signal(&mut terminate_signal) => Some(WaitOutcome::InterruptedByTerminateSignal),
+            _ = wait_for_stop_request(&mut stop_request) => Some(WaitOutcome::StoppedByOperator),
         };
         if let Some(completed) = completed {
             break completed;
@@ -273,22 +319,28 @@ where
             TerminationReason::Exited,
         ),
         WaitOutcome::TimedOut => (
-            stop_process_group(&mut child, process_id)
+            stop_process_group(&mut child, &mut process_group_guard)
                 .await
                 .context("Cannot stop timed-out Antigravity process")?,
             TerminationReason::TimedOut,
         ),
         WaitOutcome::InterruptedByCtrlC => (
-            stop_process_group(&mut child, process_id)
+            stop_process_group(&mut child, &mut process_group_guard)
                 .await
                 .context("Cannot stop interrupted Antigravity process")?,
             TerminationReason::InterruptedByCtrlC,
         ),
         WaitOutcome::InterruptedByTerminateSignal => (
-            stop_process_group(&mut child, process_id)
+            stop_process_group(&mut child, &mut process_group_guard)
                 .await
                 .context("Cannot stop Antigravity after termination signal")?,
             TerminationReason::InterruptedByTerminateSignal,
+        ),
+        WaitOutcome::StoppedByOperator => (
+            stop_process_group(&mut child, &mut process_group_guard)
+                .await
+                .context("Cannot stop Antigravity after an operator stop request")?,
+            TerminationReason::StoppedByOperator,
         ),
     };
 
@@ -299,7 +351,6 @@ where
     let stdout = finish_capture(stdout_task).await?;
     let stderr = finish_capture(stderr_task).await?;
     let stream = parse_output_stream(&stdout.bytes);
-    cleanup_remaining_process_group(process_id).await?;
     process_group_guard.disarm();
 
     Ok(AgyRunResult {
@@ -504,109 +555,27 @@ async fn wait_for_terminate_signal(_signal: &mut Option<()>) {
     std::future::pending::<()>().await;
 }
 
-#[cfg(unix)]
-async fn stop_process_group(child: &mut Child, process_id: u32) -> io::Result<ExitStatus> {
-    let group_id = i32::try_from(process_id)
-        .map_err(|_| io::Error::other("Antigravity process ID is out of range"))?;
-    let grace_deadline = Instant::now() + TERMINATION_GRACE;
-    signal_process_group(group_id, libc::SIGTERM);
-
-    let status = match time::timeout(TERMINATION_GRACE, child.wait()).await {
-        Ok(status) => status?,
-        Err(_) => {
-            signal_process_group(group_id, libc::SIGKILL);
-            return child.wait().await;
-        }
+async fn wait_for_stop_request(stop_request: &mut Option<tokio::sync::watch::Receiver<bool>>) {
+    let Some(stop_request) = stop_request else {
+        std::future::pending::<()>().await;
+        return;
     };
-
-    time::sleep_until(grace_deadline).await;
-    signal_process_group(group_id, libc::SIGKILL);
-    Ok(status)
-}
-
-#[cfg(unix)]
-fn signal_process_group(group_id: i32, signal: i32) {
-    let result = unsafe { libc::kill(-group_id, signal) };
-    if result != 0 {
-        let error = io::Error::last_os_error();
-        if error.raw_os_error() != Some(libc::ESRCH) {
-            tracing::warn!(%error, group_id, signal, "Could not signal Antigravity process group");
+    loop {
+        if *stop_request.borrow() {
+            return;
+        }
+        if stop_request.changed().await.is_err() {
+            std::future::pending::<()>().await;
+            return;
         }
     }
 }
 
-#[cfg(unix)]
-async fn cleanup_remaining_process_group(process_id: u32) -> Result<()> {
-    let group_id = i32::try_from(process_id)
-        .context("Antigravity process ID is out of range for its Unix process group")?;
-    if !process_group_exists(group_id) {
-        return Ok(());
-    }
-
-    signal_process_group(group_id, libc::SIGTERM);
-    time::sleep(TERMINATION_GRACE).await;
-    signal_process_group(group_id, libc::SIGKILL);
-    Ok(())
-}
-
-#[cfg(unix)]
-fn process_group_exists(group_id: i32) -> bool {
-    let result = unsafe { libc::kill(-group_id, 0) };
-    result == 0 || io::Error::last_os_error().raw_os_error() != Some(libc::ESRCH)
-}
-
-#[cfg(not(unix))]
-async fn cleanup_remaining_process_group(_process_id: u32) -> Result<()> {
-    Ok(())
-}
-
-#[cfg(unix)]
-struct ProcessGroupGuard {
-    group_id: i32,
-    armed: bool,
-}
-
-#[cfg(unix)]
-impl ProcessGroupGuard {
-    fn new(process_id: u32) -> Result<Self> {
-        let group_id = i32::try_from(process_id)
-            .context("Antigravity process ID is out of range for its Unix process group")?;
-        Ok(Self {
-            group_id,
-            armed: true,
-        })
-    }
-
-    fn disarm(&mut self) {
-        self.armed = false;
-    }
-}
-
-#[cfg(unix)]
-impl Drop for ProcessGroupGuard {
-    fn drop(&mut self) {
-        if self.armed {
-            signal_process_group(self.group_id, libc::SIGKILL);
-        }
-    }
-}
-
-#[cfg(not(unix))]
-struct ProcessGroupGuard;
-
-#[cfg(not(unix))]
-impl ProcessGroupGuard {
-    fn new(_process_id: u32) -> Result<Self> {
-        Ok(Self)
-    }
-
-    fn disarm(&mut self) {}
-}
-
-#[cfg(not(unix))]
-async fn stop_process_group(child: &mut Child, _process_id: u32) -> io::Result<ExitStatus> {
-    child.kill().await?;
-    child.wait().await
+async fn stop_process_group(
+    child: &mut Child,
+    process_group: &mut ProcessGroupGuard,
+) -> io::Result<ExitStatus> {
+    process_group.terminate_and_wait(child).await
 }
 
 #[cfg(test)]
@@ -620,7 +589,7 @@ mod tests {
         time::{Duration, Instant},
     };
 
-    use super::{AgyRunConfig, TerminationReason, parse_output_stream, run};
+    use super::{AgyRunConfig, TerminationReason, parse_output_stream, run, run_with_stop_request};
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -814,7 +783,58 @@ mod tests {
 
     #[cfg(unix)]
     #[tokio::test]
-    async fn successful_exit_cleans_up_a_detached_descendant_in_the_process_group() {
+    async fn operator_stop_request_terminates_and_reaps_the_writer_group() {
+        let root = test_dir();
+        let settings_file = root.join("settings.json");
+        let executable = root.join("fake-agy");
+        let ready_file = root.join("writer-started");
+        fs::write(&settings_file, "{}\n").expect("write temporary settings");
+        fs::write(
+            &executable,
+            format!(
+                "#!/bin/sh\nprintf started > '{}'\nexec sleep 30\n",
+                ready_file.display()
+            ),
+        )
+        .expect("write fake CLI");
+        fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
+            .expect("make fake CLI executable");
+        let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
+        let run_root = root.clone();
+        let run = tokio::spawn(async move {
+            run_with_stop_request(
+                AgyRunConfig {
+                    executable,
+                    project_root: run_root,
+                    settings_file,
+                    prompt: "Stop after launch".to_owned(),
+                    conversation_id: None,
+                    timeout: Duration::from_secs(10),
+                },
+                |_| Ok(()),
+                stop_receiver,
+            )
+            .await
+        });
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !ready_file.exists() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(ready_file.exists(), "fake Writer did not start");
+        stop_sender.send(true).expect("send stop request");
+        let result = tokio::time::timeout(Duration::from_secs(5), run)
+            .await
+            .expect("stop request should finish within the bounded cleanup interval")
+            .expect("Writer task should not panic")
+            .expect("Writer stop should be reported as an execution result");
+        assert_eq!(result.termination, TerminationReason::StoppedByOperator);
+        fs::remove_dir_all(root).expect("remove temporary test directory");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn normal_exit_does_not_signal_a_group_after_reaping_its_leader() {
         let root = test_dir();
         let settings_file = root.join("settings.json");
         let executable = root.join("fake-agy");
@@ -846,8 +866,11 @@ mod tests {
         .expect("run fake Antigravity CLI");
         assert_eq!(result.termination, TerminationReason::Exited);
         assert_eq!(result.agent_status.as_deref(), Some("SUCCESS"));
-        tokio::time::sleep(Duration::from_millis(1300)).await;
-        assert!(!descendant_marker.exists());
+        tokio::time::sleep(Duration::from_millis(2300)).await;
+        assert!(
+            descendant_marker.exists(),
+            "TALOS must fail closed after reaping the group leader instead of signalling a possibly reused PGID"
+        );
 
         fs::remove_dir_all(root).expect("remove temporary test directory");
     }

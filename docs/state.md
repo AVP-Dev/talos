@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R6 — Runtime and resumption is in progress.** T6.1 and T6.2 are complete. R6.2 adds durable pause/resume, Git-snapshot reconciliation, and an append-only control journal. Next is **T6.3 — stop/cancellation and crash recovery**. R5 and R6.2 pass the local macOS profile. Linux-native build/runtime/sandbox acceptance remains deferred until the user provides server access under T6.5/T9.3. Backlog count: 40 of 61 scheduled tasks done (65.6% by task count, unweighted); two unscheduled ideas are recorded separately.
+**R6 — Runtime and resumption is in progress.** T6.1 and T6.2 are complete. T6.3 implementation adds cooperative stop/cancellation, process-group cleanup for project checks, and early stale-lease reclaim when the recorded supervisor PID is absent. T6.3 behavior tests and full-profile verification remain pending. R5 and R6.2 pass the local macOS profile. Linux-native build/runtime/sandbox acceptance remains deferred until the user provides server access under T6.5/T9.3. Backlog count: 40 of 61 scheduled tasks done (65.6% by task count, unweighted); two unscheduled ideas are recorded separately.
 
 ## Goal and fixed direction
 
@@ -232,9 +232,19 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - macOS `xcrun` emitted non-fatal cache-file permission warnings; required checks exited successfully. No Linux host was contacted and no Linux-native check was run.
 - T6.2 is committed locally as `6370893` (`feat: add durable project pause and reconciliation`) on `master`. Continue with T6.3.
 
+## R6.3 progress — 2026-11-18
+
+- Added schema v8 durable `stop_requested_attempt_id` state and append-only events for request, completion, closure, and recovery interruption.
+- Added `talos stop`. It records a request for the active Writer and waits up to 10 seconds for an observed terminal attempt. The Writer supervisor polls the local SQLite control row every 100 ms and terminates its group when requested. A timeout is reported as unconfirmed; operator inspection and `task recover` remain necessary after TALOS loss.
+- Added shared process-group cleanup for Writer runs and project checks. It sends SIGTERM, waits 750 ms, sends SIGKILL, and reaps the leader. The armed guard sends SIGKILL if cleanup is cancelled. After `Child::wait` succeeds, TALOS disarms and never signals the old numeric PGID. This prevents PGID reuse signals but means descendants left after a normal CLI exit are not cleaned up.
+- Added best-effort early supervisor-lease reclaim: only a parseable `talos-task-*` owner PID that returns ESRCH can be treated as gone; an alive, reused, inaccessible, or unknown PID fails closed. Recovery advances the fencing token and still quarantines unfinished attempts as `unknown`.
+- Updated README, plan, backlog, architecture, and ADR-027 with command behavior, failure boundaries, and the normal-exit descendant limitation.
+- `cargo fmt --all` and `cargo check --all-targets --all-features` passed on macOS. The newly added behavior tests and full verification profile have not been run in this batch; mark T6.3 in progress until those acceptance checks are completed. No Linux host was contacted.
+- Working tree changes are not committed yet. The repository remains local on `master`, with no remote. Linux-native checks remain deferred until the user provides server access.
+
 ## Next action
 
-R5 is implemented, locally verified, and committed as `1e76675` on `master`. T6.1 is committed locally as `7671f12`; T6.2 is committed locally as `6370893`. Continue with **T6.3 — stop/cancellation and crash recovery**. Keep all work local; the user will create the hosted repository later. Linux implementation can proceed in its planned round, but server connection and Linux-native verification are deferred until access is provided.
+Continue R6 in order. T6.3 is implemented but still in progress pending its behavior and full-profile checks. Then take T6.4 (SSH reconnect), T6.5 (Linux process identity and server acceptance), and T6.6 (interactive handoff). Do not connect to a Linux host or run Linux-native checks until the user provides access. Keep all work local; the user will create the hosted repository later.
 
 ## Session close checklist
 

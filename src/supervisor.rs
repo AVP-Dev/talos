@@ -3,6 +3,10 @@ use std::{
     fs::{self, OpenOptions},
     io::Write,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
     time::Duration,
 };
 
@@ -25,6 +29,63 @@ use crate::{
 pub const VERIFIED_AGY_WRITE_VERSION: &str = "1.5.10";
 pub const VERIFIED_AGY_CRITIC_VERSION: &str = "1.5.10";
 const MAX_CRITIC_RESPONSE_BYTES: usize = 64 * 1024;
+const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+struct StopRequestWatcher {
+    receiver: tokio::sync::watch::Receiver<bool>,
+    shutdown: Arc<AtomicBool>,
+    task: Option<tokio::task::JoinHandle<()>>,
+}
+
+impl StopRequestWatcher {
+    fn start(project: Project, attempt_id: i64) -> Self {
+        let (sender, receiver) = tokio::sync::watch::channel(false);
+        let shutdown = Arc::new(AtomicBool::new(false));
+        let poll_shutdown = Arc::clone(&shutdown);
+        let task = tokio::task::spawn_blocking(move || {
+            let database = match Database::open(&project) {
+                Ok(database) => database,
+                Err(error) => {
+                    tracing::warn!(%error, attempt_id, "Could not open stop-request observer");
+                    return;
+                }
+            };
+            while !poll_shutdown.load(Ordering::Acquire) {
+                match database.writer_stop_requested(attempt_id) {
+                    Ok(true) => {
+                        let _ = sender.send(true);
+                        return;
+                    }
+                    Ok(false) => {}
+                    Err(error) => {
+                        tracing::warn!(%error, attempt_id, "Could not inspect Writer stop request");
+                    }
+                }
+                std::thread::sleep(STOP_POLL_INTERVAL);
+            }
+        });
+        Self {
+            receiver,
+            shutdown,
+            task: Some(task),
+        }
+    }
+
+    async fn finish(mut self) -> Result<()> {
+        self.shutdown.store(true, Ordering::Release);
+        self.task
+            .take()
+            .context("Writer stop-request observer is missing")?
+            .await
+            .context("Writer stop-request observer task failed")
+    }
+}
+
+impl Drop for StopRequestWatcher {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+    }
+}
 
 /// Conservatively check whether the process group TALOS created for this Writer still exists.
 /// This reports liveness only; it does not identify a process or establish a Writer outcome.
@@ -342,7 +403,8 @@ async fn run_writer_attempt_inner(
         }
     };
 
-    let execution = crate::adapter::agy_process::run(
+    let stop_watcher = StopRequestWatcher::start(project.clone(), attempt.id);
+    let execution = crate::adapter::agy_process::run_with_stop_request(
         AgyRunConfig {
             executable,
             project_root: project.root.clone(),
@@ -361,8 +423,10 @@ async fn run_writer_attempt_inner(
                 database.record_writer_conversation_id(attempt.id, &conversation_id)
             }
         },
+        stop_watcher.receiver.clone(),
     )
     .await;
+    stop_watcher.finish().await?;
 
     let execution = match execution {
         Ok(execution) => execution,
@@ -416,6 +480,10 @@ fn classify_execution(result: &AgyRunResult) -> (WriterAttemptOutcome, Option<&'
                 Some("writer_interrupted"),
             )
         }
+        TerminationReason::StoppedByOperator => (
+            WriterAttemptOutcome::Interrupted,
+            Some("writer_stopped_by_operator"),
+        ),
         TerminationReason::Exited
             if result.exit_code == Some(0)
                 && result.agent_status.as_deref() == Some("SUCCESS")

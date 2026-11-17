@@ -14,6 +14,7 @@ use tokio::{
     time,
 };
 
+use crate::process_group::ProcessGroupGuard;
 use crate::secrets::{contains_sensitive, redact_sensitive};
 
 const MAX_CHECKS: usize = 32;
@@ -293,6 +294,11 @@ async fn run_process(argv: &[String], cwd: &Path, timeout: Duration) -> Result<P
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    #[cfg(unix)]
+    command.process_group(0);
+    let mut terminate_signal = create_terminate_signal()?;
+    let ctrl_c = tokio::signal::ctrl_c();
+    tokio::pin!(ctrl_c);
     let mut child = match command.spawn() {
         Ok(child) => child,
         Err(_) => {
@@ -305,6 +311,10 @@ async fn run_process(argv: &[String], cwd: &Path, timeout: Duration) -> Result<P
             });
         }
     };
+    let process_id = child
+        .id()
+        .context("Verification command did not report a process ID")?;
+    let mut process_group_guard = ProcessGroupGuard::new(process_id)?;
     let stdout = child
         .stdout
         .take()
@@ -315,13 +325,35 @@ async fn run_process(argv: &[String], cwd: &Path, timeout: Duration) -> Result<P
         .context("Cannot capture verification command stderr")?;
     let stdout_task = tokio::spawn(capture_stream(stdout));
     let stderr_task = tokio::spawn(capture_stream(stderr));
-    let (exit_code, timed_out, failure_code) = match time::timeout(timeout, child.wait()).await {
-        Ok(Ok(status)) => (status.code(), false, None),
-        Ok(Err(_)) => (None, false, Some("process_wait_failed".to_owned())),
-        Err(_) => {
-            let _ = child.kill().await;
-            let _ = child.wait().await;
-            (None, true, Some("timeout".to_owned()))
+    let deadline = time::sleep(timeout);
+    tokio::pin!(deadline);
+    let (exit_code, timed_out, failure_code) = tokio::select! {
+        status = child.wait() => {
+            match status {
+                Ok(status) => {
+                    process_group_guard.disarm();
+                    (status.code(), false, None)
+                }
+                Err(_) => (None, false, Some("process_wait_failed".to_owned())),
+            }
+        }
+        _ = &mut deadline => {
+            match process_group_guard.terminate_and_wait(&mut child).await {
+                Ok(_) => (None, true, Some("timeout".to_owned())),
+                Err(_) => (None, true, Some("process_stop_failed".to_owned())),
+            }
+        }
+        _ = &mut ctrl_c => {
+            match process_group_guard.terminate_and_wait(&mut child).await {
+                Ok(_) => (None, false, Some("interrupted".to_owned())),
+                Err(_) => (None, false, Some("process_stop_failed".to_owned())),
+            }
+        }
+        _ = wait_for_terminate_signal(&mut terminate_signal) => {
+            match process_group_guard.terminate_and_wait(&mut child).await {
+                Ok(_) => (None, false, Some("interrupted".to_owned())),
+                Err(_) => (None, false, Some("process_stop_failed".to_owned())),
+            }
         }
     };
     let stdout = finish_capture(stdout_task).await?;
@@ -333,6 +365,34 @@ async fn run_process(argv: &[String], cwd: &Path, timeout: Duration) -> Result<P
         stdout,
         stderr,
     })
+}
+
+#[cfg(unix)]
+fn create_terminate_signal() -> Result<Option<tokio::signal::unix::Signal>> {
+    use tokio::signal::unix::{SignalKind, signal};
+
+    signal(SignalKind::terminate())
+        .context("Cannot subscribe to the termination signal")
+        .map(Some)
+}
+
+#[cfg(not(unix))]
+fn create_terminate_signal() -> Result<Option<()>> {
+    Ok(None)
+}
+
+#[cfg(unix)]
+async fn wait_for_terminate_signal(signal: &mut Option<tokio::signal::unix::Signal>) {
+    if let Some(signal) = signal {
+        let _ = signal.recv().await;
+    } else {
+        std::future::pending::<()>().await;
+    }
+}
+
+#[cfg(not(unix))]
+async fn wait_for_terminate_signal(_signal: &mut Option<()>) {
+    std::future::pending::<()>().await;
 }
 
 async fn capture_stream<R>(mut reader: R) -> std::io::Result<CapturedStream>
@@ -453,5 +513,34 @@ mod tests {
         assert!(result.duration_ms.is_some());
         assert_eq!(result.stdout_sha256.len(), 64);
         assert_eq!(result.stderr_sha256.len(), 64);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn timed_out_check_terminates_its_process_group_before_reaping_the_leader() {
+        use std::{fs, time::Duration};
+
+        let root =
+            std::env::temp_dir().join(format!("talos-check-group-test-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("create temporary check root");
+        let marker = root.join("descendant-marker");
+        let command = format!(
+            "(sleep 2; printf alive > '{}') </dev/null >/dev/null 2>&1 & exec sleep 30",
+            marker.display()
+        );
+        let result = super::run_process(
+            &["/bin/sh".to_owned(), "-c".to_owned(), command],
+            &root,
+            Duration::from_millis(100),
+        )
+        .await
+        .expect("terminate the timed-out check process group");
+        assert!(result.timed_out);
+        tokio::time::sleep(Duration::from_millis(2300)).await;
+        assert!(
+            !marker.exists(),
+            "timed-out process-group descendants must stop"
+        );
+        fs::remove_dir_all(root).expect("remove temporary check root");
     }
 }
