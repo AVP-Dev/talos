@@ -58,7 +58,7 @@ talos task continue <ID> --confirm-project-inspected  # implemented for one elig
 talos task recover          # implemented: quarantine ambiguous attempts as unknown
 talos task resolve <ATTEMPT_ID> ...  # implemented: audited operator decision
 talos status                # session, worker, queue, and capability status
-talos logs [TASK_ID]        # event history and output
+talos logs [TASK_ID]        # task event history
 talos attach                # planned for R6: return to the tmux session
 talos pause | resume        # planned for R6: stop assigning work / continue
 talos doctor                # diagnose CLI, tmux, Git, and database setup

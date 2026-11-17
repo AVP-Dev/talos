@@ -2,7 +2,7 @@
 
 This is the single project backlog. Task IDs remain stable across rounds. Mark work `done` only with an observed result; record user decisions separately.
 
-Statuses: `done` — completed and verified; `in progress` — actively being worked; `ready` — may be started; `planned` — scheduled; `blocked` — stopped by a specific external condition; `deferred` — intentionally moved to a later round.
+Statuses: `done` — completed and verified; `in progress` — actively being worked; `ready` — may be started; `planned` — scheduled; `blocked` — stopped by a specific external condition; `deferred` — intentionally moved to a later round; `idea` — recorded for possible work after the current roadmap, with no round assigned.
 
 ## R0 — Bootstrap and research
 
@@ -138,3 +138,9 @@ Dependency: R6–R8.
 ## Required end-to-end scenarios from the original request
 
 First launch/repeat `up`; Writer/Critic success and justified rejection; child task; independent parallel work; adding a task while work is running; manual takeover; CLI recovery; orchestrator crash; SSH disconnect/reconnect; Linux reboot autostart; PR without merge; duplicate-execution prevention; and rechecking original acceptance criteria before closeout. Keep separate evidence for each scenario; do not combine them into a misleading test.
+
+## Unscheduled ideas — revisit after R9
+
+| ID | Status | Idea | Note |
+|---|---|---|---|
+| F1 | idea | Add a local project-origin and history journal for Git and non-Git projects | Revisit after the current roadmap. Explore project registration/creation milestones, plan and decision history, and references to files or reports produced during work. Keep structured metadata local in SQLite; evaluate path, digest, size, and provenance references for larger files. Define privacy, retention, backup, and export before implementation. This is not a request for TALOS to generate or copy entire projects. Research: `docs/research/project-history-idea.md`. |

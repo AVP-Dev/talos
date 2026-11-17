@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R3 — One autonomous Writer is complete for the verified macOS target.** T3.1–T3.7 are done. `task run`, safe terminal-error `task continue`, fail-closed `task recover`, audited `task resolve`, and one-shot `up --auto` are implemented. `up --auto` handles at most one queued task from a clean Git worktree. Writer success always remains `reviewing`; there is no Critic, project-check runner, or task completion gate yet. `up --semi` remains deferred to R5. Backlog count: 25 of 61 tasks done (41.0% by task count, unweighted). Stop here at the round boundary; next planned task is T4.1.
+**R3 — One autonomous Writer is complete for the verified macOS target.** T3.1–T3.7 are done. `task run`, safe terminal-error `task continue`, fail-closed `task recover`, audited `task resolve`, and one-shot `up --auto` are implemented. `up --auto` handles at most one queued task from a clean Git worktree. Writer success always remains `reviewing`; there is no Critic, project-check runner, or task completion gate yet. `up --semi` remains deferred to R5. Backlog count: 25 of 61 scheduled tasks done (41.0% by task count, unweighted); one unscheduled idea is recorded separately. The next planned task is T4.1.
 
 ## Goal and fixed direction
 
@@ -150,7 +150,9 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 
 ## Repository and runtime condition
 
-- A local Git repository is initialized on the `master` branch. The project remains local; no remote is configured, and no push or publication is planned until the user creates a hosted repository.
+- A local Git repository is initialized on the `master` branch. Initial snapshot commit: `76fa40d` (`chore: initialize local project history`). The project remains local; no remote is configured, and no push or publication is planned until the user creates a hosted repository.
+- The staged snapshot contained 38 project files; `.gitignore` excluded `.DS_Store` and `target/`. `git diff --cached --check` passed. One redundant blank line at the end of `Cargo.toml` was removed before the initial commit. No Rust tests or builds were run for this repository/documentation setup batch.
+- Product history follow-up is recorded as unscheduled idea F1, to revisit after R9. The current database stores task metadata and lifecycle events plus Writer-attempt metadata; it does not persist a separate project plan, project-creation history, or full Writer transcript.
 - No `.talos/` runtime state was created in the TALOS workspace. Smoke databases are isolated under `/private/tmp`.
 - TALOS-driven Antigravity runs happened only in disposable projects. No external AI CLI has written to the TALOS source tree. There is no background worker or tmux session; `up --auto` is one-shot and `up --semi` is not implemented.
 - The original Agent Starter Kit and pair-mailbox repositories remain untouched.
