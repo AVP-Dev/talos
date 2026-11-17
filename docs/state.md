@@ -151,7 +151,7 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 
 ## Repository and runtime condition
 
-- A local Git repository is initialized on the `master` branch. Initial snapshot commit: `76fa40d` (`chore: initialize local project history`). The project remains local; no remote is configured, and no push or publication is planned until the user creates a hosted repository.
+- A local Git repository is initialized on the `master` branch. Initial snapshot commit: `76fa40d` (`chore: initialize local project history`). Latest completed round: `1e76675` (`feat: add evidence-gated project verification`). The project remains local; no remote is configured, and no push or publication is planned until the user creates a hosted repository.
 - The staged snapshot contained 38 project files; `.gitignore` excluded `.DS_Store` and `target/`. `git diff --cached --check` passed. One redundant blank line at the end of `Cargo.toml` was removed before the initial commit. No Rust tests or builds were run for this repository/documentation setup batch.
 - Product history follow-up is recorded as unscheduled idea F1, to revisit after R9. The current database stores task metadata and lifecycle events plus Writer-attempt metadata; it does not persist a separate project plan, project-creation history, or full Writer transcript.
 - Earlier smoke databases were isolated under `/private/tmp`; the R4 runtime database in this workspace is now documented below.
@@ -213,7 +213,7 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 
 ## Next action
 
-R5 has been implemented and locally verified. Commit the reviewed R5 source and documentation locally on `master`, then continue with T6.1. Keep all work local; the user will create the hosted repository later. Linux-native implementation can proceed in its planned round, but server connection and Linux-native verification are deferred until access is provided.
+R5 is implemented, locally verified, and committed as `1e76675` on `master`. Continue with **T6.1 — create and reconnect the tmux control session**. Keep all work local; the user will create the hosted repository later. Linux-native implementation can proceed in its planned round, but server connection and Linux-native verification are deferred until access is provided.
 
 ## Session close checklist
 
