@@ -1,0 +1,22 @@
+[package]
+name = "talos"
+version = "0.1.0"
+edition = "2024"
+description = "A local CLI-first multi-agent development orchestrator"
+
+[dependencies]
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+libc = "0.2"
+rusqlite = { version = "0.41", features = ["bundled"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+sha2 = "0.11"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+tokio = { version = "1.54", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

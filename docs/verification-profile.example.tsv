@@ -1,0 +1,7 @@
+# name	layer	required	command
+# Rust profile example; copy only after the crate and every listed command exist.
+# fmt	static	1	cargo fmt --all -- --check
+# clippy	static	1	cargo clippy --all-targets --all-features -- -D warnings
+# test	positive	1	cargo test --all-targets
+# build	build	1	cargo build --release
+# security-secrets	security	1	./scripts/security-scan.sh
