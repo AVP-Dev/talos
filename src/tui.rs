@@ -23,6 +23,7 @@ use ratatui::{
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap},
 };
+use std::os::unix::fs::OpenOptionsExt;
 
 use crate::{
     adapter::AdapterId as AdapterKind,
@@ -135,6 +136,10 @@ pub struct TuiApp {
 impl TuiApp {
     pub fn new(project: Project) -> Result<Self> {
         let available = available_adapters(&project);
+        Self::with_adapters(project, available)
+    }
+
+    fn with_adapters(project: Project, available: Vec<AdapterKind>) -> Result<Self> {
         let mut config = ProjectConfig::load(&project)?;
         if matches!(project.discovery, DiscoveryMethod::Git)
             && !crate::config::config_path(&project.state_root).exists()
@@ -796,7 +801,7 @@ impl TuiApp {
             details.push_str(&integration.changed_paths.join("\n"));
             details.push('\n');
         }
-        let report_text = File::open(&report).and_then(|file| {
+        let report_text = open_runtime_read(&report).and_then(|file| {
             let mut text = Vec::new();
             file.take(64 * 1024).read_to_end(&mut text)?;
             Ok(String::from_utf8_lossy(&text).into_owned())
@@ -1216,7 +1221,6 @@ impl TuiApp {
 
     fn start_selected_task(&mut self, id: i64) -> Result<()> {
         anyhow::ensure!(self.child.is_none(), "A task is still running.");
-        use std::os::unix::fs::OpenOptionsExt;
         let log = OpenOptions::new()
             .create(true)
             .append(true)
@@ -1373,16 +1377,24 @@ fn run_recovery_hint(log: &[String], config: &ProjectConfig) -> String {
     }
 }
 
+fn open_runtime_read(path: &Path) -> io::Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(io::Error::other("Expected a regular runtime file"));
+    }
+    Ok(file)
+}
+
 fn recent_log_lines(path: &Path, baseline: u64) -> Vec<String> {
-    let Ok(mut file) = File::open(path) else {
+    let Ok(mut file) = open_runtime_read(path) else {
         return Vec::new();
     };
     let Ok(metadata) = file.metadata() else {
         return Vec::new();
     };
-    if !metadata.is_file() {
-        return Vec::new();
-    }
     let end = metadata.len();
     let start = baseline.min(end).max(end.saturating_sub(48 * 1024));
     if file.seek(SeekFrom::Start(start)).is_err() {
@@ -1847,7 +1859,7 @@ fn ui(frame: &mut Frame, app: &TuiApp) {
     render_input(frame, app, chunks[4]);
     if let Some((message, _)) = &app.status_message {
         frame.render_widget(
-            Paragraph::new(message.as_str()).wrap(Wrap { trim: true }),
+            Paragraph::new(safe_display(message)).wrap(Wrap { trim: true }),
             chunks[5],
         );
     }
@@ -2880,10 +2892,10 @@ fn render_input(frame: &mut Frame, app: &TuiApp, area: Rect) {
         _ if !app.available.contains(&app.config.writer)
             || !app.available.contains(&app.config.critic) =>
         {
-            " F2 Set up agents · F3 History · F4 New session "
+            " /config Set up agents · F2 Settings · F3 History "
         }
         _ => {
-            " Describe task · Enter Review · F2 Settings · F3 History · F4 New session · Esc Clear input "
+            " Describe task · Enter Review · /config Settings · /new New session · F3 History · Esc Clear "
         }
     };
     let before = &app.input[..app.cursor];
@@ -2960,6 +2972,110 @@ mod tests {
     }
 
     #[test]
+    fn guided_cockpit_reviews_before_enqueuing_and_resets_the_session() {
+        let project = test_tui_project();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&project.root)
+                .output()
+                .expect("run Git");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Base",
+        ]);
+        let project = Project::discover(&project.root).expect("discover Git project");
+        ensure_talos_ignored(&project).expect("local exclusion");
+        let mut app = TuiApp::with_adapters(
+            project.clone(),
+            vec![AdapterKind::Codex, AdapterKind::Claude],
+        )
+        .expect("open cockpit");
+        let mut database = Database::open(&project).expect("open database");
+        let old = database
+            .add_task("Earlier task", "Earlier criteria")
+            .expect("queue old task");
+        app.execute_slash_command("/config").expect("open settings");
+        assert_eq!(app.screen, Screen::Settings);
+        app.handle_submit().expect("save settings");
+        assert_eq!(app.config.writer, AdapterKind::Codex);
+        assert_eq!(app.config.critic, AdapterKind::Claude);
+
+        app.paste("Проверка проекта\nKeep the change small.");
+        app.handle_submit().expect("prepare draft");
+        assert_eq!(app.screen, Screen::Review);
+        assert_eq!(database.list_tasks().expect("list tasks").len(), 1);
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(90, 25)).expect("terminal");
+        terminal
+            .draw(|frame| ui(frame, &app))
+            .expect("render Cyrillic draft");
+
+        std::fs::write(project.root.join("local-edit.txt"), "user change").expect("dirty project");
+        assert!(
+            app.handle_submit()
+                .unwrap_err()
+                .to_string()
+                .contains("uncommitted")
+        );
+        assert_eq!(database.list_tasks().expect("list tasks").len(), 1);
+        std::fs::remove_file(project.root.join("local-edit.txt")).expect("clean test project");
+
+        app.screen = Screen::Task;
+        app.task_view = Some(old.id);
+        for key in "/new".chars() {
+            app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
+                .expect("type command");
+        }
+        app.handle_submit().expect("new session");
+        app.refresh_state().expect("refresh");
+        assert_eq!(app.screen, Screen::Main);
+        assert!(app.input.is_empty() && app.recent_events.is_empty());
+        assert!(app.task_view.is_none());
+        assert_eq!(app.config.writer, AdapterKind::Codex);
+        app.open_history(None).expect("open history");
+        assert_eq!(app.history[0].id, old.id);
+        std::fs::remove_dir_all(&project.root).expect("remove test project");
+    }
+
+    #[test]
+    fn cockpit_backspace_accepts_repeat_and_edits_at_a_unicode_boundary() {
+        let project = test_tui_project();
+        let mut app = TuiApp::with_adapters(project.clone(), Vec::new()).expect("open cockpit");
+        app.screen = Screen::Main;
+        app.paste("раз два");
+        app.handle_key(KeyEvent::new(KeyCode::Left, KeyModifiers::NONE))
+            .expect("move cursor");
+        let mut held = KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE);
+        held.kind = KeyEventKind::Repeat;
+        app.handle_key(held).expect("repeat Backspace");
+        app.handle_key(held).expect("repeat Backspace");
+        assert_eq!(app.input, "раз а");
+        app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+            .expect("move to end");
+        app.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL))
+            .expect("delete word");
+        assert_eq!(app.input, "раз ");
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("clear line");
+        assert!(app.input.is_empty());
+        std::fs::remove_dir_all(&project.root).expect("remove test project");
+    }
+
+    #[test]
     fn active_tab_navigation_and_titles() {
         assert_eq!(ActiveTab::Feed.title(), " 1: Unified Feed ");
         assert_eq!(ActiveTab::Feed.next(), ActiveTab::Dialogue);
@@ -2978,7 +3094,7 @@ mod tests {
         let db = Database::open(&project).expect("open db");
         drop(db);
 
-        let mut app = TuiApp::new(project.clone()).expect("create TuiApp");
+        let mut app = TuiApp::with_adapters(project.clone(), Vec::new()).expect("create TuiApp");
 
         // 1. Test /feed and aliases
         app.active_tab = ActiveTab::Diff;
@@ -3038,7 +3154,7 @@ mod tests {
         let db = Database::open(&project).expect("open db");
         drop(db);
 
-        let mut app = TuiApp::new(project.clone()).expect("create TuiApp");
+        let mut app = TuiApp::with_adapters(project.clone(), Vec::new()).expect("create TuiApp");
 
         // 1. Longest common prefix helper
         assert_eq!(
@@ -3112,7 +3228,7 @@ mod tests {
         let db = Database::open(&project).expect("open db");
         drop(db);
 
-        let mut app = TuiApp::new(project.clone()).expect("create TuiApp");
+        let mut app = TuiApp::with_adapters(project.clone(), Vec::new()).expect("create TuiApp");
         app.modified_files = vec![
             "src/main.rs".to_string(),
             "src/tui.rs".to_string(),

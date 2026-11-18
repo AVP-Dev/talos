@@ -39,32 +39,7 @@ pub struct KiloRunResult {
 }
 
 pub fn resolve_kilo_executable() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("KILO_PATH") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    let default_candidates = [
-        "/Users/AVP-Dev/.kilo/bin/kilo",
-        "/usr/local/bin/kilo",
-        "/opt/homebrew/bin/kilo",
-    ];
-    for candidate in default_candidates {
-        let path = PathBuf::from(candidate);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("kilo");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    super::resolve_installed_cli("kilo", "KILO_PATH", &[".kilo/bin", ".local/bin"])
 }
 
 pub async fn run_kilo(config: KiloRunConfig) -> Result<KiloRunResult> {

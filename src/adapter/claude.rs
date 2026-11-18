@@ -40,32 +40,7 @@ pub struct ClaudeRunResult {
 }
 
 pub fn resolve_claude_executable() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("CLAUDE_PATH") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    let default_candidates = [
-        "/Users/AVP-Dev/.local/bin/claude",
-        "/usr/local/bin/claude",
-        "/opt/homebrew/bin/claude",
-    ];
-    for candidate in default_candidates {
-        let path = PathBuf::from(candidate);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("claude");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    super::resolve_installed_cli("claude", "CLAUDE_PATH", &[".local/bin"])
 }
 
 pub async fn run_claude(

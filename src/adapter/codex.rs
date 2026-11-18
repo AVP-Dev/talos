@@ -40,33 +40,7 @@ pub struct CodexRunResult {
 }
 
 pub fn resolve_codex_executable() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("CODEX_PATH") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    let default_candidates = [
-        "/Users/AVP-Dev/.local/bin/codex",
-        "/usr/local/bin/codex",
-        "/opt/homebrew/bin/codex",
-    ];
-    for candidate in default_candidates {
-        let path = PathBuf::from(candidate);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    // Search PATH
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("codex");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    super::resolve_installed_cli("codex", "CODEX_PATH", &[".local/bin"])
 }
 
 pub async fn run_codex(

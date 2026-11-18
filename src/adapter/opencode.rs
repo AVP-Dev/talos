@@ -40,33 +40,11 @@ pub struct OpenCodeRunResult {
 }
 
 pub fn resolve_opencode_executable() -> Option<PathBuf> {
-    if let Ok(path) = std::env::var("OPENCODE_PATH") {
-        let path = PathBuf::from(path);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    let default_candidates = [
-        "/Users/AVP-Dev/.opencode/bin/opencode",
-        "/Users/AVP-Dev/.local/bin/opencode",
-        "/usr/local/bin/opencode",
-        "/opt/homebrew/bin/opencode",
-    ];
-    for candidate in default_candidates {
-        let path = PathBuf::from(candidate);
-        if path.is_file() {
-            return Some(path);
-        }
-    }
-    if let Some(path_var) = std::env::var_os("PATH") {
-        for dir in std::env::split_paths(&path_var) {
-            let candidate = dir.join("opencode");
-            if candidate.is_file() {
-                return Some(candidate);
-            }
-        }
-    }
-    None
+    super::resolve_installed_cli(
+        "opencode",
+        "OPENCODE_PATH",
+        &[".opencode/bin", ".local/bin"],
+    )
 }
 
 pub async fn run_opencode(
