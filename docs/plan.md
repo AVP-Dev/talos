@@ -235,13 +235,43 @@ Implement autonomous two-tier team orchestration where TALOS manages two distinc
 
 **Exit criteria:** `talos up --auto` defaults to pair mode without regression; `talos up --auto --mode team` executes the full team orchestration loop; schema v19 migration operates atomically; all unit and integration tests pass with 0 warnings.
 
+### R12 — Terminal Orchestrator Cockpit (TUI) & Adapter Diagnostics Polish
+
+Deliver an interactive terminal user interface on Ratatui and Crossterm, making it the primary interface for TALOS, and polish multi-adapter capability discovery.
+
+- **Terminal Orchestrator Cockpit:** 4 tabbed views (`Overview`, `Dialogue & Review`, `Git Diff`, `Audit & Checks`), Tokio async background supervisor, and session reconnection on launch.
+- **In-TUI Slash Commands:** Commands (`/stop`, `/pause`, `/resume`, `/commit`, `/diff`, `/audit`, `/dialogue`, `/help`) with full Russian alias support. Terminal keybinding safety (removed `Ctrl+P`).
+- **Adapter Probing Polish:** Accurate presence detection and status reporting in `talos doctor` across all 7 supported AI CLI adapters.
+
+**Exit criteria:** bare `talos` opens the TUI Cockpit; slash commands execute cleanly; `talos doctor` reports accurate executable presence for each adapter; all tests pass.
+
+### R13 — Intelligent Rate-Limit & Quota Detection with Adaptive Backoff
+
+Implement cross-vendor rate limit, 429, and quota exhaustion classification, wait duration parsing, and seamless auto-pause/auto-resume across Writer, Critic, and agent queries.
+
+- **Classifier:** Parse known error signatures across OpenAI, Anthropic, Gemini, DeepSeek, and local gateways into `RequestLimit`, `QuotaExhausted`, or `Overloaded`.
+- **Duration Extraction:** Parse explicit retry durations (`try again in 20s`, `resets in 45s`, `retry-after: 60`) with intelligent adaptive fallbacks (20s to 300s for request limits; 5m to 45m for quota limits).
+- **Auto-Resume Integration:** Log `task.rate_limit_backoff` audit events, pause asynchronously, and automatically retry attempts up to 5 times without burning worker code-help attempts.
+
+**Exit criteria:** rate limit signatures are accurately classified; wait durations extracted; supervisor auto-pauses and retries without user intervention; all tests pass.
+
+### R14 — Autonomous Decisions Artifact, Session Timings & Token Economy
+
+Deliver transparent artifact reporting for autonomous choices, session metrics, and bounded token context budgets.
+
+- **Autonomous Decisions Artifact:** Automatically generate `TALOS_SUMMARY.md` documenting task execution, session duration metrics, autonomous architectural decisions, verified checks, and git commit details.
+- **Session Timings:** Track start time, active execution duration, and rate-limit pauses.
+- **Token Economy:** Truncate large diagnostic logs and error dumps to a bounded 4096-byte budget (`truncate_for_token_economy`) to protect agent prompt budgets.
+
+**Exit criteria:** `TALOS_SUMMARY.md` is generated upon task completion; error context is bounded; all tests pass.
+
 ## 6. Dependency order
 
 ```text
 R0 → R1 → R2 → R3 → R4 → R5
                          └──→ R6
 R5 + R6 → R7 → R8 → R9
-R6 + R7 + R8 + R9 → R10 → R11
+R6 + R7 + R8 + R9 → R10 → R11 → R12 → R13 → R14
 ```
 
 Implementation details may change based on experiments. Preserve invariants and acceptance checks; update `docs/decisions.md`, `docs/tasks.md`, and `docs/state.md` when scope changes materially.

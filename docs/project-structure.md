@@ -14,18 +14,22 @@ src/
   cli.rs                    Clap argument and subcommand definitions
   config.rs                 project configuration and GitHub policy
   db.rs                     SQLite schema, migrations, task state, events, and leases
-  adapter/                  currently Agy only; R10 adds one provider profile at a time
+  adapter/                  7 provider profiles (agy, codex, claude, omp, pi, kilo, opencode)
   checks.rs                 project check execution and evidence
   github.rs                 GitHub CLI probes and policy-gated operations
   policy.rs                 Writer authority and execution-mode rules
   process_group.rs          Unix child process-group control
   process_identity.rs       platform process identity, including Linux procfs
   project.rs                project root discovery and private runtime path
+  rate_limit.rs             intelligent rate-limit/quota detection & adaptive backoff
   review.rs                 structured Critic review contracts
   revision.rs               Git revision facts and review snapshots
   secrets.rs                credential detection and output redaction
+  summary.rs                deliverable task summary artifact & token economy truncation
   supervisor.rs             Writer/Critic lifecycle and recovery coordination
+  team.rs                   two-tier team orchestration (Writer Team & Critic Team)
   tmux.rs                   optional persistent terminal control session
+  tui.rs                    unified terminal orchestrator cockpit (Ratatui/Crossterm)
   worktree.rs               explicit task-worktree lifecycle and integration
   inline test modules      unit and behavior tests colocated with modules
 scripts/                    verification profile, scanner, and macOS/Linux packagers

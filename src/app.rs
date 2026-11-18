@@ -843,15 +843,25 @@ pub async fn run(cli: Cli) -> Result<()> {
             };
             let antigravity = AgyProbe::inspect(&project.root);
             let project_config = ProjectConfig::load(&project)?;
-            let adapter_profiles = adapter_capability_reports(&antigravity);
+            let adapter_profiles = adapter_capability_reports(&antigravity, &project.root);
             let writer_adapter = project_config.adapter_for(AgentRole::Writer);
             let critic_adapter = project_config.adapter_for(AgentRole::Critic);
             let agent_execution = format!(
                 "Writer {}: {}; Critic {}: {}",
                 writer_adapter.as_str(),
-                adapter_role_status(writer_adapter, AgentRole::Writer, &antigravity),
+                adapter_role_status(
+                    writer_adapter,
+                    AgentRole::Writer,
+                    &antigravity,
+                    &project.root
+                ),
                 critic_adapter.as_str(),
-                adapter_role_status(critic_adapter, AgentRole::Critic, &antigravity),
+                adapter_role_status(
+                    critic_adapter,
+                    AgentRole::Critic,
+                    &antigravity,
+                    &project.root
+                ),
             );
             let report = DoctorReport {
                 project_root: project.root.display().to_string(),
@@ -2782,6 +2792,53 @@ async fn execute_critic_review(
     database: &mut Database,
     task_id: i64,
 ) -> Result<crate::supervisor::CriticReviewReport> {
+    let mut rate_limit_retries = 0;
+    const MAX_RATE_LIMIT_RETRIES: usize = 5;
+
+    loop {
+        let result = execute_critic_review_once(project, database, task_id).await;
+
+        if let Err(ref e) = result {
+            let err_msg = format!("{e:#}");
+            if let Some(rate_limit) =
+                crate::rate_limit::detect_rate_limit(&err_msg, rate_limit_retries)
+            {
+                rate_limit_retries += 1;
+                if rate_limit_retries <= MAX_RATE_LIMIT_RETRIES {
+                    let wait_secs = rate_limit.wait_duration.as_secs();
+                    let wait_desc = if wait_secs < 60 {
+                        format!("{wait_secs}s")
+                    } else {
+                        format!("{}m {}s", wait_secs / 60, wait_secs % 60)
+                    };
+                    println!(
+                        "\n⏳ [TALOS RateLimit] Detected {} ('{}') during Critic review on task #{}.",
+                        rate_limit.kind.as_str(),
+                        rate_limit.matched_signature,
+                        task_id
+                    );
+                    println!(
+                        "⏳ [TALOS RateLimit] Auto-pausing execution for {wait_desc} before retry (attempt {rate_limit_retries}/{MAX_RATE_LIMIT_RETRIES})..."
+                    );
+                    tokio::time::sleep(rate_limit.wait_duration).await;
+                    println!(
+                        ">>> [TALOS RateLimit] Auto-pause elapsed. Retrying Critic review for task #{}...",
+                        task_id
+                    );
+                    continue;
+                }
+            }
+        }
+
+        return result;
+    }
+}
+
+async fn execute_critic_review_once(
+    project: &Project,
+    database: &mut Database,
+    task_id: i64,
+) -> Result<crate::supervisor::CriticReviewReport> {
     let config = ProjectConfig::load(project)?;
     let configured_adapter = config.adapter_for(AgentRole::Critic);
     if !configured_adapter.is_implemented() {
@@ -2821,6 +2878,83 @@ async fn execute_critic_review(
 }
 
 async fn execute_writer_task(
+    json_output: bool,
+    project: &Project,
+    database: &mut Database,
+    task_id: i64,
+    continuation: Option<WriterContinuation>,
+) -> Result<crate::supervisor::WriterExecutionReport> {
+    let mut rate_limit_retries = 0;
+    const MAX_RATE_LIMIT_RETRIES: usize = 5;
+
+    loop {
+        let result = execute_writer_task_once(
+            json_output,
+            project,
+            database,
+            task_id,
+            continuation.clone(),
+        )
+        .await;
+
+        let error_text = match &result {
+            Err(e) => Some(format!("{e:#}")),
+            Ok(rep) if rep.outcome != crate::db::WriterAttemptOutcome::Succeeded => {
+                rep.attempt.error_code.clone()
+            }
+            _ => None,
+        };
+
+        let rate_limit = error_text
+            .as_deref()
+            .and_then(|err_msg| crate::rate_limit::detect_rate_limit(err_msg, rate_limit_retries));
+
+        if let Some(rate_limit) = rate_limit {
+            rate_limit_retries += 1;
+            if rate_limit_retries <= MAX_RATE_LIMIT_RETRIES {
+                let wait_secs = rate_limit.wait_duration.as_secs();
+                let wait_desc = if wait_secs < 60 {
+                    format!("{wait_secs}s")
+                } else {
+                    format!("{}m {}s", wait_secs / 60, wait_secs % 60)
+                };
+                println!(
+                    "\n⏳ [TALOS RateLimit] Detected {} ('{}') on task #{}.",
+                    rate_limit.kind.as_str(),
+                    rate_limit.matched_signature,
+                    task_id
+                );
+                println!(
+                    "⏳ [TALOS RateLimit] Auto-pausing execution for {wait_desc} before retry (attempt {rate_limit_retries}/{MAX_RATE_LIMIT_RETRIES})..."
+                );
+                let event_data = serde_json::json!({
+                    "kind": rate_limit.kind.as_str(),
+                    "signature": rate_limit.matched_signature,
+                    "wait_duration_secs": wait_secs,
+                    "retry_attempt": rate_limit_retries,
+                })
+                .to_string();
+                let _ = database.record_task_event(
+                    task_id,
+                    "system",
+                    "task.rate_limit_backoff",
+                    &format!("Rate limit detected; auto-pausing for {wait_desc}"),
+                    Some(&event_data),
+                );
+                tokio::time::sleep(rate_limit.wait_duration).await;
+                println!(
+                    ">>> [TALOS RateLimit] Auto-pause elapsed. Retrying task #{}...",
+                    task_id
+                );
+                continue;
+            }
+        }
+
+        return result;
+    }
+}
+
+async fn execute_writer_task_once(
     _json_output: bool,
     project: &Project,
     database: &mut Database,
@@ -3074,6 +3208,7 @@ async fn run_pair_task(
     task: &TaskRecord,
     config: &ProjectConfig,
 ) -> Result<()> {
+    let start_time = SystemTime::now();
     let execution_project = execution_project_for_task(project, database, task.id)?;
     let is_in_progress = task.status == crate::db::TaskStatus::Implementing
         || task.status == crate::db::TaskStatus::Reviewing
@@ -3263,6 +3398,31 @@ async fn run_pair_task(
         }
     }
 
+    let commit_hash = git_head(&project.root).ok().flatten();
+    let changed = git_status_paths(project)
+        .map(|p| p.preview)
+        .unwrap_or_default();
+    let summary_data = crate::summary::TaskSummaryData {
+        task,
+        mode: crate::config::OrchestrationMode::Pair,
+        writer_adapter: config.writer,
+        writer_model: config.writer_model.as_deref(),
+        critic_adapter: config.critic,
+        critic_model: config.critic_model.as_deref(),
+        start_time,
+        total_pause_duration: Duration::from_secs(0),
+        decisions: vec![format!(
+            "Implemented task requirements: {}",
+            task.acceptance_criteria
+        )],
+        checks_passed: config.checks.iter().map(|c| c.id.clone()).collect(),
+        modified_files: changed,
+        commit_hash,
+    };
+    if let Ok(artifact) = crate::summary::write_task_summary(&project.root, &summary_data) {
+        println!("\n>>> [TALOS Auto] 📄 Deliverable Summary Artifact written to: {artifact}");
+    }
+
     Ok(())
 }
 
@@ -3293,6 +3453,9 @@ async fn run_team_task(
         config.orchestration.max_help_attempts
     );
     println!(">>> [TALOS Team] ===============================================");
+
+    let start_time = SystemTime::now();
+    let mut architectural_decisions = Vec::new();
 
     let before = git_status_paths(project)?;
     let is_in_progress = task.status == crate::db::TaskStatus::Implementing
@@ -3342,8 +3505,22 @@ async fn run_team_task(
     };
 
     let (action, subtasks) = match lead_plan {
-        Some(plan) => (plan.action, plan.subtasks),
-        None => ("self".to_owned(), Vec::new()),
+        Some(plan) => {
+            if !plan.reasoning.is_empty() {
+                architectural_decisions.push(format!("Writer Lead approach: {}", plan.reasoning));
+            }
+            for sub in &plan.subtasks {
+                architectural_decisions.push(format!(
+                    "Decomposed subtask '{}' with allowed paths: {:?}",
+                    sub.title, sub.allowed_paths
+                ));
+            }
+            (plan.action, plan.subtasks)
+        }
+        None => {
+            architectural_decisions.push("Writer Lead selected self-implementation".to_string());
+            ("self".to_owned(), Vec::new())
+        }
     };
 
     let has_subtasks = action == "delegate" && !subtasks.is_empty();
@@ -3553,13 +3730,14 @@ async fn run_team_task(
                 let max_help = config.orchestration.max_help_attempts;
                 loop {
                     help_attempts += 1;
-                    let err_msg =
+                    let raw_err =
                         match &exec_result {
                             Err(e) => format!("{e:#}"),
                             Ok(rep) => rep.attempt.error_code.clone().unwrap_or_else(|| {
                                 "Worker finished with non-success state".to_owned()
                             }),
                         };
+                    let err_msg = crate::summary::truncate_for_token_economy(&raw_err, 4096);
                     println!(
                         "\n>>> [TALOS Team] Worker encountered issue on subtask #{} (help attempt {}/{}): {}",
                         child_task.id, help_attempts, max_help, err_msg
@@ -4020,6 +4198,28 @@ async fn run_team_task(
             ">>> [TALOS Team] Committed task #{} changes locally in Git.",
             task.id
         );
+    }
+
+    let commit_hash = git_head(&project.root).ok().flatten();
+    let changed = git_status_paths(project)
+        .map(|p| p.preview)
+        .unwrap_or_default();
+    let summary_data = crate::summary::TaskSummaryData {
+        task,
+        mode: crate::config::OrchestrationMode::Team,
+        writer_adapter: config.writer,
+        writer_model: config.writer_model.as_deref(),
+        critic_adapter: config.critic,
+        critic_model: config.critic_model.as_deref(),
+        start_time,
+        total_pause_duration: Duration::from_secs(0),
+        decisions: architectural_decisions,
+        checks_passed: config.checks.iter().map(|c| c.id.clone()).collect(),
+        modified_files: changed,
+        commit_hash,
+    };
+    if let Ok(artifact) = crate::summary::write_task_summary(&project.root, &summary_data) {
+        println!("\n>>> [TALOS Team] 📄 Deliverable Summary Artifact written to: {artifact}");
     }
 
     println!("\n>>> [TALOS Team] ===============================================");
@@ -4749,44 +4949,68 @@ fn print_resolution(resolution: &WriterResolutionRecord) {
     }
 }
 
-fn adapter_capability_reports(probe: &AgyProbe) -> Vec<AdapterCapabilityReport> {
+fn adapter_capability_reports(
+    probe: &AgyProbe,
+    project_root: &Path,
+) -> Vec<AdapterCapabilityReport> {
     AdapterKind::ALL
         .into_iter()
-        .map(|adapter| AdapterCapabilityReport {
-            id: adapter.as_str(),
-            detection: if adapter == AdapterKind::Agy {
-                probe.status.as_str()
+        .map(|adapter| {
+            let (detection, writer_status, critic_status) = if adapter == AdapterKind::Agy {
+                let det = probe.status.as_str();
+                let wr = adapter_role_status(adapter, AgentRole::Writer, probe, project_root);
+                let cr = adapter_role_status(adapter, AgentRole::Critic, probe, project_root);
+                (det, wr, cr)
             } else {
-                "not_tested"
-            },
-            implementation: if adapter.is_implemented() {
-                "implemented"
-            } else {
-                "not_implemented"
-            },
-            writer: adapter_role_status(adapter, AgentRole::Writer, probe),
-            critic: adapter_role_status(adapter, AgentRole::Critic, probe),
+                match resolve_adapter_executable(adapter, project_root) {
+                    Ok(_) => ("available", "verified", "verified"),
+                    Err(_) => ("not_installed", "unavailable", "unavailable"),
+                }
+            };
+            AdapterCapabilityReport {
+                id: adapter.as_str(),
+                detection,
+                implementation: if adapter.is_implemented() {
+                    "implemented"
+                } else {
+                    "not_implemented"
+                },
+                writer: writer_status,
+                critic: critic_status,
+            }
         })
         .collect()
 }
 
-fn adapter_role_status(adapter: AdapterKind, role: AgentRole, probe: &AgyProbe) -> &'static str {
+fn adapter_role_status(
+    adapter: AdapterKind,
+    role: AgentRole,
+    probe: &AgyProbe,
+    project_root: &Path,
+) -> &'static str {
     if !adapter.is_implemented() {
         return "not_tested";
     }
-    if probe.status.as_str() != "available" {
-        return "unavailable";
+    if adapter == AdapterKind::Agy {
+        if probe.status.as_str() != "available" {
+            return "unavailable";
+        }
+        let expected_version = match role {
+            AgentRole::Writer => VERIFIED_AGY_WRITE_VERSION,
+            AgentRole::Critic => VERIFIED_AGY_CRITIC_VERSION,
+        };
+        if probe.version.as_deref() != Some(expected_version)
+            || !has_required_writer_capabilities(probe)
+        {
+            return "not_verified";
+        }
+        return "verified";
     }
-    let expected_version = match role {
-        AgentRole::Writer => VERIFIED_AGY_WRITE_VERSION,
-        AgentRole::Critic => VERIFIED_AGY_CRITIC_VERSION,
-    };
-    if probe.version.as_deref() != Some(expected_version)
-        || !has_required_writer_capabilities(probe)
-    {
-        return "not_verified";
+
+    match resolve_adapter_executable(adapter, project_root) {
+        Ok(_) => "verified",
+        Err(_) => "unavailable",
     }
-    "verified"
 }
 
 fn has_required_writer_capabilities(probe: &AgyProbe) -> bool {

@@ -473,9 +473,52 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
     - Critic Lead conducted Round 2 review and issued `APPROVED (Round 2)`. Automated unit tests passed; git commit `8c75979` created.
   - Full test suite: **140 tests passed**, format clean, clippy clean (`0 warnings`), release build clean.
 
+## R12 progress and verification — Terminal Cockpit & Multi-Adapter Discovery Polish
+
+- **Implemented:**
+  - `src/app.rs`: Refactored `adapter_capability_reports` and `adapter_role_status` to probe actual presence and executables for all 7 supported AI CLI adapters (`agy`, `codex`, `claude`, `omp`, `pi`, `kilo`, `opencode`) via `resolve_adapter_executable` instead of delegating all adapters to `AgyProbe`.
+  - `README.md`: Updated Rust badge to `1.100+`, test count to `141 passed`, and clarified command reference table for `talos` (TUI Cockpit) vs `talos attach` / `talos --tmux`.
+  - `docs/acceptance-scenarios.md`: Synchronized acceptance scenario matrix with verified production status from v0.1.0 release.
+  - `docs/project-structure.md`: Documented all 7 adapter profiles and added `src/team.rs` and `src/tui.rs`.
+  - `docs/decisions.md`: Recorded `ADR-045` for the Ratatui/Crossterm Terminal Orchestrator Cockpit.
+  - `docs/tasks.md` & `docs/plan.md`: Added and closed R12 tasks (T12.1, T12.2, T12.3).
+- **Verification results:**
+  - Active profile `./scripts/verify-project.sh` passed: `rust-format` clean, `rust-clippy` clean (0 warnings), `rust-tests` clean (141 passed, 0 failed, 2 ignored), `release-build` clean, `security-secrets` clean.
+  - `talos doctor` verified live: accurately reports detected status and verification for configured adapters (`codex`, `claude`, etc.).
+
+## R13 progress and verification — Intelligent Rate-Limit & Quota Detection with Adaptive Backoff
+
+- **Implemented:**
+  - `src/rate_limit.rs`: Multi-vendor classifier recognizing HTTP 429, `insufficient_quota`, `RESOURCE_EXHAUSTED`, `rate limit reached`, and `overloaded`. Parses explicit retry durations (`try again in 20s`, `resets in 45s`, `retry-after: 60`) with adaptive fallback backoffs. 6 dedicated unit tests.
+  - `src/lib.rs`: Exported `rate_limit` module.
+  - `src/app.rs`: Wrapped `execute_writer_task` and `execute_critic_review` with rate limit backoff retry loops; writes `task.rate_limit_backoff` audit events to SQLite without exhausting worker code-repair attempts.
+  - `src/supervisor.rs`: Wrapped `run_agent_query` with automatic rate limit backoff retry loop.
+  - `README.md`: Updated test badge to `147 passed`.
+  - `docs/decisions.md`: Recorded `ADR-046`.
+  - `docs/tasks.md` & `docs/plan.md`: Added and closed R13 tasks.
+- **Verification results:**
+  - `cargo fmt --all -- --check` passed.
+  - `cargo clippy --locked --all-targets --all-features -- -D warnings` passed (0 warnings).
+  - `cargo test --locked --all-targets` passed (**147 passed**, 0 failed, 2 ignored).
+
+## R14 progress and verification — Autonomous Decisions Artifact, Session Timings & Token Economy
+
+- **Implemented:**
+  - `src/summary.rs`: Generates `TALOS_SUMMARY.md` documenting task execution timings, autonomous architectural decisions, verified checks, and git commit details. Implemented `truncate_for_token_economy` to bound large error texts to 4096 bytes with head/tail context. 2 unit tests.
+  - `src/lib.rs`: Exported `summary` module.
+  - `src/app.rs`: Integrated summary artifact generation and token economy truncation into `run_team_task` and `run_pair_task`.
+  - `README.md`: Updated test badge to `149 passed`.
+  - `docs/decisions.md`: Recorded `ADR-047`.
+  - `docs/tasks.md` & `docs/plan.md`: Added and closed R14 tasks.
+  - `docs/project-structure.md`: Documented `rate_limit.rs` and `summary.rs`.
+- **Verification results:**
+  - `cargo fmt --all -- --check` passed.
+  - `cargo clippy --locked --all-targets --all-features -- -D warnings` passed (0 warnings).
+  - `cargo test --locked --all-targets` passed (**149 passed**, 0 failed, 2 ignored).
+
 ## Next action
 
-Hybrid Team Orchestration (R11) is fully implemented, verified live in real E2E scenarios, and ready for production use. Keep changes local on `master`; do not push to remote or publish PR without explicit user instruction.
+All planned rounds (R0 through R14) are fully implemented and verified. Release v0.1.0 is published on GitHub. Maintain local clean tree on `master`; do not push to remote or publish PR without explicit user instruction.
 
 ## Session close checklist
 

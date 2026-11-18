@@ -6,8 +6,8 @@
     <a href="https://github.com/AVP-Dev/talos/releases/latest"><img src="https://img.shields.io/github/v/release/AVP-Dev/talos?label=Release&style=for-the-badge&color=blue" alt="Release" /></a>
     <img src="https://img.shields.io/badge/Status-Beta%20%2F%20Preview-yellow?style=for-the-badge" alt="Status: Beta" />
     <img src="https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-black?style=for-the-badge&logo=apple" alt="macOS and Linux" />
-    <img src="https://img.shields.io/badge/Rust-1.94%2B-orange?style=for-the-badge&logo=rust" alt="Rust" />
-    <img src="https://img.shields.io/badge/Tests-140%20passed-brightgreen?style=for-the-badge" alt="Tests" />
+    <img src="https://img.shields.io/badge/Rust-1.100%2B-orange?style=for-the-badge&logo=rust" alt="Rust" />
+    <img src="https://img.shields.io/badge/Tests-149%20passed-brightgreen?style=for-the-badge" alt="Tests" />
   </p>
 
   <p>
@@ -117,7 +117,8 @@ cargo install --locked --path .
 
 | Command | Description |
 | :--- | :--- |
-| `talos` | Launch or reconnect to the 3-pane interactive workspace (`tmux`) |
+| `talos` | Launch the interactive Terminal Orchestrator Cockpit (`tui`) |
+| `talos attach` | Create or reconnect to the persistent tmux control shell |
 | `talos config` | View current configuration (`writer`, `critic`, `mode`, checks) |
 | `talos config set <KEY> <VAL>` | Configure roles (`writer`, `critic`, `mode`, `max-writers`) |
 | `talos doctor` | Probe installed AI CLIs, Git, tmux, and dependencies |

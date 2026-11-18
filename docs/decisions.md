@@ -375,3 +375,40 @@ No schema change for process identity is selected or implemented. The separate s
   - Backward compatibility is maintained for schema versions 1 through 18.
 - **Verification:**
   - 137 automated unit and integration tests passing; verification profile clean.
+
+## ADR-045 — Unified Terminal Orchestrator Cockpit on Ratatui and Crossterm
+
+- **Status:** implemented and verified in v0.1.0 release.
+- **Decision:** bare `talos` invocation (and explicit `talos tui`) launches a full-screen interactive Terminal Orchestrator Cockpit powered by `ratatui` and `crossterm`. Persistent multi-pane tmux workspaces remain available via `talos attach` and `talos --tmux`.
+- **Architecture and Invariants:**
+  1. **UI Event Loop & Background Supervisor:** The terminal UI runs asynchronously on Tokio without blocking the rendering loop. Dispatching a task spawns background execution while streaming live output to the TUI.
+  2. **Multi-View Tabbed Interface:** The Cockpit provides four distinct operational views:
+     - `Overview`: Task queue, worker/critic statuses, lease owner, and live event log.
+     - `Dialogue & Review`: Conversation stream between Writer Lead, Critic Lead, and worker subtasks.
+     - `Git Diff`: Real-time tracked and untracked file diffs for the current working revision.
+     - `Audit & Checks`: Verification test results, timing, exit codes, and evidence logs.
+  3. **In-TUI Slash Commands & Russian Aliases:** The interactive command bar accepts extensible commands (`/stop`, `/pause`, `/resume`, `/commit`, `/diff`, `/audit`, `/dialogue`, `/help`, etc.) alongside full Russian alias support (`/стоп`, `/пауза`, `/продолжить`, `/помощь`).
+  4. **Terminal Keybinding Safety:** Hotkey `Ctrl+P` was removed to prevent collisions with native tmux prefixes or terminal emulators; navigation uses standard tabs, arrow keys, and slash commands.
+  5. **Safety & Recovery:** Reconnection to active SQLite tasks on startup; dirty tree protection before auto-dispatch; clean terminal state restoration on exit via Crossterm raw mode teardown.
+- **Verification:** verified live across macOS and Linux terminal environments; automated CLI parser test in `src/cli.rs`.
+
+## ADR-046 — Intelligent Rate-Limit & Quota Detection with Adaptive Backoff and Auto-Resume
+
+- **Status:** implemented and verified in R13.
+- **Decision:** when external AI CLIs (Codex, Claude, Agy, OMP, Kilo, etc.) return rate limit or quota exhaustion errors (HTTP 429, `insufficient_quota`, `RESOURCE_EXHAUSTED`, `rate limit reached`, `overloaded`), TALOS must NOT treat this as an implementation defect, code syntax error, or waste code-repair help attempts.
+- **Architecture and Invariants:**
+  1. **Signature Pattern Matching:** `src/rate_limit.rs` classifies errors into `RequestLimit` (RPM/TPM/429), `QuotaExhausted` (credits/billing), or `Overloaded` (529/capacity) using known vendor signatures.
+  2. **Intelligent Wait Extraction:** Extracts explicit wait periods from CLI outputs (e.g. `try again in 20s`, `resets in 45s`, `retry-after: 60`, `wait 5m`).
+  3. **Adaptive Backoff Schedule:** When no explicit duration is given by the CLI, TALOS applies progressive backoff (request limits: 20s → 60s → 120s → 300s; quota exhaustion: 5m → 15m → 30m → 45m).
+  4. **Seamless Auto-Resume:** Records `task.rate_limit_backoff` event in SQLite with duration and attempt count, prints clear countdown status, sleeps asynchronously with `tokio::time::sleep`, and automatically retries the worker or query attempt (capped at 5 retries).
+- **Verification:** 6 dedicated unit tests covering OpenAI, Anthropic, Gemini, DeepSeek, and non-rate-limit code errors; integrated into Writer task execution, Critic review, and agent planning queries.
+
+## ADR-047 — Autonomous Decisions Artifact, Session Timings, and Token Economy Budgeting
+
+- **Status:** implemented and verified in R14.
+- **Decision:** upon completing a task in Team or Pair mode, TALOS automatically generates a structured Markdown report (`TALOS_SUMMARY.md`) in the project root documenting session timings, autonomous architectural choices, passing tests, and git commit details.
+- **Architecture and Invariants:**
+  1. **Deliverable Artifact (`TALOS_SUMMARY.md`):** Documents task metadata, timestamps, elapsed session duration (active vs rate-limit pauses), autonomous architectural decisions made by Writer Lead / agents, passing project check names, and modified file paths.
+  2. **Token Economy Truncation:** Large error outputs and compiler logs are truncated via `src/summary.rs::truncate_for_token_economy` to a bounded 4096-byte budget preserving head and tail diagnostic context, preventing token blowups in agent prompts.
+  3. **Non-Intrusive Artifact Generation:** Written only on successful verification; failures remain recorded in SQLite without cluttering the project workspace with incomplete artifacts.
+- **Verification:** unit tests for token truncation head/tail boundaries and small-string bypass; live verification across `run_team_task` and `run_pair_task`.

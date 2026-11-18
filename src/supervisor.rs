@@ -225,6 +225,64 @@ pub async fn run_agent_query(
     read_only: bool,
     timeout: Duration,
 ) -> Result<String> {
+    let mut rate_limit_retries = 0;
+    const MAX_RETRIES: usize = 4;
+
+    loop {
+        let res = run_agent_query_once(
+            project_root,
+            adapter,
+            executable.clone(),
+            model.clone(),
+            prompt.clone(),
+            read_only,
+            timeout,
+        )
+        .await;
+
+        if let Err(ref e) = res {
+            let err_msg = format!("{e:#}");
+            if let Some(rate_limit) =
+                crate::rate_limit::detect_rate_limit(&err_msg, rate_limit_retries)
+            {
+                rate_limit_retries += 1;
+                if rate_limit_retries <= MAX_RETRIES {
+                    let wait_secs = rate_limit.wait_duration.as_secs();
+                    let wait_desc = if wait_secs < 60 {
+                        format!("{wait_secs}s")
+                    } else {
+                        format!("{}m {}s", wait_secs / 60, wait_secs % 60)
+                    };
+                    println!(
+                        "\n⏳ [TALOS RateLimit] Query to {} hit {} ('{}'). Auto-pausing for {wait_desc}...",
+                        adapter.as_str(),
+                        rate_limit.kind.as_str(),
+                        rate_limit.matched_signature
+                    );
+                    tokio::time::sleep(rate_limit.wait_duration).await;
+                    println!(
+                        ">>> [TALOS RateLimit] Retrying query to {}...",
+                        adapter.as_str()
+                    );
+                    continue;
+                }
+            }
+        }
+
+        return res;
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_agent_query_once(
+    project_root: &Path,
+    adapter: crate::config::AdapterKind,
+    executable: PathBuf,
+    model: Option<String>,
+    prompt: String,
+    read_only: bool,
+    timeout: Duration,
+) -> Result<String> {
     match adapter {
         crate::config::AdapterKind::Codex => {
             let res = crate::adapter::codex::run_codex(

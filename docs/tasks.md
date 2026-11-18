@@ -160,6 +160,32 @@ Dependency: R6–R8.
 | T11.4 | done | Critic Team multi-angle evaluation and Critic Lead consolidated verdict | Critic Workers perform specialized domain audits (security, algorithms, testing) within read-only bounds. Critic Lead consolidates diff, plan, verification output, and worker findings into structured `approve` or `request_changes` verdict. Rebuttal and fix loop negotiated autonomously. |
 | T11.5 | done | Verification and backward compatibility preservation for Pair mode | Tested both `pair` and `team` workflows live in isolated git project `/private/tmp/talos-team-e2e` with Codex (Writer) and Agy (Critic). Parallel execution of two Writer Workers verified with exact millisecond timestamps (Worker 1: 1794996988535 ms, Worker 2: 1794996988668 ms; 30.7s concurrency overlap). Writer Lead automated integration, Critic Worker audit, Critic Lead approval, project checks (unittest), and git commit verified. Pair mode verified with Task #5 running sequentially. 140 unit and integration tests passing; format, clippy (0 warnings), and security checks clean. |
 
+## R12 — Terminal Orchestrator Cockpit (TUI) & Adapter Diagnostics Polish
+**Status:** complete. Delivered interactive TUI Cockpit as default `talos` interface and accurate multi-adapter capability discovery.
+
+| ID | Status | Task | Exit criteria |
+|---|---|---|---|
+| T12.1 | done | Implement Terminal Orchestrator Cockpit on Ratatui and Crossterm | Full-screen interactive dashboard with 4 tabbed views (`Overview`, `Dialogue & Review`, `Git Diff`, `Audit & Checks`), Tokio async background supervisor streaming, and session reconnection on launch. |
+| T12.2 | done | Extensible in-TUI slash command engine and terminal keybinding safety | In-TUI slash commands (`/stop`, `/pause`, `/resume`, `/commit`, `/diff`, `/audit`, `/dialogue`, `/help`) with full Russian alias support. Removed conflicting `Ctrl+P` hotkey. |
+| T12.3 | done | Multi-adapter executable probing in `talos doctor` | `doctor` probes actual presence and executable paths for all 7 supported AI CLI adapters instead of delegating all checks to `AgyProbe`. Verified in diagnostics. |
+
+## R13 — Intelligent Rate-Limit & Quota Detection with Adaptive Backoff
+**Status:** complete. Implemented multi-vendor error signature parsing, wait time extraction, adaptive backoff, and seamless auto-resume.
+
+| ID | Status | Task | Exit criteria |
+|---|---|---|---|
+| T13.1 | done | Implement rate limit and quota classifier module | `src/rate_limit.rs` classifies errors from OpenAI, Anthropic, Gemini, DeepSeek, and local gateways into `RequestLimit`, `QuotaExhausted`, or `Overloaded` with time parsing and adaptive fallbacks. 6 unit tests passing. |
+| T13.2 | done | Integrate backoff auto-pause and auto-resume into Writer and Critic | `execute_writer_task`, `execute_critic_review`, and `run_agent_query` catch rate limit errors, log `task.rate_limit_backoff` events, sleep asynchronously without burning code help attempts, and retry automatically up to 5 times. |
+
+## R14 — Autonomous Decisions Artifact, Session Timings & Token Economy
+**Status:** complete. Automatic `TALOS_SUMMARY.md` generation, session duration metrics, and token economy context truncation implemented.
+
+| ID | Status | Task | Exit criteria |
+|---|---|---|---|
+| T14.1 | done | Generate Deliverable Summary Artifact (`TALOS_SUMMARY.md`) | `src/summary.rs` generates structured Markdown summarizing session timings, autonomous architectural decisions, verified checks, and modified files upon successful completion. |
+| T14.2 | done | Session timings and execution metrics | Tracks task start timestamp, total duration, active execution time, and pause intervals across Team and Pair orchestration modes. |
+| T14.3 | done | Token economy context truncation | Large diagnostic error texts truncated to 4096 bytes preserving head and tail context (`truncate_for_token_economy`), protecting agent context windows. 2 unit tests passing. |
+
 ## Required end-to-end scenarios from the original request
 
 First launch/repeat `up`; Writer/Critic success and justified rejection; child task; independent parallel work; adding a task while work is running; manual takeover; CLI recovery; orchestrator crash; SSH disconnect/reconnect; Linux reboot autostart; PR without merge; duplicate-execution prevention; and rechecking original acceptance criteria before closeout. Keep separate evidence for each scenario; do not combine them into a misleading test.
