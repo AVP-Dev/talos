@@ -3057,14 +3057,7 @@ fn recover_writer_attempts(json_output: bool, database: &mut Database) -> Result
         bail!("TALOS lost its supervisor lease during Writer recovery");
     }
     let quarantined_count = quarantine_result?;
-    let unresolved_attempts = database
-        .writer_attempts(None)?
-        .into_iter()
-        .filter(|attempt| {
-            matches!(attempt.state.as_str(), "launching" | "running")
-                || (attempt.state == "unknown" && attempt.operator_resolution.is_none())
-        })
-        .collect::<Vec<_>>();
+    let unresolved_attempts = database.unresolved_writer_attempts()?;
     let process_identity_checks = unresolved_attempts
         .iter()
         .map(|attempt| {
