@@ -292,6 +292,12 @@ pub struct VerificationEvidenceRecord {
     pub checks: Vec<CheckExecution>,
 }
 
+#[derive(Clone, Debug, Serialize)]
+pub struct LatestVerificationSummary {
+    pub run: VerificationRunRecord,
+    pub check_count: usize,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct ProjectControlState {
     pub queue_paused: bool,
@@ -1647,26 +1653,37 @@ impl Database {
              WHERE edges.task_id = ?1 ORDER BY edges.depends_on_task_id",
         )?;
         statement
-            .query_map([task_id], |row| {
-                let status: String = row.get(2)?;
-                Ok(TaskDependencyRecord {
-                    task_id: row.get(0)?,
-                    prerequisite_task_id: row.get(1)?,
-                    prerequisite_status: parse_task_status(&status).ok_or_else(|| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            2,
-                            rusqlite::types::Type::Text,
-                            Box::new(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("Unknown task status in database: {status}"),
-                            )),
-                        )
-                    })?,
-                    prerequisite_integration_state: row.get(3)?,
-                })
-            })?
+            .query_map([task_id], map_task_dependency_record)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("Cannot list task dependencies")
+    }
+
+    pub fn task_dependency_summary(
+        &self,
+        task_id: i64,
+        limit: usize,
+    ) -> Result<(usize, Vec<TaskDependencyRecord>)> {
+        let limit = i64::try_from(limit).context("Dependency summary limit is out of range")?;
+        let dependency_count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM task_dependencies WHERE task_id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        let dependency_count = usize::try_from(dependency_count)
+            .context("Dependency count is outside the supported range")?;
+        let mut statement = self.connection.prepare(
+            "SELECT edges.task_id, edges.depends_on_task_id, tasks.status, integrations.state
+             FROM task_dependencies AS edges
+             JOIN tasks ON tasks.id = edges.depends_on_task_id
+             LEFT JOIN task_worktree_integrations AS integrations
+               ON integrations.task_id = tasks.id
+             WHERE edges.task_id = ?1 ORDER BY edges.depends_on_task_id LIMIT ?2",
+        )?;
+        let dependencies = statement
+            .query_map(params![task_id, limit], map_task_dependency_record)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("Cannot summarize task dependencies")?;
+        Ok((dependency_count, dependencies))
     }
 
     pub fn runnable_queued_tasks(&self) -> Result<Vec<TaskRecord>> {
@@ -1904,28 +1921,21 @@ impl Database {
              FROM tasks ORDER BY id",
         )?;
         let records = statement
-            .query_map([], |row| {
-                let status: String = row.get(3)?;
-                Ok(TaskRecord {
-                    id: row.get(0)?,
-                    title: row.get(1)?,
-                    acceptance_criteria: row.get(2)?,
-                    status: parse_task_status(&status).ok_or_else(|| {
-                        rusqlite::Error::FromSqlConversionFailure(
-                            3,
-                            rusqlite::types::Type::Text,
-                            Box::new(std::io::Error::new(
-                                std::io::ErrorKind::InvalidData,
-                                format!("Unknown task status in database: {status}"),
-                            )),
-                        )
-                    })?,
-                    created_at_ms: row.get(4)?,
-                    updated_at_ms: row.get(5)?,
-                })
-            })?
+            .query_map([], map_task_record)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(records)
+    }
+
+    pub fn get_task(&self, task_id: i64) -> Result<Option<TaskRecord>> {
+        self.connection
+            .query_row(
+                "SELECT id, title, acceptance_criteria, status, created_at_ms, updated_at_ms
+                 FROM tasks WHERE id = ?1",
+                [task_id],
+                map_task_record,
+            )
+            .optional()
+            .context("Cannot read task")
     }
 
     pub fn task_events(&self, task_id: Option<i64>) -> Result<Vec<TaskEvent>> {
@@ -2310,6 +2320,33 @@ impl Database {
             });
         }
         Ok(history)
+    }
+
+    pub fn latest_verification_summary(
+        &self,
+        task_id: i64,
+    ) -> Result<Option<LatestVerificationSummary>> {
+        let run = self
+            .connection
+            .query_row(
+                "SELECT id, task_id, critic_review_id, status, revision_id, started_at_ms,
+                        finished_at_ms
+                 FROM verification_runs WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+                [task_id],
+                map_verification_run_record,
+            )
+            .optional()?;
+        let Some(run) = run else {
+            return Ok(None);
+        };
+        let check_count: i64 = self.connection.query_row(
+            "SELECT COUNT(*) FROM verification_results WHERE run_id = ?1",
+            [run.id],
+            |row| row.get(0),
+        )?;
+        let check_count = usize::try_from(check_count)
+            .context("Verification check count is outside the supported range")?;
+        Ok(Some(LatestVerificationSummary { run, check_count }))
     }
 
     pub fn begin_writer_attempt(
@@ -3315,6 +3352,21 @@ impl Database {
             .query_map([task_id], map_writer_attempt_record)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(attempts)
+    }
+
+    pub fn latest_writer_attempt(&self, task_id: i64) -> Result<Option<WriterAttemptRecord>> {
+        self.connection
+            .query_row(
+                "SELECT id, task_id, state, process_id, started_at_ms, finished_at_ms,
+                        prompt_sha256, conversation_id, exit_code, agent_status, error_code,
+                        operator_resolution, resolved_at_ms, resolution_reason, source_attempt_id,
+                        base_revision, source_review_id, process_identity_fingerprint
+                 FROM writer_attempts WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+                [task_id],
+                map_writer_attempt_record,
+            )
+            .optional()
+            .context("Cannot read latest Writer attempt")
     }
 
     pub fn latest_critic_review(&self, task_id: i64) -> Result<Option<CriticReviewRecord>> {
@@ -4793,6 +4845,58 @@ fn is_continuable_attempt(attempt: &WriterAttemptRecord) -> bool {
             .conversation_id
             .as_deref()
             .is_some_and(|conversation_id| validate_public_conversation_id(conversation_id).is_ok())
+}
+
+fn map_task_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
+    let status: String = row.get(3)?;
+    Ok(TaskRecord {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        acceptance_criteria: row.get(2)?,
+        status: parse_task_status(&status).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                3,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Unknown task status in database: {status}"),
+                )),
+            )
+        })?,
+        created_at_ms: row.get(4)?,
+        updated_at_ms: row.get(5)?,
+    })
+}
+
+fn map_task_dependency_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskDependencyRecord> {
+    let status: String = row.get(2)?;
+    Ok(TaskDependencyRecord {
+        task_id: row.get(0)?,
+        prerequisite_task_id: row.get(1)?,
+        prerequisite_status: parse_task_status(&status).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Unknown task status in database: {status}"),
+                )),
+            )
+        })?,
+        prerequisite_integration_state: row.get(3)?,
+    })
+}
+
+fn map_verification_run_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<VerificationRunRecord> {
+    Ok(VerificationRunRecord {
+        id: row.get(0)?,
+        task_id: row.get(1)?,
+        critic_review_id: row.get(2)?,
+        status: row.get(3)?,
+        revision_id: row.get(4)?,
+        started_at_ms: row.get(5)?,
+        finished_at_ms: row.get(6)?,
+    })
 }
 
 fn map_writer_attempt_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<WriterAttemptRecord> {

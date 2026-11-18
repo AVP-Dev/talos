@@ -360,6 +360,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
+            TaskCommand::Handoff { task_id } => {
+                print_task_handoff(cli.json, &database, task_id)?;
+            }
             TaskCommand::ChildReport { task_id } => {
                 print_child_task_report(cli.json, &database, task_id)?;
             }
@@ -2124,6 +2127,195 @@ fn print_child_task_report(json_output: bool, database: &Database, task_id: i64)
         );
     }
     Ok(())
+}
+
+fn print_task_handoff(json_output: bool, database: &Database, task_id: i64) -> Result<()> {
+    const MAX_DEPENDENCIES: usize = 32;
+
+    let task = database
+        .get_task(task_id)?
+        .with_context(|| format!("Task #{task_id} does not exist"))?;
+    let (title, title_truncated) = bounded_handoff_text(&task.title);
+    let (acceptance_criteria, criteria_truncated) = bounded_handoff_text(&task.acceptance_criteria);
+
+    let attempt = database.latest_writer_attempt(task_id)?;
+    let latest_attempt = attempt.as_ref().map(|attempt| {
+        json!({
+            "attempt_id": attempt.id,
+            "state": attempt.state,
+            "error_code": attempt.error_code,
+            "exit_code": attempt.exit_code,
+            "base_revision": attempt.base_revision,
+            "source_review_id": attempt.source_review_id,
+            "operator_resolution": attempt.operator_resolution,
+        })
+    });
+    let review = database.latest_critic_review(task_id)?;
+    let latest_review = review.as_ref().map(|review| {
+        let (summary, summary_truncated) = bounded_handoff_text(&review.summary);
+        json!({
+            "review_id": review.id,
+            "writer_attempt_id": review.writer_attempt_id,
+            "decision": review.decision,
+            "summary": summary,
+            "summary_truncated": summary_truncated,
+            "revision_id": review.revision_id,
+        })
+    });
+    let verification = database.latest_verification_summary(task_id)?;
+    let latest_verification = verification.as_ref().map(|evidence| {
+        json!({
+            "run_id": evidence.run.id,
+            "critic_review_id": evidence.run.critic_review_id,
+            "status": evidence.run.status,
+            "revision_id": evidence.run.revision_id,
+            "check_count": evidence.check_count,
+        })
+    });
+    let (dependency_count, dependencies) =
+        database.task_dependency_summary(task_id, MAX_DEPENDENCIES)?;
+    let worktree = database.task_worktree(task_id)?;
+    let integration = database.task_worktree_integration(task_id)?;
+    let integration_state = integration.as_ref().map(|record| record.state.as_str());
+    let worktree_is_active = worktree.as_ref().is_some_and(|record| {
+        record.state.as_str() == "active" && record.writer_routed_at_ms.is_some()
+    });
+    let latest_verification_status = verification
+        .as_ref()
+        .map(|evidence| evidence.run.status.as_str());
+    let next_action = task_handoff_next_action(
+        task_id,
+        task.status.as_str(),
+        worktree_is_active,
+        integration_state,
+        latest_verification_status,
+    );
+    let worktree_summary = worktree.as_ref().map(|record| {
+        json!({
+            "state": record.state.as_str(),
+            "branch": record.branch_name,
+            "base_commit": record.base_commit,
+            "integration_state": integration_state,
+            "integration_commit": integration.as_ref().and_then(|entry| entry.integration_commit.as_deref()),
+        })
+    });
+    let report = json!({
+        "schema_version": "talos-task-handoff-v1",
+        "task": {
+            "task_id": task.id,
+            "title": title,
+            "title_truncated": title_truncated,
+            "status": task.status.as_str(),
+            "acceptance_criteria": acceptance_criteria,
+            "acceptance_criteria_truncated": criteria_truncated,
+            "updated_at_ms": task.updated_at_ms,
+        },
+        "recommended_next_action": next_action,
+        "latest_writer_attempt": latest_attempt,
+        "latest_critic_review": latest_review,
+        "latest_verification": latest_verification,
+        "dependencies": dependencies,
+        "dependency_count": dependency_count,
+        "dependencies_truncated": dependency_count > MAX_DEPENDENCIES,
+        "worktree": worktree_summary,
+        "limits": [
+            "This report is read-only and summarizes recorded state at generation time.",
+            "It does not prove continuity of an interactive CLI session or authorize an action.",
+            "Prompts, patches, transcripts, raw command output, and the current Git diff are not included.",
+            "Inspect the current working tree before a Writer action or retry.",
+        ],
+    });
+
+    if json_output {
+        print_json(&report)?;
+    } else {
+        println!(
+            "Task #{} handoff packet ({}, read-only).",
+            task_id,
+            task.status.as_str()
+        );
+        println!("Title: {title}");
+        println!("Acceptance criteria: {acceptance_criteria}");
+        println!("Recommended next action: {next_action}");
+        if let Some(attempt) = attempt.as_ref() {
+            println!("Latest Writer attempt: #{} {}.", attempt.id, attempt.state);
+        }
+        if let Some(review) = review.as_ref() {
+            let (summary, truncated) = bounded_handoff_text(&review.summary);
+            println!(
+                "Latest Critic review: #{} {} — {}{}",
+                review.id,
+                review.decision,
+                summary,
+                if truncated { " [truncated]" } else { "" }
+            );
+        }
+        if let Some(evidence) = verification.as_ref() {
+            println!(
+                "Latest verification: #{} {} ({} check(s)).",
+                evidence.run.id, evidence.run.status, evidence.check_count
+            );
+        }
+        if dependency_count > MAX_DEPENDENCIES {
+            println!(
+                "Dependencies: showing {MAX_DEPENDENCIES} of {dependency_count}; request `talos task dependencies {task_id}` for the full list."
+            );
+        }
+        println!(
+            "No prompts, patches, transcripts, raw command output, or current Git diff are included."
+        );
+    }
+    Ok(())
+}
+
+fn bounded_handoff_text(value: &str) -> (String, bool) {
+    const MAX_BYTES: usize = 4 * 1024;
+    const SUFFIX: &str = " [truncated]";
+    let redacted = redact_sensitive(value);
+    if redacted.len() <= MAX_BYTES {
+        return (redacted, false);
+    }
+    let mut end = MAX_BYTES.saturating_sub(SUFFIX.len()).min(redacted.len());
+    while !redacted.is_char_boundary(end) {
+        end -= 1;
+    }
+    (format!("{}{SUFFIX}", &redacted[..end]), true)
+}
+
+fn task_handoff_next_action(
+    task_id: i64,
+    task_status: &str,
+    has_worktree: bool,
+    integration_state: Option<&str>,
+    verification_status: Option<&str>,
+) -> String {
+    match task_status {
+        "queued" => format!(
+            "Inspect current Git changes and prerequisites with `talos task dependencies {task_id}`; run `talos task run {task_id}` only after both are clear."
+        ),
+        "implementing" => format!(
+            "Inspect the latest Writer outcome and project changes before another `talos task run {task_id}`."
+        ),
+        "reviewing" if has_worktree && integration_state.is_none() => format!(
+            "Integrate the managed worktree with `talos task worktree integrate {task_id}`, then review the integrated revision."
+        ),
+        "reviewing" if integration_state == Some("needs_attention") => {
+            "Inspect the recorded worktree integration mismatch before continuing.".to_owned()
+        }
+        "reviewing" => format!("Review the latest revision with `talos task review {task_id}`."),
+        "verifying"
+            if has_worktree
+                && integration_state == Some("pending")
+                && verification_status == Some("pass") =>
+        {
+            format!("Commit the verified primary-tree changes, then run `talos task worktree finalize {task_id}`.")
+        }
+        "verifying" => format!("Run the saved project checks with `talos task verify {task_id}`."),
+        "complete" => "No further task action is required.".to_owned(),
+        "planning" => "Inspect the task and its history to choose the next explicit action.".to_owned(),
+        "blocked" | "failed" => "Inspect `talos logs --project` and `talos status`; use `talos task recover` only when a Writer attempt was interrupted.".to_owned(),
+        _ => "Inspect the task status and history before taking an action.".to_owned(),
+    }
 }
 
 async fn run_task_verification(

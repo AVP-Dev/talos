@@ -15,8 +15,10 @@ cargo install --locked --path .
 Update from the checkout with:
 
 ```sh
-cargo install --locked --path . --force
+cargo install --locked --path .
 ```
+
+Installing from `--path` rebuilds and installs the local package. `--force` is available if Cargo reports a conflicting binary from another package.
 
 Remove the installed binary with:
 
@@ -24,7 +26,7 @@ Remove the installed binary with:
 cargo uninstall talos
 ```
 
-These commands manage Cargo's executable installation root. They do not remove project-local `.talos/` databases or backups. Cargo's root defaults to `$CARGO_HOME` or `$HOME/.cargo`; `--root` can select another install location. See the official [Cargo install](https://doc.rust-lang.org/cargo/commands/cargo-install.html) and [Cargo uninstall](https://doc.rust-lang.org/cargo/commands/cargo-uninstall.html) references.
+These commands manage Cargo's executable installation root. They do not remove project-local `.talos/` databases or backups. Cargo chooses the root from `--root`, `CARGO_INSTALL_ROOT`, Cargo configuration, `CARGO_HOME`, or `$HOME/.cargo`, in that order. Use the same root option when uninstalling a custom-root install. See the official [Cargo install](https://doc.rust-lang.org/cargo/commands/cargo-install.html) and [Cargo uninstall](https://doc.rust-lang.org/cargo/commands/cargo-uninstall.html) references.
 
 On macOS, `scripts/package-macos.sh` builds the native ARM64 artifact by default. Pass `x86_64-apple-darwin` to build for Intel when that target is installed. The script requires a clean committed worktree and writes the binary, README, build manifest, and SHA-256 checksums under the ignored `dist/` directory. It records the compiler and lockfile digest so another build can be compared. Byte-for-byte reproducibility has not yet been verified. The current artifact is unsigned and not notarized; it is a local build output, not a ready-to-publish macOS distribution.
 
@@ -60,6 +62,14 @@ Use `talos task recover` to quarantine interrupted attempts. Recovery reports `u
 
 `talos attach` creates or reconnects to a project-scoped tmux shell. After an SSH disconnect, reconnect to the host and run `talos attach` again. The complete macOS SSH reconnect scenario is not yet accepted. Linux reboot and optional systemd user autostart remain deferred to server validation.
 
+If an interactive CLI cannot resume the same conversation in headless mode, create a fresh-context packet from durable task records with:
+
+```sh
+talos --json task handoff 1
+```
+
+The packet is generated on demand and does not write a second history record. It omits prompts, patches, transcripts, raw command output, and the current Git diff. Inspect the working tree before a Writer action or retry. It is a new context summary; it does not establish interactive session continuity.
+
 ## Git worktrees
 
 Task worktrees are separate checkouts, not OS sandboxes. TALOS preserves a worktree that contains changes. Integration stages the exact recorded patch in the primary checkout, then requires a Critic review and project checks. The user creates the final commit and runs `task worktree finalize`; TALOS does not create that commit. Review `git status` and the patch before removing or cleaning any worktree.
@@ -86,4 +96,4 @@ No GitHub auth check, push, PR, or CI request has been performed from this works
 
 ## Current verification limits
 
-The current R8/R9 code changes were checked with formatting, Clippy, and `cargo check`; automated tests and Linux-native checks were not run in this session. The exact current status and next action are in [`docs/state.md`](state.md), and scenario evidence is tracked in [`docs/acceptance-scenarios.md`](acceptance-scenarios.md).
+Earlier R8/R9 code changes passed formatting, Clippy, and `cargo check`. The task-handoff changes pass `cargo fmt --all` and `cargo check --locked --all-features --lib --bin talos` on macOS. Their behavior tests were not run. Automated tests and Linux-native checks remain pending under the current development direction. The exact current status and next action are in [`docs/state.md`](state.md), and scenario evidence is tracked in [`docs/acceptance-scenarios.md`](acceptance-scenarios.md).

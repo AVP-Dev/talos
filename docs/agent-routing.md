@@ -37,3 +37,5 @@ If a CLI cannot resume its recorded session, reconstruct only from durable facts
 5. Exact next action and its permission boundary.
 
 Do not claim that this packet resumes model conversation history; it starts a new agent session from a checked project snapshot.
+
+`talos task handoff <ID>` supplies a compact subset of saved task facts. It omits the current Git diff and CLI conversation, so inspect the working tree and relevant source files before any Writer action or retry.

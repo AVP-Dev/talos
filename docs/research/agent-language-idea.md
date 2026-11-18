@@ -8,7 +8,7 @@ Would any parts of controlled technical language or typed exchange contracts imp
 
 Candidate areas to examine:
 
-- Typed JSON contracts for task handoffs, Critic findings, and session summaries.
+- Broader typed JSON contracts for Writer/Critic exchanges and reports. T6.6 now provides one versioned task context packet; this does not settle whether broader contracts help.
 - Stable terms for roles, decisions, states, and authority boundaries.
 - Optional checks for concise, direct text in selected machine-facing fields.
 - Compact handoffs that reduce repeated context and token use.

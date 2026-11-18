@@ -20,7 +20,7 @@ pub struct Cli {
 pub enum Command {
     /// Inspect readiness without starting an agent or worker.
     Up(UpArgs),
-    /// Create or list durable development tasks.
+    /// Manage and inspect durable development tasks.
     Task(TaskArgs),
     /// Show project and queue state.
     Status,
@@ -205,6 +205,11 @@ pub enum TaskCommand {
     Children {
         /// ID of the parent task.
         parent_task_id: i64,
+    },
+    /// Print a compact, read-only context packet for continuing a task in a new session.
+    Handoff {
+        /// ID of the task to summarize.
+        task_id: i64,
     },
     /// Print the compact, versioned result report for a child task.
     ChildReport {

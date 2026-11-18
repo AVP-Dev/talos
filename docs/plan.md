@@ -8,7 +8,7 @@ TALOS is a local CLI-first orchestrator that enables multiple AI coding CLIs to 
 
 The system detects the project, stores its queue and context locally, launches suitable CLIs through their public interfaces, assigns a Writer and an independent Critic, verifies code and acceptance criteria, and recovers after terminal, SSH, or process loss. The goal is a practical executable, not an architecture experiment.
 
-macOS is the current verified development and runtime platform. Keep shared code portable and implement Linux-specific paths as their planned tasks are reached. If Linux-target compilation, runtime, or Agy sandbox checks require cumbersome setup on macOS, defer those checks to the user's Linux server under T6.5/T9.3. Do not add a Docker/VM requirement or claim verified Linux support before the server acceptance passes. Linux validation is not an R3 acceptance dependency.
+macOS is the current verified development and runtime platform. Linux process identity code is implemented under T6.5; continue any remaining Linux-specific runtime and packaging work in plan order. If Linux-target compilation, runtime, or Agy sandbox checks require cumbersome setup on macOS, defer those checks to the user's server under T6.5/T9.3. Do not add a Docker/VM requirement or claim verified Linux support before server acceptance passes. Linux validation is not an R3 acceptance dependency.
 
 ## 2. Design principles and boundaries
 
@@ -20,7 +20,7 @@ macOS is the current verified development and runtime platform. Keep shared code
 - **No false evidence:** CLI help, a successful model response, a mock, or an agent's claim alone does not prove session continuity or task completion.
 - **Bounded autonomy:** Auto skips repeated prompts for routine, explicitly permitted in-project work. It does not disable CLI controls, grant unrestricted access, allow production operations, or merge automatically.
 - **English-only system:** all code, prompts, CLI output, logs, reports, examples, and documentation are in English.
-- **Development and platform support:** macOS is the current verified platform. Linux-specific implementation is in scope; do not claim verified Linux support until the Linux build/runtime/sandbox acceptance in T6.5 and T9.3 passes.
+- **Development and platform support:** macOS is the current verified platform. Linux process identity code is implemented, but native Linux build/runtime/sandbox acceptance remains open under T6.5 and T9.3.
 
 ## 3. Proposed architecture
 
@@ -85,8 +85,8 @@ Each round ends with a usable, verifiable result, an updated backlog, and a sess
 | R3 | One autonomous Writer | One verified adapter completes one safe local task per explicit `up --auto` invocation from a clean temporary Git project. Complete for the initial macOS target. |
 | R4 | Independent Critic | Read-only review, real blocker finding, denied write probe, linked Writer fix, immutable review history, and per-project role selection. Complete for verified macOS Antigravity 1.5.10. |
 | R5 | Verification and permissions | Configured checks, exact Git facts, Auto/Semi policy, redaction, and evidence-gated completion. Complete on macOS; see R5 acceptance below. |
-| R6 | Persistent runtime and recovery | In progress: T6.1 adds a project-scoped tmux control shell; T6.2 adds durable pause/resume and manual-change reconciliation; T6.3 adds cooperative stop and safer recovery; T6.4 SSH reconnect and T6.5 Linux identity/server acceptance remain open. R6.3 behavior/profile verification is pending. |
-| R7 | Decomposition and parallel work | In progress: T7.1 dependency scheduling and T7.2 child-task contracts are implemented with behavior checks pending; T7.3 capability reporting is implemented but native delegation remains unverified; T7.4 adds explicit task worktree lifecycle management; T7.5 adds Writer routing and evidence-gated integration. Behavior and migration acceptance remain open. |
+| R6 | Persistent runtime and recovery | In progress: T6.1 adds a project-scoped tmux control shell; T6.2 adds durable pause/resume and manual-change reconciliation; T6.3 adds cooperative stop and safer recovery; T6.6 adds a bounded new-context packet. Process/recovery and macOS SSH behavior acceptance remain open. T6.5 Linux implementation exists; native server acceptance is deferred until access is available. |
+| R7 | Decomposition and parallel work | T7.1–T7.5 implementation is in place: dependency scheduling, bounded child contracts, capability reporting, explicit worktree lifecycle, and evidence-gated integration. Migration and behavior acceptance remain open; native delegation stays disabled and the three-agent scenario is unverified. |
 | R8 | GitHub workflow | In progress: T8.1 adds local `gh` capability reporting and an explicitly requested aggregate auth check. T8.2 implements policy-gated exact branch push, durable reconciliation, and draft PR creation. T8.3 records commit-bound CI snapshots with bounded polling. Remote behavior awaits the user's repository. No automatic merge. |
 | R9 | Hardening and release | In progress: T9.1 scenario inventory, T9.3 macOS install/package preparation, T9.4 operator documentation, and T9.5 macOS artifact packaging are underway. Runtime scenarios, install acceptance, reproducibility, and Linux server gates remain open. |
 
@@ -161,6 +161,8 @@ Use tmux for persistent sessions with a visible status and a user control shell.
 
 **T6.5 implementation (in progress):** schema v9 stores a Linux process identity fingerprint captured at Writer launch from `/proc/<pid>/stat` plus the boot ID. `task recover` reports whether the current identity matches the saved one, differs, is unavailable, or was not recorded. This comparison is lifecycle evidence only; it never signals a process, infers a Writer outcome, or authorizes resolution or retry. Linux-native build/runtime/sandbox acceptance remains deferred until server access is available; macOS identity remains unavailable and fail-closed.
 
+**T6.6 implementation (in progress):** `task handoff <ID>` emits a read-only, versioned context packet from existing task, Writer, Critic, verification, dependency, and worktree rows. Free-text fields are redacted and capped; prompts, patches, transcripts, raw output, current Git diff, and duplicate stored reports are omitted. The operator must inspect the working tree before a Writer action or retry. The report recommends a next explicit command but neither authorizes it nor proves an interactive conversation can resume headlessly. The live TUI→headless probe remains pending because the workspace-trust prompt was declined during the original spike.
+
 **Exit criteria:** state survives SSH loss and is visible on reattach; repeated `up` creates no duplicate workers or panes; ambiguous attempts stop in a safe recoverable state.
 
 ### R7 — Parallel development
@@ -223,4 +225,4 @@ Implementation details may change based on experiments. Preserve invariants and 
 
 ## 8. Current continuation point
 
-R3–R5 are closed. T6 and T7 code are implemented in part, with behavior and platform acceptance gates recorded in `docs/state.md`. R8 code is implemented locally: T8.1–T8.3 acceptance awaits the user's repository, and T8.4 keeps merge/deletion manual. Continue R9.3 install lifecycle preparation and R9.4 documentation audit without creating a repository, adding a remote, or invoking GitHub. Linux-native checks and artifacts remain deferred until server acceptance.
+R3–R5 are closed. T6 and T7 implementation is in place in part; behavior, migration, and platform acceptance gates remain in `docs/state.md`. R8 code is implemented locally: T8.1–T8.3 acceptance awaits the user's repository, and T8.4 keeps merge/deletion manual. Continue the remaining R9 documentation and install/package preparation. Do not create a repository, add a remote, or invoke GitHub. Linux-native checks and artifacts remain deferred until server access is available.

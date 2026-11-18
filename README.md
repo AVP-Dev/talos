@@ -2,7 +2,7 @@
 
 TALOS is a Rust CLI-first orchestrator for local AI coding CLIs. It stores tasks, Writer attempts, and events in a durable local SQLite database, supervises one verified Antigravity Writer at a time, and preserves ambiguous work for operator review.
 
-> **Current status:** R6 remains in progress: macOS SSH reconnect, process-recovery behavior, interactive handoff, and Linux server acceptance are open. R7.1–R7.5 implementation is in progress; behavior and migration acceptance remain open. Native Agy subagent delegation remains disabled until its public invocation interface and configured roster pass a live probe. R8.1 diagnostics, R8.2 policy-gated publication, and R8.3 commit-bound CI evidence are implemented locally; behavior acceptance and a user-provided GitHub repository remain pending. R9 has an end-to-end acceptance inventory, operator runbook, and one ARM64 macOS artifact; scenario execution, install lifecycle, and reproducibility checks remain open. No GitHub auth or remote operation has been invoked. Linux-specific checks wait for the user's server; Linux support remains unverified. No Docker or VM is required. Antigravity 1.5.10 is the only Writer- and Critic-verified adapter. Critic approval moves a task to `verifying`; managed-worktree tasks also require explicit integration, post-integration checks, a user-created commit, and finalization. `up --auto` runs at most one task per explicit call. `up --semi` prompts before a Writer launch and requires an interactive terminal.
+> **Current status:** R6.3 and R6.5 code is implemented; process-recovery, macOS SSH reconnect, and Linux server acceptance remain open. T6.6 adds a read-only task context packet, while interactive TUI-to-headless continuity remains unverified. R7.1–R7.5 code is implemented; migration, behavior, and three-agent acceptance remain open. Native Agy subagent delegation stays disabled until its public invocation interface and configured roster pass a live probe. R8.1 diagnostics, R8.2 policy-gated publication, and R8.3 commit-bound CI evidence are implemented locally; behavior acceptance and a user-provided GitHub repository remain pending. R9 has an end-to-end acceptance inventory, operator runbook, and one ARM64 macOS artifact; scenario execution, install lifecycle, and reproducibility checks remain open. No GitHub authentication or remote operation has been invoked. Linux-specific checks wait for the user's server; Linux support remains unverified. No Docker or VM is required. Antigravity 1.5.10 is the only Writer- and Critic-verified adapter. Critic approval moves a task to `verifying`; managed-worktree tasks also require explicit integration, post-integration checks, a user-created commit, and finalization. `up --auto` runs at most one task per explicit call. `up --semi` prompts before a Writer launch and requires an interactive terminal.
 
 ## Start here
 
@@ -25,6 +25,7 @@ talos task dependencies 12
 talos task child 12 "Add parser support" --criteria "Parser handles the documented format" --allow src/parser.rs --timeout-seconds 900
 talos task children 12
 talos task child-report 13
+talos task handoff 13
 talos task worktree create 13
 talos task run 13
 talos task worktree integrate 13
@@ -56,6 +57,8 @@ talos task review <ID>
 Tasks can be linked into a directed acyclic graph. `task depends <TASK> --on <PREREQUISITE>` adds an append-only edge; self-dependencies and cycles are refused. Explicit runs and Auto both wait until all prerequisites have status `complete`. Use `task dependencies <TASK>` to inspect prerequisite states.
 
 `task child <PARENT> <TITLE> --criteria ... --allow <PATH>` creates a bounded child contract with up to 64 project-relative paths and a Writer timeout of 1–1800 seconds. The parent automatically waits for each child to complete. TALOS includes the path scope in the Writer and Critic inputs and deterministically blocks Critic approval if the child diff changes an out-of-scope path. This is a review gate, not an OS sandbox. `task child-report <ID>` returns the compact `talos-child-task-report-v1` shape from existing task, review, and verification rows; TALOS does not store a second copy of the report or a full Writer transcript.
+
+`task handoff <ID>` prints a read-only `talos-task-handoff-v1` context packet derived from current task, Writer, Critic, verification, dependency, and worktree records. It bounds and redacts free-text fields and omits prompts, patches, transcripts, raw command output, and the current Git diff. Inspect the working tree before a Writer action or retry. The packet recommends a next explicit command from recorded state; it does not launch an agent, authorize that action, or prove that an interactive CLI session can resume in headless mode. It is a compact new-context fallback when session continuity is unavailable.
 
 `talos doctor` reports native subagent invocation as advertised only when the installed CLI help exposes its public invocation tool. Otherwise the capability remains untested and native delegation stays disabled until the configured agent roster and a harmless invocation are verified. Manual child tasks remain available.
 
@@ -143,9 +146,16 @@ Example check configuration:
 - [End-to-end acceptance scenarios](docs/acceptance-scenarios.md)
 - [Architecture](docs/architecture.md)
 - [Design manifest](docs/design-manifest.md)
+- [Project structure and ownership](docs/project-structure.md)
+- [Agent routing and session continuity](docs/agent-routing.md)
+- [Critic review contract](docs/critic-review-contract.md)
+- [Glossary](docs/glossary.md)
+- [Onboarding protocol](docs/onboarding-protocol.md)
 - [Decisions](docs/decisions.md)
 - [Starter Kit integration](docs/research/starter-kit.md)
 - [pair-mailbox assessment matrix](docs/research/pair-mailbox-assessment.md)
 - [CLI research and unverified limits](docs/research/cli-spike.md)
+- [Project history idea](docs/research/project-history-idea.md)
+- [Agent handoff idea](docs/research/agent-language-idea.md)
 
-TALOS targets Rust stable 1.94 or newer. macOS is the verified development and runtime platform. Implement Linux-specific paths as their planned tasks are reached; defer checks that need a Linux environment to the user's server. Do not describe Linux as verified before that acceptance passes. R5 added interactive Semi approval for Writer launch, automated project checks, and evidence-gated completion.
+TALOS targets Rust stable 1.94 or newer. macOS is the verified development and runtime platform. Linux process identity code is implemented; defer native Linux build, runtime, boot, sandbox, and packaging checks to the user's server. Do not describe Linux as verified before that acceptance passes. R5 added interactive Semi approval for Writer launch, automated project checks, and evidence-gated completion.

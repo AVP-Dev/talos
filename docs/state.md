@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R6–R9 implementation remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. R7.1–R7.5 code is implemented or in progress, with behavior/migration acceptance still open; native subagent delegation and three-agent acceptance remain unavailable until verified. T8.1 diagnostics, T8.2 publication, and T8.3 commit-bound CI snapshots are implemented locally; T8.4 keeps merge/deletion manual. T8.1–T8.3 command, migration, and remote acceptance remains pending. R9.1 has a 15-scenario evidence inventory; T9.2 hardening scenarios are documented; T9.3 macOS install/package preparation, T9.4 docs, and T9.5 packaging are in progress. No GitHub authentication or remote operation has been performed. Linux access, native checks, and Linux artifacts are deferred to the user's server. Backlog: 41/61 scheduled tasks done (67.2%, unweighted), 16 in progress, 1 planned, and 3 deferred; two unscheduled ideas remain recorded separately.
+**R6–R9 implementation remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 live interactive handoff remain open; T6.6 now has a read-only context-packet fallback. R7.1–R7.5 code is implemented, with behavior/migration acceptance still open; native subagent delegation and three-agent acceptance remain unavailable until verified. T8.1 diagnostics, T8.2 publication, and T8.3 commit-bound CI snapshots are implemented locally; T8.4 keeps merge/deletion manual. T8.1–T8.3 command, migration, and remote acceptance remains pending. R9.1 has a 15-scenario evidence inventory; T9.2 hardening scenarios are documented; T9.4 documentation is complete; T9.3 install/package preparation and T9.5 artifact work remain in progress. No GitHub authentication or remote operation has been performed. Linux access, native checks, and Linux artifacts are deferred to the user's server. Backlog: 42/61 scheduled tasks done (68.9%, unweighted), 16 in progress, 0 planned, and 3 deferred; two unscheduled ideas remain recorded separately.
 
 ## Goal and fixed direction
 
@@ -336,10 +336,11 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - No database growth threshold or compaction/retention policy has been selected. Record actual size/memory measurements; keep archival and pruning decisions under F1 rather than claiming bounded long-term database size.
 - This is a test plan only. No long-running, fault-injection, or database-growth tests were run.
 
-## R9.4 progress — documentation alignment
+## R9.4 closure — documentation alignment
 
-- Updated `README.md`, `docs/architecture.md`, `docs/plan.md`, `docs/tasks.md`, `docs/decisions.md`, and this handoff to describe schema v16, T8.1–T8.4 behavior, the manual merge boundary, and live GitHub/Linux limitations.
-- Added the acceptance inventory to the README's project document links. A broader command/platform/verification audit is still in progress.
+- Reviewed README, roadmap/backlog/handoff, architecture, project structure, decisions, operator and agent-routing guides, Critic contract, and acceptance/verification documents against current commands and limits.
+- Corrected stale Cargo install-root guidance, `.talos/` ignore behavior, implemented-feature wording, and Linux scope. README now links the operator, architecture, handoff, onboarding, and research documents.
+- TALOS project artifacts remain English. GitHub remote actions and Linux acceptance remain explicitly pending.
 
 ## R9.3 progress — macOS installation preparation
 
@@ -355,9 +356,16 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - The macOS package script records the inputs needed to compare builds. One native ARM64 artifact now exists, but byte-for-byte reproducibility has not been checked. The binary was not run, and Cargo install/update/uninstall behavior was not exercised. Linux artifacts wait for T6.5/T9.3 acceptance.
 - Script syntax, formatting, Clippy, `cargo check`, and `git diff --check` passed. Automated tests and Linux-native checks were not run.
 
+## R6.6 progress — compact task handoff
+
+- Added `talos task handoff <ID>` as a read-only, generated `talos-task-handoff-v1` packet. It includes bounded task text, the latest Writer attempt, latest Critic summary, latest verification summary, up to 32 prerequisite rows, and the current managed-worktree integration state.
+- Added targeted database queries for one task, latest Writer attempt, latest verification summary, and a capped prerequisite summary. Handoff generation no longer loads the entire task list or full attempt/verification histories. Text values are redacted and capped at 4 KiB each. Prompts, patches, transcripts, raw check output, and the current Git diff are omitted; no report is persisted.
+- The packet recommends an explicit next command based on saved state. It does not launch a process, authorize an operation, or prove continuity of the interactive CLI conversation. The live TUI→headless probe remains pending because the workspace-trust decision has not been made.
+- Updated README, runbook, architecture, plan, task backlog, project structure, agent-routing guide, and ADR-038. `cargo fmt --all` and `cargo check --locked --all-features --lib --bin talos` passed on macOS. No tests were added or run, and no Linux host was contacted.
+
 ## Next action
 
-Commit the post-artifact T9.1/T9.2/T9.4 documentation updates locally. Then continue R9.4 documentation audit and R9.3 install lifecycle preparation. Keep tests, fault injection, install/uninstall acceptance, byte-for-byte reproducibility, and Linux-native acceptance pending. R8 implementation is locally complete; live CLI and remote acceptance remain pending. T8.2 commits are `efaaa75` and `8728ce4`; T8.3 is `877ae10`; T8.4 is `6c6ba78`; R9 prep is `9fafb4c`. Do not create a repository, add a remote, or invoke GitHub operations; the user will provide the repository later. R6/R7 behavior acceptance and native delegation gates remain open. Skip Linux connection/setup and defer Linux-native checks/artifacts until the server is available. Keep work local on `master`.
+Commit the T6.6 implementation and documentation locally, then regenerate the ARM64 macOS artifact from that commit so it includes `task handoff`. Continue the R9.4 docs audit and R9.3 packaging work in plan order. Keep behavior/migration tests, fault injection, install/uninstall acceptance, byte-for-byte reproducibility, GitHub live acceptance, and Linux-native acceptance pending. R8 code is locally implemented; live CLI and remote acceptance await a user-provided repository. T8.2 commits are `efaaa75` and `8728ce4`; T8.3 is `877ae10`; T8.4 is `6c6ba78`; previous macOS artifact prep is `9fafb4c`/`ea73675`. Do not create a repository, add a remote, or invoke GitHub operations. Skip Linux connection/setup and defer Linux-native checks/artifacts until the server is available. Keep all work local on `master`.
 
 ## Session close checklist
 

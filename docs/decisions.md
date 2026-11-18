@@ -300,3 +300,10 @@ No schema change for process identity is selected or implemented. The separate s
 - **Decision:** TALOS can open draft pull requests and record their CI evidence. It has no merge or remote-branch deletion command. `talos github policy` reports `manual_only` merge and `unsupported` remote branch deletion in both human and JSON output.
 - **Reason:** approval of code integration and cleanup stays with the user. A passing CI result is evidence, not authority to merge or remove remote refs.
 - **Consequence:** TALOS never calls `gh pr merge`, GitHub's merge API, or a remote branch deletion command. Users perform merge and cleanup through their chosen GitHub workflow after review.
+
+## ADR-038 — Generate task handoff packets from existing state
+
+- **Status:** implemented in T6.6; live interactive-session continuity remains unverified.
+- **Decision:** provide `talos task handoff <ID>` as a read-only, versioned new-context fallback. Generate it from current task, latest Writer, Critic, verification, dependency, and worktree rows. Cap and redact free-text fields, include only the latest attempt/review/verification summaries, and omit prompts, patches, transcripts, raw command output, and current Git diff. Do not persist a second report or transcript.
+- **Reason:** when a CLI cannot preserve one conversation across interactive and headless modes, a later session still needs a small, inspectable summary without copying the full prompt history or adding duplicate database rows.
+- **Consequence:** the packet recommends the next explicit CLI command from saved state but does not authorize the action, launch a process, or prove same-session continuity. The operator must inspect the working tree before a Writer action or retry. Its dependency list is capped; the report states when the cap omits rows. The TUI-to-headless acceptance probe remains pending until the workspace-trust decision is made.

@@ -60,7 +60,7 @@ Deterministic acceptance rules:
 - Findings are immutable historical records tied to one revision. A later fix and review create a new record; they do not edit or delete earlier findings.
 - A rejection moves the task back to `implementing`; a valid approval moves it to `verifying`. R5 completion requires separately recorded project-check evidence for this exact approved Git revision.
 
-## Planned command flow
+## Current command flow
 
 ```text
 task run <ID>       # first Writer attempt, from a clean Git worktree
