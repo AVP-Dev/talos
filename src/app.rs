@@ -21,7 +21,8 @@ use crate::{
     db::{
         Database, GithubCiCheckRecord, GithubCiSnapshotInput, GithubPublicationInput,
         GithubPublicationRecord, ProjectControlEvent, QueueSummary, ResumeProjectOutcome,
-        StopRequestOutcome, TaskEvent, TaskRecord, WriterResolutionAction, WriterResolutionRecord,
+        StopRequestOutcome, TaskEvent, TaskRecord, TaskSummaryRecord, WriterResolutionAction,
+        WriterResolutionRecord,
     },
     github::{self, GithubProbe},
     policy::{self, Action as PolicyAction, Authorization, ExecutionMode},
@@ -411,16 +412,35 @@ pub async fn run(cli: Cli) -> Result<()> {
                     print_task_worktree_integration(cli.json, "integrated", &integration)?;
                 }
             },
-            TaskCommand::List => {
-                let tasks = database.list_tasks()?;
+            TaskCommand::List { limit, after } => {
+                let page = database.task_list_page(after, limit)?;
                 if cli.json {
-                    print_json(&tasks)?;
-                } else if tasks.is_empty() {
-                    println!("No tasks in the queue.");
-                } else {
-                    for task in tasks {
-                        print_task(&task);
+                    print_json(&page)?;
+                } else if page.tasks.is_empty() {
+                    if after == 0 {
+                        println!("No tasks in the queue.");
+                    } else {
+                        println!("No tasks after ID {after}.");
                     }
+                } else {
+                    for task in &page.tasks {
+                        print_task_summary(task);
+                    }
+                    if let Some(next_after) = page.next_after {
+                        println!(
+                            "More tasks are available: `talos task list --after {next_after}`."
+                        );
+                    }
+                }
+            }
+            TaskCommand::Show { task_id } => {
+                let task = database
+                    .get_task(task_id)?
+                    .with_context(|| format!("Task #{task_id} does not exist"))?;
+                if cli.json {
+                    print_json(&task)?;
+                } else {
+                    print_task(&task);
                 }
             }
             TaskCommand::Run { task_id } => {
@@ -3235,6 +3255,15 @@ fn print_task(task: &TaskRecord) {
             redact_sensitive(&task.acceptance_criteria)
         );
     }
+}
+
+fn print_task_summary(task: &TaskSummaryRecord) {
+    println!(
+        "#{} [{}] {}",
+        task.id,
+        task.status.as_str(),
+        redact_sensitive(&task.title)
+    );
 }
 
 fn print_event(event: &TaskEvent) {

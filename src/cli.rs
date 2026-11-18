@@ -221,8 +221,20 @@ pub enum TaskCommand {
         #[command(subcommand)]
         command: TaskWorktreeCommand,
     },
-    /// List tasks in the local queue.
-    List,
+    /// List one bounded page of compact task summaries.
+    List {
+        /// Maximum tasks to print, from 1 through 100.
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+        /// Continue after this task ID (use the previous page's next_after value).
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+    },
+    /// Show one task, including its full acceptance criteria.
+    Show {
+        /// ID of the task to display.
+        task_id: i64,
+    },
     /// Run one queued task or a Critic-requested fix with the configured Writer.
     Run {
         /// ID of the queued task to execute.

@@ -42,6 +42,8 @@ talos logs --project
 talos resume
 ```
 
+`talos task list` returns 25 compact task summaries by default (maximum 100 per page) and omits acceptance criteria. In JSON, use `has_more` and `next_after` to request the next page with `talos task list --after <ID>`. Use `talos task show <ID>` when you need the full criteria for one task.
+
 `talos attach` creates or reconnects to one persistent tmux shell for the current project. It does not start a worker. Run the existing TALOS commands in that shell, or keep using them directly in the foreground when tmux is unavailable.
 
 `talos pause` durably blocks new Writer attempts and continuations while preserving queued tasks. It does not stop an already-running Writer. Before resuming, TALOS compares the saved Git snapshot with the current project. If the snapshot changed or could not be captured, inspect `git diff` and `git status`, then run `talos resume --reconcile`; tasks already awaiting verification return to Critic review. `talos logs --project` shows the append-only pause and reconciliation history.

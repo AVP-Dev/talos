@@ -21,6 +21,7 @@ const MAX_CHILD_TASK_ALLOWED_PATHS: usize = 64;
 const MAX_CHILD_TASK_SCOPE_BYTES: usize = 16 * 1024;
 const MIN_CHILD_TASK_TIMEOUT_MS: i64 = 1_000;
 const MAX_CHILD_TASK_TIMEOUT_MS: i64 = 30 * 60 * 1_000;
+const MAX_TASK_LIST_PAGE_SIZE: usize = 100;
 type FinalizeReviewRow = (i64, String, String, String, Option<String>, Option<String>);
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -59,6 +60,22 @@ pub struct TaskRecord {
     pub status: TaskStatus,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TaskSummaryRecord {
+    pub id: i64,
+    pub title: String,
+    pub status: TaskStatus,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TaskListPage {
+    pub tasks: Vec<TaskSummaryRecord>,
+    pub after: i64,
+    pub limit: usize,
+    pub has_more: bool,
+    pub next_after: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -1938,6 +1955,41 @@ impl Database {
             .query_map([], map_task_record)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(records)
+    }
+
+    pub fn task_list_page(&self, after: i64, limit: usize) -> Result<TaskListPage> {
+        if after < 0 || !(1..=MAX_TASK_LIST_PAGE_SIZE).contains(&limit) {
+            bail!("Task list requires a non-negative cursor and a limit from 1 to 100");
+        }
+        let query_limit = i64::try_from(
+            limit
+                .checked_add(1)
+                .context("Task list limit is out of range")?,
+        )
+        .context("Task list limit is out of range")?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, title, status FROM tasks
+             WHERE id > ?1 ORDER BY id LIMIT ?2",
+        )?;
+        let mut tasks = statement
+            .query_map(params![after, query_limit], map_task_summary_record)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = tasks.len() > limit;
+        if has_more {
+            tasks.pop();
+        }
+        let next_after = if has_more {
+            tasks.last().map(|task| task.id)
+        } else {
+            None
+        };
+        Ok(TaskListPage {
+            tasks,
+            after,
+            limit,
+            has_more,
+            next_after,
+        })
     }
 
     pub fn get_task(&self, task_id: i64) -> Result<Option<TaskRecord>> {
@@ -4919,6 +4971,24 @@ fn map_task_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskRecord> {
         })?,
         created_at_ms: row.get(4)?,
         updated_at_ms: row.get(5)?,
+    })
+}
+
+fn map_task_summary_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskSummaryRecord> {
+    let status: String = row.get(2)?;
+    Ok(TaskSummaryRecord {
+        id: row.get(0)?,
+        title: row.get(1)?,
+        status: parse_task_status(&status).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                2,
+                rusqlite::types::Type::Text,
+                Box::new(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("Unknown task status in database: {status}"),
+                )),
+            )
+        })?,
     })
 }
 
