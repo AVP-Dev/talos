@@ -1,6 +1,7 @@
 use std::{
+    io::Read,
     path::{Component, Path},
-    process::{Command, Output},
+    process::{Command, Output, Stdio},
 };
 
 use anyhow::{Context, Result, bail};
@@ -8,6 +9,9 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 const MAX_REVIEW_PATCH_BYTES: usize = 64 * 1024;
+const MAX_CHANGED_PATHS: usize = 4096;
+const MAX_CHANGED_PATH_BYTES: usize = 1024;
+const MAX_CHANGED_PATH_OUTPUT_BYTES: usize = MAX_CHANGED_PATHS * (MAX_CHANGED_PATH_BYTES + 1);
 const PROJECT_PATHS: [&str; 3] = [".", ":(exclude).git", ":(exclude).talos"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -32,11 +36,7 @@ pub struct RevisionFacts {
 /// Capture a Git base revision for a new Writer task. Existing changes are rejected so that
 /// the later Critic review can attribute the complete diff to TALOS's task lifecycle.
 pub fn clean_base_commit(project_root: &Path) -> Result<String> {
-    let status = git_output(
-        project_root,
-        &["status", "--porcelain=v1", "-z", "--untracked-files=all"],
-    )?;
-    if !status.stdout.is_empty() {
+    if !git_worktree_is_clean(project_root)? {
         bail!(
             "A new Writer task must start from a clean Git worktree so its review has an exact base revision"
         );
@@ -60,7 +60,7 @@ impl RevisionSnapshot {
     pub fn capture(project_root: &Path, base_commit: &str) -> Result<Self> {
         validate_commit_id(base_commit)?;
 
-        let mut patch = git_output(
+        let patch_output = git_output_limited(
             project_root,
             &[
                 "diff",
@@ -73,14 +73,19 @@ impl RevisionSnapshot {
                 PROJECT_PATHS[1],
                 PROJECT_PATHS[2],
             ],
-        )?
-        .stdout;
+            MAX_REVIEW_PATCH_BYTES,
+            "Review patch",
+        )?;
+        if !patch_output.status.success() {
+            bail!("Git could not produce the tracked review patch");
+        }
+        let mut patch = patch_output.stdout;
         if patch.len() > MAX_REVIEW_PATCH_BYTES {
             bail!(
                 "Review patch exceeds the {MAX_REVIEW_PATCH_BYTES}-byte limit; TALOS will not truncate it"
             );
         }
-        let tracked_paths = git_output(
+        let tracked_paths_output = git_output_limited(
             project_root,
             &[
                 "diff",
@@ -94,11 +99,16 @@ impl RevisionSnapshot {
                 PROJECT_PATHS[1],
                 PROJECT_PATHS[2],
             ],
-        )?
-        .stdout;
+            MAX_CHANGED_PATH_OUTPUT_BYTES,
+            "Changed path list",
+        )?;
+        if !tracked_paths_output.status.success() {
+            bail!("Git could not list changed project paths");
+        }
+        let tracked_paths = tracked_paths_output.stdout;
         let mut changed_paths = decode_paths(&tracked_paths)?;
 
-        let untracked = git_output(
+        let untracked_output = git_output_limited(
             project_root,
             &[
                 "ls-files",
@@ -110,13 +120,22 @@ impl RevisionSnapshot {
                 PROJECT_PATHS[1],
                 PROJECT_PATHS[2],
             ],
-        )?
-        .stdout;
+            MAX_CHANGED_PATH_OUTPUT_BYTES,
+            "Untracked path list",
+        )?;
+        if !untracked_output.status.success() {
+            bail!("Git could not list untracked project paths");
+        }
+        let untracked = untracked_output.stdout;
         let mut untracked_paths = decode_paths(&untracked)?;
+        if changed_paths.len().saturating_add(untracked_paths.len()) > MAX_CHANGED_PATHS {
+            bail!("A Critic revision may include at most {MAX_CHANGED_PATHS} changed paths");
+        }
         untracked_paths.sort();
         for path in untracked_paths {
             validate_relative_path(&path)?;
-            let output = git_output_allow_failure(
+            let remaining_patch_bytes = MAX_REVIEW_PATCH_BYTES - patch.len();
+            let output = git_output_limited(
                 project_root,
                 &[
                     "diff",
@@ -127,6 +146,8 @@ impl RevisionSnapshot {
                     "/dev/null",
                     &path,
                 ],
+                remaining_patch_bytes,
+                "Review patch",
             )?;
             match output.status.code() {
                 Some(1) => {}
@@ -186,21 +207,29 @@ fn append_patch(target: &mut Vec<u8>, addition: &[u8]) -> Result<()> {
 }
 
 fn decode_paths(bytes: &[u8]) -> Result<Vec<String>> {
-    bytes
+    if bytes.len() > MAX_CHANGED_PATH_OUTPUT_BYTES {
+        bail!("Changed path output exceeds the supported size limit");
+    }
+    let mut paths = Vec::new();
+    for path in bytes
         .split(|byte| *byte == 0)
         .filter(|path| !path.is_empty())
-        .map(|path| {
-            let path = String::from_utf8(path.to_vec())
-                .context("Git returned a non-UTF-8 path that cannot be reviewed safely")?;
-            validate_relative_path(&path)?;
-            Ok(path)
-        })
-        .collect()
+    {
+        if paths.len() == MAX_CHANGED_PATHS {
+            bail!("A Critic revision may include at most {MAX_CHANGED_PATHS} changed paths");
+        }
+        let path = String::from_utf8(path.to_vec())
+            .context("Git returned a non-UTF-8 path that cannot be reviewed safely")?;
+        validate_relative_path(&path)?;
+        paths.push(path);
+    }
+    Ok(paths)
 }
 
 fn validate_relative_path(value: &str) -> Result<()> {
     let path = Path::new(value);
     if value.is_empty()
+        || value.len() > MAX_CHANGED_PATH_BYTES
         || path.is_absolute()
         || path
             .components()
@@ -210,7 +239,7 @@ fn validate_relative_path(value: &str) -> Result<()> {
         || value.starts_with(".git/")
         || value == ".git"
     {
-        bail!("Review path is not a safe project-relative path: {value:?}");
+        bail!("Review path is too long or is not a safe project-relative path: {value:?}");
     }
     Ok(())
 }
@@ -226,15 +255,115 @@ fn validate_commit_id(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn git_output(project_root: &Path, arguments: &[&str]) -> Result<Output> {
-    let output = git_output_allow_failure(project_root, arguments)?;
-    if !output.status.success() {
+fn git_worktree_is_clean(project_root: &Path) -> Result<bool> {
+    let mut command = Command::new("git");
+    command
+        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .current_dir(project_root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for (key, _) in std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("GIT_"))
+    {
+        command.env_remove(key);
+    }
+    let mut child = command
+        .spawn()
+        .context("Cannot inspect whether the Writer worktree is clean")?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("Cannot read Git status output");
+    };
+    let mut first_byte = [0_u8; 1];
+    let bytes_read = match stdout.read(&mut first_byte) {
+        Ok(bytes_read) => bytes_read,
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            return Err(error).context("Cannot read Git status output");
+        }
+    };
+    if bytes_read > 0 {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Ok(false);
+    }
+    drop(stdout);
+    let status = child
+        .wait()
+        .context("Cannot wait for Git status to finish")?;
+    if !status.success() {
         bail!(
-            "Git command failed while preparing a Critic revision (exit code {})",
-            output.status.code().unwrap_or(-1)
+            "Git status failed while checking the Writer worktree (exit code {})",
+            status.code().unwrap_or(-1)
         );
     }
-    Ok(output)
+    Ok(true)
+}
+
+fn git_output_limited(
+    project_root: &Path,
+    arguments: &[&str],
+    maximum_stdout_bytes: usize,
+    output_label: &str,
+) -> Result<Output> {
+    let mut command = Command::new("git");
+    command
+        .args(arguments)
+        .current_dir(project_root)
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+    for (key, _) in std::env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("GIT_"))
+    {
+        command.env_remove(key);
+    }
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "Cannot run Git command {:?}",
+            arguments.first().unwrap_or(&"")
+        )
+    })?;
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("Cannot read Git {output_label} output");
+    };
+    let mut captured = Vec::with_capacity(maximum_stdout_bytes.min(64 * 1024));
+    let mut buffer = [0_u8; 8 * 1024];
+    loop {
+        let bytes_read = match stdout.read(&mut buffer) {
+            Ok(bytes_read) => bytes_read,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("Cannot read bounded Git output");
+            }
+        };
+        if bytes_read == 0 {
+            break;
+        }
+        if bytes_read > maximum_stdout_bytes.saturating_sub(captured.len()) {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "Git {output_label} exceeds the {maximum_stdout_bytes}-byte limit; TALOS will not truncate it"
+            );
+        }
+        captured.extend_from_slice(&buffer[..bytes_read]);
+    }
+    drop(stdout);
+    let status = child
+        .wait()
+        .context("Cannot wait for Git command to finish")?;
+    Ok(Output {
+        status,
+        stdout: captured,
+        stderr: Vec::new(),
+    })
 }
 
 fn git_output_allow_failure(project_root: &Path, arguments: &[&str]) -> Result<Output> {

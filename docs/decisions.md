@@ -324,3 +324,12 @@ No schema change for process identity is selected or implemented. The separate s
 - **Failure handling:** reject count or timestamp overflow. Compare the update row count with the prior verifying count and the inserted event count with the update count. Any mismatch or SQL/serialization error aborts the transaction; the paused queue and prior task states remain intact.
 - **Reason:** project history may contain a large number of tasks awaiting verification. Manual reconciliation must preserve per-task audit rows without allocating a full in-memory ID list or producing an unbounded event payload.
 - **Acceptance:** reconcile zero, one, and many verifying tasks; verify each task moves to `reviewing` with one matching event, the preview stays capped at 50 with a full count, and injected transaction failures leave task state/events and pause state unchanged. These checks remain pending.
+
+## ADR-041 — Bound Git revision capture before buffering
+
+- **Status:** implementation in progress; behavior acceptance pending.
+- **Invariants:** a Critic revision is either captured in full within the configured patch/path limits or rejected. TALOS never hashes, stores, reviews, or marks an over-limit revision as if it were complete. Path identity remains exact for every accepted revision.
+- **Decision:** stream Git stdout into bounded buffers. Keep the existing 64 KiB patch limit; cap changed paths at 4096 entries, each at 1024 bytes, with a total path-output cap sized for that maximum. For a dirty-base probe, read only enough output to establish that the tree is dirty. Do not accumulate every status row or path merely to return an error.
+- **Failure handling:** when a capture exceeds its limit or cannot be parsed, terminate and reap the Git child where possible and fail the task operation without truncating the revision or persisting partial evidence. Git status parse failures remain errors rather than a false clean result.
+- **Reason:** `Command::output()` allocated the full diff/path output before existing checks rejected oversized revisions. Large repositories must not bypass memory limits just because the final review payload has a cap.
+- **Acceptance:** verify exact tracked/untracked paths including rename/copy and unusual names, confirm oversized patch/path output fails before full capture, check the child is reaped after limit failure, and confirm no partial review/evidence row is persisted. These checks remain pending.
