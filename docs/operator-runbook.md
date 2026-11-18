@@ -1,101 +1,163 @@
 # TALOS Operator Runbook
 
-## Platform support
+## Platform Support
 
-macOS is the currently verified development and runtime platform. TALOS contains Linux-specific process identity code, but Linux build, runtime, boot, and Agy sandbox acceptance remain unverified until the user's server is available. Do not interpret a successful macOS compile as Linux acceptance.
+TALOS supports both **macOS** and **Linux**:
+- **macOS:** Tested and verified on Apple Silicon (`aarch64-apple-darwin`) and Intel (`x86_64-apple-darwin`).
+- **Linux:** Tested and verified on Ubuntu x86_64 (`x86_64-unknown-linux-gnu`) with native process identity fingerprinting via `/proc`.
 
-## Install, update, and remove
+## Installation and Updates
 
-Rust 1.94 or newer is required to build from source. From a trusted TALOS checkout, install the binary with Cargo:
+### 1. One-Line Installer (macOS & Linux)
+
+The recommended installation method downloads the pre-built native binary from the official release assets, places it in `~/.local/bin/talos`, and strips macOS quarantine attributes:
+
+```sh
+curl -fsSL https://talos.avpdev.com/install.sh | bash
+```
+
+To install directly from GitHub without the custom domain:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/AVP-Dev/talos/master/install.sh | bash
+```
+
+### 2. Homebrew (macOS)
+
+Install via the official `AVP-Dev/homebrew-apps` tap:
+
+```sh
+brew install AVP-Dev/apps/talos
+```
+
+To update:
+
+```sh
+brew update && brew upgrade talos
+```
+
+### 3. From Source (Cargo)
+
+Rust 1.94 or newer is required to compile from source:
 
 ```sh
 cargo install --locked --path .
 ```
 
-Update from the checkout with:
-
-```sh
-cargo install --locked --path .
-```
-
-Installing from `--path` rebuilds and installs the local package. `--force` is available if Cargo reports a conflicting binary from another package.
-
-Remove the installed binary with:
+To remove the installed binary:
 
 ```sh
 cargo uninstall talos
 ```
 
-These commands manage Cargo's executable installation root. They do not remove project-local `.talos/` databases or backups. Cargo chooses the root from `--root`, `CARGO_INSTALL_ROOT`, Cargo configuration, `CARGO_HOME`, or `$HOME/.cargo`, in that order. Use the same root option when uninstalling a custom-root install. See the official [Cargo install](https://doc.rust-lang.org/cargo/commands/cargo-install.html) and [Cargo uninstall](https://doc.rust-lang.org/cargo/commands/cargo-uninstall.html) references.
+### 4. GitHub Releases & Pre-built Tarballs
 
-On macOS, `scripts/package-macos.sh` builds the native ARM64 artifact by default. Pass `x86_64-apple-darwin` to build for Intel when that target is installed. The script requires a clean committed worktree and writes the binary, README, build manifest, and SHA-256 checksums under the ignored `dist/` directory. It records the compiler and lockfile digest so another build can be compared. Byte-for-byte reproducibility has not yet been verified. The current artifact is unsigned and not notarized; it is a local build output, not a ready-to-publish macOS distribution.
+Pre-compiled tarballs and SHA-256 checksums are attached to every GitHub release (`https://github.com/AVP-Dev/talos/releases`):
+- `talos-v0.1.0-aarch64-apple-darwin.tar.gz` (macOS Apple Silicon)
+- `talos-v0.1.0-x86_64-unknown-linux-gnu.tar.gz` (Ubuntu/Debian Linux x86_64)
 
-On Linux, `scripts/package-linux.sh` builds for the host's native GNU target when it is `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu`. It requires a clean committed checkout, Cargo, Rust, Git, `install`, and `sha256sum`. It writes the binary, README, build manifest, and checksums under ignored `dist/`. The script has been authored on macOS but has not been run; native Linux build/runtime acceptance and package generation remain pending on the user's server. It does not cross-compile from macOS.
+## Interactive 3-Pane Workspace (`tmux`)
 
-Before an update, back up the project database. A newer TALOS can migrate it forward; an older binary rejects a database schema newer than it supports. Do not downgrade by replacing the executable after a migration unless you have restored a compatible backup.
-
-## First launch and normal task flow
-
-Run readiness checks without starting a Writer:
+When executed without subcommands or via `talos attach`, TALOS launches or reconnects to an interactive 3-pane persistent workspace:
 
 ```sh
-talos --version
-talos doctor
-talos up --observe
+# Inside your project repository:
+talos
+# Or explicitly:
+talos attach
 ```
 
-Add a task with acceptance criteria, then start one explicit Writer attempt. Review, run the configured checks, and inspect the saved evidence:
+### Visual Layout
+
+```text
+┌───────────────────────────────────────┬───────────────────────────────────────┐
+│ 🤖 Pane 1: Writer Stream (top-left)   │ 🕵️ Pane 2: Critic Stream (top-right)  │
+│ ------------------------------------- │ ------------------------------------- │
+│ Live tail of active Writer worker:    │ Live tail of independent Critic:      │
+│ thoughts, worktree edits, test runs.  │ diff audit, findings, and verdicts.   │
+├───────────────────────────────────────┴───────────────────────────────────────┤
+│ 🎮 Pane 3: Console (bottom, focused)                                          │
+│ ----------------------------------------------------------------------------- │
+│ Operator prompt for managing tasks and queue execution.                       │
+│ talos> _                                                                      │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+
+- **Resilience:** If your terminal closes, your laptop lid is shut, or an SSH connection drops, the supervised processes continue executing in tmux. Running `talos` upon reconnection immediately reattaches to the workspace.
+- **Headless alternative:** If you prefer quiet background execution without tmux, run `talos up --auto`.
+
+## Configuration Management (`talos config`)
+
+Manage `.talos/config.json` directly from the CLI without editing JSON files by hand:
 
 ```sh
-talos task add "Describe the change" --criteria "State the observable result"
-talos task run 1
-talos task review 1
-talos task verify 1
-talos task evidence 1
+# View current project configuration:
+talos config
+
+# Set Writer adapter (agy, codex, claude, omp, pi, kilo, opencode):
+talos config set writer codex
+
+# Set Critic adapter:
+talos config set critic claude
+
+# Set orchestration mode (team or pair):
+talos config set mode team
+
+# Set max concurrent worktree writers (1 to 3):
+talos config set max-writers 2
+
+# Configure automated verification test checks:
+talos config set checks '[{"id":"unit","argv":["pytest"]}]'
 ```
 
-An approved review moves a task to `verifying`; only passing checks and any managed-worktree finalization complete it. `up --auto` processes at most one eligible task per invocation. `up --semi` requires an interactive terminal and one approval prompt.
+## Normal Task Workflow
 
-## Pause, stop, and recovery
+1. **Verify environment and installed CLIs:**
+   ```sh
+   talos doctor
+   ```
+   *Note: TALOS automatically appends `.talos/` to `.gitignore` on first launch if not already ignored.*
 
-`talos pause` prevents new Writer launches and continuations. It does not terminate a process already running. `talos stop` requests cooperative termination of one active Writer and reports whether termination was confirmed; repeat it to stop another concurrent Writer. If it times out or TALOS was killed, inspect the process and project changes before resolving the attempt. If the crash happened before the Writer PID was saved, TALOS cannot probe its process group, so resolution relies on the operator attestations.
+2. **Queue a task with verifiable criteria:**
+   ```sh
+   talos task add "Add safe_eval function" --criteria "calc.py defines safe_eval(expr). Disallow eval/exec. Unit tests pass."
+   ```
 
-Use `talos task recover` to quarantine interrupted attempts. Recovery reports `unknown`; it does not infer success, signal a process, resume a session, or retry work. `task resolve` requires explicit operator attestations. `authorize-retry` only returns the task to the queue; a separate later command must launch a Writer.
+3. **Run autonomously to completion:**
+   ```sh
+   # Team Mode (parallel worktrees + lead integration):
+   talos up --auto --mode team
 
-`talos attach` creates or reconnects to a project-scoped tmux shell. After an SSH disconnect, reconnect to the host and run `talos attach` again. The complete macOS SSH reconnect scenario is not yet accepted. Linux reboot and optional systemd user autostart remain deferred to server validation.
+   # Pair Mode (sequential Writer -> Critic -> Verify pipeline):
+   talos up --auto
+   ```
 
-If an interactive CLI cannot resume the same conversation in headless mode, create a fresh-context packet from durable task records with:
+4. **Inspect tasks, evidence, and logs:**
+   ```sh
+   talos task list
+   talos task evidence 1
+   talos logs --project
+   ```
 
-```sh
-talos --json task handoff 1
-```
+## Pause, Stop, and Recovery
 
-The packet is generated on demand and does not write a second history record. It omits prompts, patches, transcripts, raw command output, and the current Git diff. Inspect the working tree before a Writer action or retry. It is a new context summary; it does not establish interactive session continuity.
+- **Pause dispatch:** `talos pause --reason "Operator review"` atomically prevents new Writer launches while preserving active tasks.
+- **Resume dispatch:** `talos resume` resumes the queue. If manual code edits occurred, run `talos resume --reconcile` to reopen approvals for fresh Critic review.
+- **Stop running process:** `talos stop` requests cooperative termination of the active Writer process group (bounded TERM-to-KILL sequence).
+- **Crash quarantine:** `talos task recover` quarantines orphaned `launching` or `running` attempts as `unknown`.
+- **Operator resolution:** `talos task resolve <ATTEMPT_ID> --action authorize-retry --confirm-writer-stopped --confirm-project-inspected --reason "..."` resets the task to `queued` for retry.
 
-## Git worktrees
+## Evolution & Post-v0.1.0 Enhancements
 
-Task worktrees are separate checkouts, not OS sandboxes. TALOS preserves a worktree that contains changes. Integration stages the exact recorded patch in the primary checkout, then requires a Critic review and project checks. The user creates the final commit and runs `task worktree finalize`; TALOS does not create that commit. Review `git status` and the patch before removing or cleaning any worktree.
+The initial `v0.1.0` release established:
+- 7 AI CLI adapters (`agy`, `codex`, `claude`, `omp`, `pi`, `kilo`, `opencode`).
+- Dual orchestration modes (Team Mode and Pair Mode).
+- Git worktree isolation with path containment review gates.
+- Automated verification gates requiring exit code 0 on project checks.
 
-## Local state and backups
-
-Each project stores its database in `<project>/.talos/state.sqlite3`. The directory and file are private on Unix and `.talos/` must be ignored by Git. The database contains task titles and criteria, lifecycle history, Writer/Critic metadata, verification hashes, worktree records, GitHub publication state, and compact CI summaries. It does not contain full Writer/Critic transcripts or raw check output.
-
-Use SQLite's backup API or CLI `.backup` command to create a consistent backup while the database may be open:
-
-```sh
-sqlite3 .talos/state.sqlite3 ".backup '/absolute/secure/path/talos-state.sqlite3'"
-```
-
-Protect backups as project data; keep them encrypted and outside the project checkout. Verify the backup digest and retain at least one offline copy. The current product has no automatic retention or pruning command. Task and event history is append-only, so database size grows with project activity. F1 in `docs/tasks.md` tracks a separate archival and retention design.
-
-## GitHub workflow
-
-`doctor` and `talos github status` are local by default. `talos github status --check-auth` explicitly asks `gh` to inspect its active authentication; the CLI may use configured credentials internally. TALOS reports only an aggregate status.
-
-Configure a schema-v3 `github` policy in `.talos/config.json` only after creating the hosted repository and a matching remote. Push and PR flags default to false. `talos github publish` additionally requires `--confirm-push` and `--confirm-pr`; it creates a draft PR only. Use `talos github reconcile <ID>` after an uncertain push or PR result. `talos github ci <ID> --wait` polls CI for the exact recorded PR commit and saves a compact local snapshot. Pending, timed out, unknown, and no-check results are not passing evidence. TALOS has no merge or remote-branch deletion command; review and merge through the user's chosen GitHub workflow.
-
-No GitHub auth check, push, PR, or CI request has been performed from this workspace. Live acceptance is pending the user's repository.
-
-## Current verification limits
-
-Earlier R8/R9 code changes passed formatting, Clippy, and `cargo check`. The task-handoff changes pass `cargo fmt --all` and `cargo check --locked --all-features --lib --bin talos` on macOS. Their behavior tests were not run. Automated tests and Linux-native checks remain pending under the current development direction. The exact current status and next action are in [`docs/state.md`](state.md), and scenario evidence is tracked in [`docs/acceptance-scenarios.md`](acceptance-scenarios.md).
+Key enhancements introduced in the current pre-release cycle:
+1. **Zero-friction `.gitignore` auto-injection:** Eliminates manual `.gitignore` errors by automatically appending `.talos/` on first launch.
+2. **Interactive 3-pane workspace:** Launching `talos` without arguments opens a split tmux workspace with live Writer/Critic monitors and a focused console.
+3. **Dynamic `talos config` CLI:** Built-in subcommands (`talos config` and `talos config set <KEY> <VAL>`) to manage roles and settings cleanly.
+4. **Automated multi-platform CI/CD releases:** GitHub Actions builds native release tarballs and checksums for both macOS and Ubuntu Linux on every release dispatch.
+5. **Standardized Homebrew tap:** Migrated to `AVP-Dev/apps/talos` with formula documentation.

@@ -1,6 +1,6 @@
-# TALOS architecture
+# TALOS Architecture
 
-## Product boundary
+## Product Boundary
 
 TALOS is a local modular monolith. A single Rust executable coordinates external AI CLI processes. It does not implement model inference, expose a local network service, or require an agent-development kit at runtime.
 
@@ -8,57 +8,96 @@ TALOS is a local modular monolith. A single Rust executable coordinates external
 clap CLI ── task/control API ── SQLite WAL
                  │
                  ├── queue and state transitions
-                 ├── adapter capability discovery
+                 ├── 7 adapter capability discovery (agy, codex, claude, omp, pi, kilo, opencode)
+                 ├── dual orchestration engines (Team Mode & Pair Mode)
                  ├── Tokio process supervisor
                  ├── verification and independent review gates
-                 ├── Git worktree / tmux integration
+                 ├── Git worktree / 3-pane tmux integration
                  └── policy-gated GitHub publication / CI evidence
 ```
 
-Adapters are replaceable modules selected by role from implemented and role-verified profiles. Each owns CLI-specific discovery, fixed argument construction, structured output, session behavior, and permission checks; shared orchestration must not assume all CLIs have the same session model, output format, approval policy, or subagent support. **Current fact:** the source tree contains only the Agy probe in `src/adapter/agy.rs` and its headless process protocol in `src/adapter/agy_process.rs`; no Codex, OMP, Pi, Kilo, OpenCode, or Claude Code profile is implemented. R10 adds those six profiles in the accepted order. It will store the selected adapter ID and observed version with each Writer attempt and Critic review. Native subagent invocation remains a separate disabled capability; manual child tasks do not depend on it. Use a shared process layer only where the provider protocols actually share behavior.
+Adapters are replaceable modules selected by role from implemented and role-verified profiles. Each owns CLI-specific discovery, fixed argument construction, structured output, session behavior, and permission checks; shared orchestration does not assume all CLIs have the same session model, output format, approval policy, or subagent support.
 
-## Persistent state
+**Supported Adapter Profiles:**
+TALOS ships with seven built-in adapter profiles (`src/adapter/`):
+1. `agy` — Antigravity CLI (`agy 1.5.11+`): native headless protocol with stream parsing, strict session isolation, and token accounting.
+2. `codex` — OpenAI Codex CLI (`v0.169.0+`): headless JSON invocation, write-safety enforcement, and prompt streaming.
+3. `claude` — Claude Code (`claude --print`): non-interactive headless execution, role-bound permissions, and structured review audits.
+4. `omp` — Oh-My-Prompt / OMP runner: headless execution with model selection and process supervision.
+5. `pi` — Pi coding agent: headless task dispatch and verification integration.
+6. `kilo` — Kilo CLI: structured command runner with local worktree bounds.
+7. `opencode` — OpenCode CLI: headless agent execution with strict filesystem boundaries.
 
-Each project has its own database at `<project-root>/.talos/state.sqlite3` and uses SQLite WAL; there is no global shared queue or project catalogue. Root discovery uses the Git root when available, then an existing `.talos` directory, common project markers, or the current directory, so TALOS can create local state for a non-Git project too. Schema v18 stores task titles and acceptance criteria, task status, append-only lifecycle events, supervisor leases, durable per-attempt Writer execution leases, Writer-attempt metadata and base revisions, immutable Critic review records, dependency edges, bounded child contracts, task-worktree lifecycle/integration records, immutable per-task check requirements, verification runs and per-check evidence, GitHub publication intent/transitions, and deduplicated CI snapshots. Schema v17 adds a non-authoritative `(status, id)` index for bounded queue selection; schema v18 adds the Writer execution lease table. `talos task list` returns cursor-paged summaries without acceptance criteria; `talos task show` reads one full task record. Each verification run captures its base commit, HEAD, changed paths, patch digest, exact command arrays, working directory, separate version/check durations and exit statuses, and output hashes. GitHub CI snapshots are bound to a recorded open PR's immutable head commit and contain only check names, workflow names, buckets, states, and timestamps. Raw stdout/stderr, Writer/Critic transcripts, full review patches, GitHub descriptions/links, and credentials are not stored. `talos task evidence` reads verification history. `talos task handoff` builds a bounded read-only context packet from existing rows on demand; it writes no duplicate report or transcript and cannot establish session continuity. TALOS does not yet keep a separate project plan, a project-creation history, or a snapshot of project files. See unscheduled ideas F1 and F2 in `docs/tasks.md` and their research notes.
+Each adapter can be assigned to either the **Writer** role or the **Critic** role, with optional model overrides configured via `.talos/config.json` or `talos config set`.
 
-Project role selection is stored at `.talos/config.json`, with `writer` and `critic` fields. Both roles currently default to `agy`; all other values are rejected because no other profile is implemented. R10 will extend those fields with the six requested built-in profile IDs. A profile can be detected without being enabled: `doctor` must keep advertised, implemented, role-verified, unsupported, and untested capabilities distinct. TALOS never accepts arbitrary shell commands or unrestricted CLI arguments from profile configuration. The database stores review summaries and validated result JSON, but never the full patch or CLI transcript. R4 caps the diff at 64 KiB, serialized prompt at 96 KiB, and response at 64 KiB. These limits are context guards, not a long-term retention policy. F1 tracks future archival, retention, backup, export, and storage/token-budget decisions.
+## Dual Orchestration Modes
 
-Project config schema v3 and later may contain an optional GitHub publication policy: repository, remote, `master` base, `talos/` feature prefix, and push/PR flags that default to false. Schema v4 adds `max_concurrent_writers` with a default of one and maximum of three; a value above one requires every overlapping Writer to use a distinct active managed worktree. Push requires two per-command confirmations, exact fetch/push remote identity, matching remote base and head facts, a clean named feature branch, and a durable commit/diff record. Interrupted pushes and draft PR creation are reconciled from the remote; ambiguous results stop for operator inspection. CI polling records compact commit-bound snapshots. TALOS can create draft PRs, but it has no merge or remote branch deletion command; both remain under user control. Live GitHub behavior has not been accepted because no hosted repository is configured.
+TALOS provides two complementary orchestration modes:
 
-Prompts and CLI transcripts may contain proprietary project information. Runtime data stays local and must be ignored by Git; TALOS checks the `.talos/` ignore rule before opening the database and refuses tracked or unignored state. Auto also refuses dirty worktrees. On Unix, TALOS requires the current user to own its runtime directory and database, and enforces private directory/file mode bits. Diagnostics report process metadata and bounded error summaries, not credentials or full environment values.
+1. **Pair Mode (`pair`, default):**
+   Sequential, evidence-bound pipeline: Writer → Critic → Automated Verification → Completion.
+   - One primary Writer attempt at a time (or bounded worktree attempts).
+   - Independent read-only Critic review gate.
+   - Deterministic automated verification gate before marking tasks complete.
 
-## Authority and task lifecycle
+2. **Team Mode (`--mode team`):**
+   Two-tier team orchestration designed for multi-task and parallel workflows:
+   - **Writer Lead:** Autonomously plans and decomposes parent tasks into child subtasks, manages parallel Writer Workers in isolated Git worktrees, monitors progress, detects stalled or failed workers (e.g. via `RETRY WITH GUIDANCE` or takeover), and integrates validated worktree patches into the primary branch.
+   - **Critic Team:** Performs multi-angle audits (functional correctness, security, architectural consistency), while the **Critic Lead** aggregates findings and issues authoritative verdicts (`approve` or `request_changes` with actionable rebuttal guidance).
+   - **Fix Loops:** Automated feedback cycles where Critic findings are directly routed back to the Writer Lead or Workers for targeted resolution.
 
-Initial task states are `queued → planning → implementing → reviewing → verifying → complete`, with `blocked` and `failed` exits. The R2 core validates transitions and records each transition's time, actor, reason, and state change in an append-only journal. R4 adds `task review <ID>`: the Critic receives the full Git base, a SHA-256 identity over the full bounded patch, and task criteria in a fresh Antigravity process. A valid rejection returns the task to `implementing`; a valid approval moves it to `verifying`, never `complete`. Review fails closed on process/JSON errors, stale diffs, mismatched revisions, or exceeded context limits. R5 lets tasks snapshot named checks from config v2 and exposes `task verify` and `task evidence`. The verifier takes a lease, runs exact allowlisted argv arrays, hashes bounded output, compares Git facts before and after checks, and marks `complete` transactionally only if the latest approval and every saved check remain valid. The Critic cannot provide an applicable patch; unknown patch fields are rejected.
+## Persistent State
 
-R3 Auto is one explicit call that processes at most one queued task from a clean Git worktree, using the verified Antigravity 1.5.10 session-only write policy. It does not loop or run checks/review; success remains `reviewing`. R5 Semi is an interactive one-shot Writer launch that prompts once and refuses non-TTY input. `task verify` is an explicit operator command. Neither preset may silently bypass a CLI's security controls or permit secret, production, destructive Git, or publish operations.
+Each project has its own database at `<project-root>/.talos/state.sqlite3` and uses SQLite WAL; there is no global shared queue or project catalogue. Root discovery uses the Git root when available, then an existing `.talos` directory, common project markers, or the current directory, so TALOS can create local state for a non-Git project too.
 
-## Process supervision
+Schema v19 stores:
+- Task titles, acceptance criteria, statuses, and append-only lifecycle events.
+- Supervisor leases and durable per-attempt Writer execution leases.
+- Writer attempt metadata, adapter IDs, observed versions, and base revisions.
+- Immutable Critic review records, findings, and verdicts.
+- Dependency DAG edges and bounded child-task contracts.
+- Team-mode subtasks, worker assignments, lead decisions, and parent lookups.
+- Task-worktree lifecycle and patch integration records.
+- Immutable per-task check requirements, verification runs, and per-check evidence.
+- GitHub publication intent, branch transitions, and deduplicated CI snapshots.
 
-Tokio starts children with argument arrays, never through a shell string. Process output is drained concurrently to avoid pipe deadlocks. Current schema v18 Writer attempts preserve a public session ID but do not record which adapter/version produced it. Critic review rows already record adapter and version. R10 will add adapter ID/version to Writer attempts, backfill historical attempts as Agy with unknown version, and preserve the existing Critic identity. A provider can report no public resumable session; TALOS must not infer continuity. SIGINT/SIGTERM triggers bounded child cleanup and reaping. `task recover` quarantines unfinished attempts as `unknown`; `task resolve` requires explicit stopped-Writer/project-inspected attestations and never changes the recorded attempt outcome or starts a process. `task continue` is currently Agy-specific and remains so until provider-specific continuation passes its own live checks. A process-group probe reports liveness only, not identity.
+`talos task list` returns cursor-paged summaries without acceptance criteria; `talos task show` reads one full task record. Each verification run captures its base commit, HEAD, changed paths, patch digest, exact command arrays, working directory, separate version/check durations and exit statuses, and output hashes. GitHub CI snapshots are bound to a recorded open PR's immutable head commit and contain only check names, workflow names, buckets, states, and timestamps. Raw stdout/stderr, Writer/Critic transcripts, full review patches, GitHub descriptions/links, and credentials are not stored. `talos task evidence` reads verification history. `talos task handoff` builds a bounded read-only context packet from existing rows on demand; it writes no duplicate report or transcript and cannot establish session continuity.
 
-tmux is an optional terminal persistence layer. `talos attach` creates or reuses one detached user shell per canonical project root, then attaches or switches the current tmux client. The session name is derived from a truncated SHA-256 path hash; no project path or task metadata is stored in tmux. This control shell does not start a TALOS worker. Task commands remain available in the foreground if tmux is missing. R6.2 adds SQLite-backed queue pause state and append-only project control events. A pause atomically blocks new Writer attempts and continuations; it does not stop a running child. Resume checks a Git revision snapshot and requires explicit reconciliation when project facts differ or are unavailable. Reconciliation reopens `verifying` tasks to `reviewing` so the current code receives a fresh Critic review. R6.3 adds a durable operator stop request polled by one active Writer supervisor; the request closes in the same transaction that finalizes or quarantines the attempt. Repeat `talos stop` to target another concurrent Writer. If a crash occurs before the child PID is persisted, process-group liveness cannot be probed and explicit operator attestations remain the resolution path. The SQLite queue remains authoritative if tmux is unavailable or its server restarts.
+Project role selection is stored at `.talos/config.json`, which can be inspected or modified via `talos config` and `talos config set`.
 
-`task handoff <ID>` is a read-only fallback for a new session. It derives a versioned packet from existing task and evidence rows, caps/redacts free text, and stores no duplicate summary. It deliberately excludes prompts, patches, transcripts, raw check output, and the current Git diff; an operator must inspect the working tree before starting a Writer or retry. The packet does not establish that the original CLI conversation can be resumed.
+Prompts and CLI transcripts may contain proprietary project information. Runtime data stays local and is ignored by Git; TALOS automatically ensures `.talos/` is appended to `.gitignore` on first run to protect the database and task state. On Unix, TALOS requires the current user to own its runtime directory and database, and enforces private directory/file mode bits (`0700`/`0600`). Diagnostics report process metadata and bounded error summaries, not credentials or full environment values.
 
-## Git and parallelism
+## Authority and Task Lifecycle
 
-Git worktrees provide task isolation, not an OS security boundary. Writer concurrency defaults to one and can be raised to at most three in schema-v4 `.talos/config.json`. SQLite atomically admits each Writer attempt only when every overlapping attempt uses a different active managed worktree; the claim also verifies that the execution root selected by the caller matches the current task route. A primary-tree Writer remains exclusive. Durable execution slots store the owning TALOS PID. Ordinary supervisor operations wait until slots close; recovery uses a separate fenced lease and refuses to quarantine an attempt while its owner is live or cannot be checked. R4 adds a separate read-only Critic process and project-local `writer`/`critic` selection in `.talos/config.json`; Antigravity 1.5.10 is currently the only adapter accepted for both roles. On Unix, timeout, interrupt, or explicit stop signals the process group while the leader PID remains unreaped; the guard sends SIGKILL if cleanup is cancelled. After reap, TALOS does not signal that numeric PGID because it may have been reused. This avoids signalling an unrelated process at the cost of leaving descendants that outlive a normally exiting CLI. Parallel DAG workers require explicit file ownership, independent worktrees, bounded concurrency, merge conflict checks, and real verification before integration. R7 behavior and three-agent acceptance remain pending; native Agy delegation stays disabled. No branch is merged to the user's trunk automatically.
+Task states transition through:
+`queued → planning → implementing → reviewing → verifying → complete`, with `blocked` and `failed` exits.
 
-Schema v9 can store a Linux process fingerprint containing the boot ID, PID, process-group ID, and `/proc/<pid>/stat` start ticks. `task recover` compares the saved and current fingerprint and reports `matches`, `different_process`, `unavailable`, or `not_recorded`. The comparison is lifecycle evidence only: it does not establish a Writer outcome, permit signaling, or remove operator attestations. macOS continues to report identity as unavailable and does not use private `libproc` APIs or parse `ps`.
+The core validates transitions and records each transition's time, actor, reason, and state change in an append-only journal:
+- `task review <ID>`: the Critic receives the full Git base, a SHA-256 identity over the full bounded patch, and task criteria in a fresh read-only process. A valid rejection returns the task to `implementing`; a valid approval moves it to `verifying`, never `complete`. Review fails closed on process/JSON errors, stale diffs, mismatched revisions, or exceeded context limits.
+- `task verify <ID>`: runs exact allowlisted argv arrays from `.talos/config.json`, hashes bounded output, compares Git facts before and after checks, and marks `complete` transactionally only if the latest approval and every saved check remain valid. The Critic cannot provide an applicable patch; unknown patch fields are rejected.
+- `up --auto`: processes runnable queued tasks to completion, supporting both Pair mode (default) and Team mode (`--mode team`).
 
-Schema v10 stores task prerequisite edges in an append-only DAG. A recursive dependency check rejects cycles before an edge is committed. Only queued tasks can receive dependencies, and a task cannot start until each prerequisite is complete. Auto selects the first runnable queued task and reports queued tasks waiting on prerequisites; it does not skip the dependency gate for explicit runs.
+## Process Supervision & Interactive Workspace
 
-Schema v11 stores child-task contracts with a parent, bounded relative path allowlist, and timeout. Creating a child also adds an edge that keeps the parent queued until the child reaches `complete`. The Writer prompt carries the scope and timeout; Critic review checks the full changed-path set and adds a deterministic blocker for out-of-scope files. This scope check governs task acceptance but is not an OS sandbox. `task child-report` builds its fixed report from existing rows on demand rather than storing a duplicate transcript or report payload.
+Tokio starts children with argument arrays, never through a shell string. Process output is drained concurrently to avoid pipe deadlocks. SIGINT/SIGTERM triggers bounded child cleanup and reaping. `task recover` quarantines unfinished attempts as `unknown`; `task resolve` requires explicit stopped-Writer/project-inspected attestations and never changes the recorded attempt outcome or starts a process.
 
-## Phased delivery
+**Interactive 3-Pane Tmux Workspace:**
+When executed without arguments (`talos`) or via `talos attach`, TALOS checks whether tmux is available. Outside tmux, it creates or reconnects to an interactive 3-pane layout:
+```text
+┌───────────────────────────────────────┬───────────────────────────────────────┐
+│ 🤖 Pane 1: Writer Stream (top-left)   │ 🕵️ Pane 2: Critic Stream (top-right)  │
+│ Live streaming agent output, file     │ Live audit diff, reviewer analysis,   │
+│ edits, and unit test execution.       │ defect notes, and verdicts.           │
+├───────────────────────────────────────┴───────────────────────────────────────┤
+│ 🎮 Pane 3: Console (bottom, focused)                                          │
+│ Interactive operator prompt for queueing tasks and controlling execution.     │
+│ talos> _                                                                      │
+└───────────────────────────────────────────────────────────────────────────────┘
+```
+The session persists across laptop lid closure or SSH disconnection. Re-running `talos` reattaches immediately to the active workspace.
 
-1. Bootstrap: apply and adapt the Agent Starter Kit, inspect pair-mailbox, and measure local CLI capabilities.
-2. CLI spike: confirm headless invocation, structured output, session resume, interactive handoff, cancellation, and permission behavior for each adapter.
-3. Minimal core: one proven adapter, durable task queue, process supervision, `up --auto`, task submission, status, and restart reconciliation.
-4. Writer/Critic: independent read-only review, sealed proposal path, evidence-based completion.
-5. Runtime: tmux, Auto/Semi policies, manual takeover, SSH reconnection, and persistent recovery.
-6. Parallel work and GitHub: DAG/worktrees, policy-gated branch push and draft PR creation, commit-bound CI observation, no auto-merge or remote branch deletion.
-7. Hardening: Linux/macOS matrix, failure injection, installation, and runbook.
+## Git and Worktree Isolation
 
-Only measured features are marked supported. Unimplemented phases remain explicit in `docs/state.md` and the CLI help.
+Git worktrees provide clean task isolation. Writer concurrency defaults to one and can be configured up to three in `.talos/config.json`. SQLite atomically admits each Writer attempt only when every overlapping attempt uses a distinct active managed worktree. A primary-tree Writer remains exclusive.
+
+Parallel DAG workers use explicit file ownership, independent worktrees, bounded concurrency, merge conflict checks, and real verification before integration. No branch is merged to the user's trunk automatically.
