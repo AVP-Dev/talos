@@ -31,8 +31,8 @@ use crate::{
     secrets::{contains_sensitive, redact_sensitive},
     supervisor::{
         VERIFIED_AGY_CRITIC_VERSION, VERIFIED_AGY_WRITE_VERSION, WriterContinuation,
-        continue_writer_attempt_with_limit, run_critic_review, run_writer_attempt_with_limit,
-        validate_project_scope,
+        WriterRunOptions, continue_writer_attempt_with_options, run_critic_review,
+        run_writer_attempt_with_options, validate_project_scope,
     },
     tmux::{TmuxClient, TmuxProbe},
     worktree,
@@ -434,7 +434,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                         println!("No more TALOS-managed task worktrees.");
                     } else {
                         for record in &page.worktrees {
-                            print_task_worktree(false, "", &record, &database)?;
+                            print_task_worktree(false, "", record, &database)?;
                         }
                         if let Some(next_after) = page.next_after {
                             println!(
@@ -2673,29 +2673,17 @@ async fn execute_writer_task(
         .executable
         .context("Antigravity executable path is unavailable")?;
     ensure_execution_root_current(project, database, task_id)?;
+    let options = WriterRunOptions {
+        executable,
+        agy_version: version,
+        timeout: WRITER_TIMEOUT,
+        max_concurrent_writers: config.max_concurrent_writers,
+    };
     if let Some(continuation) = continuation {
-        continue_writer_attempt_with_limit(
-            project,
-            database,
-            task_id,
-            executable,
-            &version,
-            WRITER_TIMEOUT,
-            continuation,
-            config.max_concurrent_writers,
-        )
-        .await
+        continue_writer_attempt_with_options(project, database, task_id, continuation, options)
+            .await
     } else {
-        run_writer_attempt_with_limit(
-            project,
-            database,
-            task_id,
-            executable,
-            &version,
-            WRITER_TIMEOUT,
-            config.max_concurrent_writers,
-        )
-        .await
+        run_writer_attempt_with_options(project, database, task_id, options).await
     }
 }
 
@@ -3662,7 +3650,7 @@ mod tests {
 
     #[tokio::test]
     async fn verification_runs_saved_command_and_completes_only_matching_approved_revision() {
-        let project = temp_project();
+        let mut project = temp_project();
         fs::write(project.root.join(".gitignore"), ".talos/\n").expect("ignore TALOS runtime");
         fs::create_dir_all(project.root.join("src")).expect("create source directory");
         fs::write(
@@ -3671,6 +3659,7 @@ mod tests {
         )
         .expect("write baseline source");
         init_git(&project.root);
+        project.discovery = DiscoveryMethod::Git;
         git(&project.root, &["add", ".gitignore", "src/lib.rs"]);
         git(
             &project.root,

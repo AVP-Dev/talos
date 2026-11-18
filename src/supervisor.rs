@@ -19,7 +19,7 @@ use crate::{
     adapter::agy_process::{AgyProcessEvent, AgyRunConfig, AgyRunResult, TerminationReason},
     db::{
         ChildTaskContract, CriticReviewInput, CriticReviewRecord, Database, TaskRecord, TaskStatus,
-        WriterAttemptOutcome, WriterAttemptRecord,
+        WriterAttemptOutcome, WriterAttemptRecord, WriterContinuationClaim,
     },
     project::{DiscoveryMethod, Project},
     review::{CriticResponse, ReviewRequest},
@@ -132,6 +132,14 @@ pub struct WriterContinuation {
     pub project_inspected_attested: bool,
 }
 
+#[derive(Clone, Debug)]
+pub struct WriterRunOptions {
+    pub executable: PathBuf,
+    pub agy_version: String,
+    pub timeout: Duration,
+    pub max_concurrent_writers: usize,
+}
+
 pub async fn run_writer_attempt(
     project: &Project,
     database: &mut Database,
@@ -140,39 +148,27 @@ pub async fn run_writer_attempt(
     agy_version: &str,
     timeout: Duration,
 ) -> Result<WriterExecutionReport> {
-    run_writer_attempt_inner(
+    run_writer_attempt_with_options(
         project,
         database,
         task_id,
-        executable,
-        agy_version,
-        timeout,
-        None,
-        1,
+        WriterRunOptions {
+            executable,
+            agy_version: agy_version.to_owned(),
+            timeout,
+            max_concurrent_writers: 1,
+        },
     )
     .await
 }
 
-pub async fn run_writer_attempt_with_limit(
+pub async fn run_writer_attempt_with_options(
     project: &Project,
     database: &mut Database,
     task_id: i64,
-    executable: PathBuf,
-    agy_version: &str,
-    timeout: Duration,
-    max_concurrent_writers: usize,
+    options: WriterRunOptions,
 ) -> Result<WriterExecutionReport> {
-    run_writer_attempt_inner(
-        project,
-        database,
-        task_id,
-        executable,
-        agy_version,
-        timeout,
-        None,
-        max_concurrent_writers,
-    )
-    .await
+    run_writer_attempt_inner(project, database, task_id, options, None).await
 }
 
 pub async fn continue_writer_attempt(
@@ -184,40 +180,29 @@ pub async fn continue_writer_attempt(
     timeout: Duration,
     continuation: WriterContinuation,
 ) -> Result<WriterExecutionReport> {
-    run_writer_attempt_inner(
+    continue_writer_attempt_with_options(
         project,
         database,
         task_id,
-        executable,
-        agy_version,
-        timeout,
-        Some(continuation),
-        1,
+        continuation,
+        WriterRunOptions {
+            executable,
+            agy_version: agy_version.to_owned(),
+            timeout,
+            max_concurrent_writers: 1,
+        },
     )
     .await
 }
 
-pub async fn continue_writer_attempt_with_limit(
+pub async fn continue_writer_attempt_with_options(
     project: &Project,
     database: &mut Database,
     task_id: i64,
-    executable: PathBuf,
-    agy_version: &str,
-    timeout: Duration,
     continuation: WriterContinuation,
-    max_concurrent_writers: usize,
+    options: WriterRunOptions,
 ) -> Result<WriterExecutionReport> {
-    run_writer_attempt_inner(
-        project,
-        database,
-        task_id,
-        executable,
-        agy_version,
-        timeout,
-        Some(continuation),
-        max_concurrent_writers,
-    )
-    .await
+    run_writer_attempt_inner(project, database, task_id, options, Some(continuation)).await
 }
 
 pub async fn run_critic_review(
@@ -380,12 +365,15 @@ async fn run_writer_attempt_inner(
     project: &Project,
     database: &mut Database,
     task_id: i64,
-    executable: PathBuf,
-    agy_version: &str,
-    timeout: Duration,
+    options: WriterRunOptions,
     continuation: Option<WriterContinuation>,
-    max_concurrent_writers: usize,
 ) -> Result<WriterExecutionReport> {
+    let WriterRunOptions {
+        executable,
+        agy_version,
+        timeout,
+        max_concurrent_writers,
+    } = options;
     if agy_version != VERIFIED_AGY_WRITE_VERSION {
         bail!(
             "Safe unattended writes were verified for Antigravity {VERIFIED_AGY_WRITE_VERSION}; installed version {agy_version} requires a new disposable-project boundary probe"
@@ -463,16 +451,16 @@ async fn run_writer_attempt_inner(
     };
     let prompt_sha256 = encode_lower_hex(&Sha256::digest(prompt.as_bytes()));
     let attempt = if let Some(continuation) = &continuation {
-        database.begin_writer_continuation_for_root(
-            task.id,
-            &prompt_sha256,
-            continuation.source_attempt_id,
-            &continuation.conversation_id,
-            continuation.project_inspected_attested,
-            std::process::id(),
+        database.begin_writer_continuation_for_root(WriterContinuationClaim {
+            task_id: task.id,
+            prompt_sha256: &prompt_sha256,
+            source_attempt_id: continuation.source_attempt_id,
+            conversation_id: &continuation.conversation_id,
+            project_inspected_attested: continuation.project_inspected_attested,
+            owner_pid: std::process::id(),
             max_concurrent_writers,
-            project.root.as_path(),
-        )?
+            expected_execution_root: project.root.as_path(),
+        })?
     } else {
         database.begin_writer_attempt_for_root(
             task.id,
@@ -976,7 +964,7 @@ mod tests {
             .expect("system time is after the Unix epoch");
         let now_ms = i64::try_from(now.as_millis()).expect("timestamp fits in SQLite integer");
         database
-            .acquire_supervisor_lease("supervisor-recovery-test", now_ms, 60_000)
+            .acquire_recovery_supervisor_lease("supervisor-recovery-test", now_ms, 60_000)
             .expect("acquire recovery lease")
             .expect("recovery lease is available")
     }
@@ -1578,7 +1566,7 @@ mod tests {
         .await
         .expect_err("unresolved attempt must block every new Writer");
 
-        assert!(format!("{error:#}").contains("unresolved Writer attempt"));
+        assert!(format!("{error:#}").contains("unresolved Writer outcome"));
         assert!(!project.root.join("writer-started").exists());
         assert_eq!(
             database.list_tasks().expect("list tasks")[1].status,

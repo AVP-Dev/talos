@@ -332,6 +332,17 @@ pub struct WriterExecutionLeaseRecord {
     pub owner_process_id: Option<u32>,
 }
 
+pub struct WriterContinuationClaim<'a> {
+    pub task_id: i64,
+    pub prompt_sha256: &'a str,
+    pub source_attempt_id: i64,
+    pub conversation_id: &'a str,
+    pub project_inspected_attested: bool,
+    pub owner_pid: u32,
+    pub max_concurrent_writers: usize,
+    pub expected_execution_root: &'a Path,
+}
+
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct CriticReviewRecord {
     pub id: i64,
@@ -3217,29 +3228,24 @@ impl Database {
         conversation_id: &str,
         project_inspected_attested: bool,
     ) -> Result<WriterAttemptRecord> {
-        self.begin_writer_continuation_with_limit(
+        let primary_root = self.primary_project_root()?;
+        self.begin_writer_continuation_for_root(WriterContinuationClaim {
             task_id,
             prompt_sha256,
             source_attempt_id,
             conversation_id,
             project_inspected_attested,
-            std::process::id(),
-            1,
-        )
+            owner_pid: std::process::id(),
+            max_concurrent_writers: 1,
+            expected_execution_root: &primary_root,
+        })
     }
 
-    pub fn begin_writer_continuation_with_limit(
+    pub fn begin_writer_continuation_for_root(
         &mut self,
-        task_id: i64,
-        prompt_sha256: &str,
-        source_attempt_id: i64,
-        conversation_id: &str,
-        project_inspected_attested: bool,
-        owner_pid: u32,
-        max_concurrent_writers: usize,
+        claim: WriterContinuationClaim<'_>,
     ) -> Result<WriterAttemptRecord> {
-        let primary_root = self.primary_project_root()?;
-        self.begin_writer_continuation_for_root(
+        let WriterContinuationClaim {
             task_id,
             prompt_sha256,
             source_attempt_id,
@@ -3247,21 +3253,8 @@ impl Database {
             project_inspected_attested,
             owner_pid,
             max_concurrent_writers,
-            &primary_root,
-        )
-    }
-
-    pub fn begin_writer_continuation_for_root(
-        &mut self,
-        task_id: i64,
-        prompt_sha256: &str,
-        source_attempt_id: i64,
-        conversation_id: &str,
-        project_inspected_attested: bool,
-        owner_pid: u32,
-        max_concurrent_writers: usize,
-        expected_execution_root: &Path,
-    ) -> Result<WriterAttemptRecord> {
+            expected_execution_root,
+        } = claim;
         if !project_inspected_attested {
             bail!("Writer continuation requires an explicit project-inspection attestation");
         }
@@ -6468,6 +6461,18 @@ mod tests {
         fs::remove_dir_all(&project.root).expect("remove temporary project");
     }
 
+    fn remove_schema_v15_to_v18(connection: &rusqlite::Connection) {
+        connection
+            .execute_batch(
+                "DROP TABLE github_ci_snapshots;
+                 DROP TABLE github_publication_events;
+                 DROP TABLE github_publications;
+                 DROP INDEX tasks_status_id;
+                 DROP TABLE writer_execution_leases;",
+            )
+            .expect("remove schema v15-v18 objects from a legacy fixture");
+    }
+
     fn recovery_lease(database: &mut Database, owner_id: &str) -> super::SupervisorLease {
         let now = super::now_ms().expect("read current time");
         database
@@ -6578,6 +6583,7 @@ mod tests {
     fn schema_v5_migrates_to_v14_with_optional_check_durations_and_control_state() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
+        remove_schema_v15_to_v18(&database.connection);
         database
             .connection
             .execute_batch(
@@ -6619,6 +6625,7 @@ mod tests {
         let task = database
             .add_task("Preserve v6 task", "Keep the existing row")
             .expect("add task before migration");
+        remove_schema_v15_to_v18(&database.connection);
         database
             .connection
             .execute_batch(
@@ -6645,6 +6652,7 @@ mod tests {
     fn schema_v7_migrates_with_no_pending_stop_request() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
+        remove_schema_v15_to_v18(&database.connection);
         database
             .connection
             .execute_batch(
@@ -6675,6 +6683,7 @@ mod tests {
     fn schema_v8_migrates_with_no_recorded_process_identity() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
+        remove_schema_v15_to_v18(&database.connection);
         database
             .connection
             .execute_batch(
@@ -6704,6 +6713,7 @@ mod tests {
     fn schema_v9_migrates_to_v14_with_dependency_tables() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
+        remove_schema_v15_to_v18(&database.connection);
         database
             .connection
             .execute_batch(
@@ -6734,6 +6744,7 @@ mod tests {
     fn schema_v10_migrates_to_v14_with_child_task_contracts() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
+        remove_schema_v15_to_v18(&database.connection);
         database
             .connection
             .execute_batch(
@@ -7082,6 +7093,7 @@ mod tests {
             TaskStatus::Verifying
         );
 
+        remove_schema_v15_to_v18(&database.connection);
         database
             .connection
             .execute_batch(
@@ -8028,6 +8040,11 @@ mod tests {
             );
             assert_eq!(event.actor, "operator");
 
+            assert!(
+                database
+                    .release_supervisor_lease(&lease)
+                    .expect("release recovery lease after resolution")
+            );
             if action == WriterResolutionAction::AuthorizeRetry {
                 let next_attempt = database
                     .begin_writer_attempt(task.id, &"ef".repeat(32))
