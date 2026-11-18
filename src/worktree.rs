@@ -12,7 +12,7 @@ use sha2::{Digest, Sha256};
 use crate::{
     db::{Database, TaskStatus, TaskWorktreeRecord, TaskWorktreeState},
     project::Project,
-    revision::{RevisionSnapshot, clean_base_commit, git_head},
+    revision::{RevisionSnapshot, clean_base_commit, git_head, git_worktree_is_clean},
 };
 
 pub fn create(
@@ -302,17 +302,7 @@ pub fn remove(
         Some(&record.base_commit),
     )?;
 
-    let status = git_output(
-        path,
-        &[
-            "status",
-            "--porcelain=v1",
-            "-z",
-            "--untracked-files=all",
-            "--ignored=matching",
-        ],
-    )?;
-    if !status.stdout.is_empty() {
+    if !git_worktree_is_clean(path, true)? {
         bail!(
             "Task #{task_id} worktree contains changes or ignored files; TALOS left it intact at {}",
             path.display()

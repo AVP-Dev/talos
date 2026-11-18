@@ -9,6 +9,7 @@ The Critic is a separate role and process. It may use the same CLI vendor as the
 ## Revision identity
 
 - For a Git project, the base is the full `HEAD` commit captured before the first Writer attempt. A new task's first Writer run must start from a clean worktree, including the index and untracked files.
+- Dirty-tree checks for task startup and managed-worktree removal, plus the tracked `.talos/` guard, stop after the first output byte; large path lists are not buffered just to refuse an operation.
 - A rejection/fix/review cycle keeps the original base commit. Each new review includes the current diff from that base, so prior Writer changes remain in scope.
 - The patch is generated without rename detection and includes staged and unstaged tracked changes plus non-ignored untracked files. `.git/` and `.talos/` are excluded. Git output is streamed into bounded buffers before TALOS parses it: the complete patch is capped at 64 KiB; changed paths are capped at 4096 entries and 1024 UTF-8 bytes per path; the serialized prompt is capped at 96 KiB; and the structured response is capped at 64 KiB. If a limit is exceeded, review fails closed, reaps the Git child where possible, and records no partial review or approval.
 - `revision_id` is `sha256:<lowercase hex>` over the UTF-8 base commit, a NUL separator, and the complete patch bytes. The patch is never truncated. TALOS recomputes this ID after the Critic exits; a mismatch makes the result stale and unusable.

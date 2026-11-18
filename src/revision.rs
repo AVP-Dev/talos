@@ -36,7 +36,7 @@ pub struct RevisionFacts {
 /// Capture a Git base revision for a new Writer task. Existing changes are rejected so that
 /// the later Critic review can attribute the complete diff to TALOS's task lifecycle.
 pub fn clean_base_commit(project_root: &Path) -> Result<String> {
-    if !git_worktree_is_clean(project_root)? {
+    if !git_worktree_is_clean(project_root, false)? {
         bail!(
             "A new Writer task must start from a clean Git worktree so its review has an exact base revision"
         );
@@ -255,10 +255,26 @@ fn validate_commit_id(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn git_worktree_is_clean(project_root: &Path) -> Result<bool> {
+pub(crate) fn git_worktree_is_clean(project_root: &Path, include_ignored: bool) -> Result<bool> {
+    let mut arguments = vec!["status", "--porcelain=v1", "-z", "--untracked-files=all"];
+    if include_ignored {
+        arguments.push("--ignored=matching");
+    }
+    Ok(!git_output_has_any_bytes(
+        project_root,
+        &arguments,
+        "Cannot inspect whether the Git worktree is clean",
+    )?)
+}
+
+pub(crate) fn git_output_has_any_bytes(
+    project_root: &Path,
+    arguments: &[&str],
+    operation: &str,
+) -> Result<bool> {
     let mut command = Command::new("git");
     command
-        .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
+        .args(arguments)
         .current_dir(project_root)
         .env("GIT_TERMINAL_PROMPT", "0")
         .env("GIT_OPTIONAL_LOCKS", "0")
@@ -270,11 +286,11 @@ fn git_worktree_is_clean(project_root: &Path) -> Result<bool> {
     }
     let mut child = command
         .spawn()
-        .context("Cannot inspect whether the Writer worktree is clean")?;
+        .with_context(|| format!("Cannot run Git while {operation}"))?;
     let Some(mut stdout) = child.stdout.take() else {
         let _ = child.kill();
         let _ = child.wait();
-        bail!("Cannot read Git status output");
+        bail!("Cannot read Git output while {operation}");
     };
     let mut first_byte = [0_u8; 1];
     let bytes_read = match stdout.read(&mut first_byte) {
@@ -282,13 +298,13 @@ fn git_worktree_is_clean(project_root: &Path) -> Result<bool> {
         Err(error) => {
             let _ = child.kill();
             let _ = child.wait();
-            return Err(error).context("Cannot read Git status output");
+            return Err(error).with_context(|| format!("Cannot read Git output while {operation}"));
         }
     };
     if bytes_read > 0 {
         let _ = child.kill();
         let _ = child.wait();
-        return Ok(false);
+        return Ok(true);
     }
     drop(stdout);
     let status = child
@@ -296,11 +312,11 @@ fn git_worktree_is_clean(project_root: &Path) -> Result<bool> {
         .context("Cannot wait for Git status to finish")?;
     if !status.success() {
         bail!(
-            "Git status failed while checking the Writer worktree (exit code {})",
+            "Git command failed while {operation} (exit code {})",
             status.code().unwrap_or(-1)
         );
     }
-    Ok(true)
+    Ok(false)
 }
 
 fn git_output_limited(

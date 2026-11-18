@@ -27,7 +27,7 @@ use crate::{
     github::{self, GithubProbe},
     policy::{self, Action as PolicyAction, Authorization, ExecutionMode},
     project::{DiscoveryMethod, Project},
-    revision::{RevisionSnapshot, git_head},
+    revision::{RevisionSnapshot, git_head, git_output_has_any_bytes},
     secrets::{contains_sensitive, redact_sensitive},
     supervisor::{
         VERIFIED_AGY_CRITIC_VERSION, VERIFIED_AGY_WRITE_VERSION, WriterContinuation,
@@ -3029,11 +3029,11 @@ fn ensure_talos_ignored(project: &Project) -> Result<()> {
     if !matches!(&project.discovery, DiscoveryMethod::Git) {
         return Ok(());
     }
-    let tracked = git_command(project, &["ls-files", "--", ".talos"])?;
-    if !tracked.status.success() {
-        bail!("Cannot inspect whether .talos is tracked by Git");
-    }
-    if !tracked.stdout.is_empty() {
+    if git_output_has_any_bytes(
+        &project.root,
+        &["ls-files", "-z", "--", ".talos"],
+        "checking whether .talos is tracked by Git",
+    )? {
         bail!(
             ".talos contains tracked files; remove them from Git before TALOS creates local runtime state"
         );
