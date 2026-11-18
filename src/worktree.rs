@@ -49,7 +49,7 @@ pub fn create(
         &[
             "worktree",
             "add",
-            "--branch",
+            "-b",
             &branch_name,
             path_text,
             &base_commit,

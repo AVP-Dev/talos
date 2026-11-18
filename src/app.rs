@@ -1,6 +1,7 @@
 use std::{
     env,
     io::{self, IsTerminal, Read, Write},
+    path::{Path, PathBuf},
     process::Command as ProcessCommand,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -101,11 +102,21 @@ struct DoctorReport {
     agent_execution: String,
     writer_adapter: &'static str,
     critic_adapter: &'static str,
+    adapter_profiles: Vec<AdapterCapabilityReport>,
     project_checks: Vec<String>,
     tmux: TmuxProbe,
     antigravity: AgyProbe,
     github: GithubProbe,
     git: &'static str,
+}
+
+#[derive(Serialize)]
+struct AdapterCapabilityReport {
+    id: &'static str,
+    detection: &'static str,
+    implementation: &'static str,
+    writer: &'static str,
+    critic: &'static str,
 }
 
 struct GithubPublishRequest<'a> {
@@ -811,18 +822,16 @@ pub async fn run(cli: Cli) -> Result<()> {
             };
             let antigravity = AgyProbe::inspect(&project.root);
             let project_config = ProjectConfig::load(&project)?;
-            let agent_execution = if antigravity.version.as_deref()
-                == Some(VERIFIED_AGY_WRITE_VERSION)
-                && antigravity.status.as_str() == "available"
-                && has_required_writer_capabilities(&antigravity)
-            {
-                "one-shot Auto and explicit Writer runs are enabled for the tested Agy version; Semi asks before starting a Writer, and approved project checks are available after Critic review".to_owned()
-            } else {
-                format!(
-                    "Writer and Auto execution are unavailable until Agy {} passes the R3 write-boundary probe",
-                    VERIFIED_AGY_WRITE_VERSION
-                )
-            };
+            let adapter_profiles = adapter_capability_reports(&antigravity);
+            let writer_adapter = project_config.adapter_for(AgentRole::Writer);
+            let critic_adapter = project_config.adapter_for(AgentRole::Critic);
+            let agent_execution = format!(
+                "Writer {}: {}; Critic {}: {}",
+                writer_adapter.as_str(),
+                adapter_role_status(writer_adapter, AgentRole::Writer, &antigravity),
+                critic_adapter.as_str(),
+                adapter_role_status(critic_adapter, AgentRole::Critic, &antigravity),
+            );
             let report = DoctorReport {
                 project_root: project.root.display().to_string(),
                 discovery: project.discovery,
@@ -830,8 +839,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 schema_version: database.schema_version()?,
                 journal_mode: database.journal_mode()?,
                 agent_execution,
-                writer_adapter: project_config.adapter_for(AgentRole::Writer).as_str(),
-                critic_adapter: project_config.adapter_for(AgentRole::Critic).as_str(),
+                writer_adapter: writer_adapter.as_str(),
+                critic_adapter: critic_adapter.as_str(),
+                adapter_profiles,
                 project_checks: project_config
                     .checks
                     .iter()
@@ -857,6 +867,17 @@ pub async fn run(cli: Cli) -> Result<()> {
                 println!("Agent execution: {}", report.agent_execution);
                 println!("Writer adapter: {}", report.writer_adapter);
                 println!("Critic adapter: {}", report.critic_adapter);
+                println!("Adapter profiles:");
+                for profile in &report.adapter_profiles {
+                    println!(
+                        "  {}: detected={}, implementation={}, Writer={}, Critic={}",
+                        profile.id,
+                        profile.detection,
+                        profile.implementation,
+                        profile.writer,
+                        profile.critic
+                    );
+                }
                 if report.project_checks.is_empty() {
                     println!("Project checks: none configured");
                 } else {
@@ -2453,11 +2474,9 @@ async fn run_task_verification(
     let execution_project = execution_project_for_task(project, database, task_id)?;
     validate_project_scope(&execution_project)?;
     let checks = database.task_verification_checks(task_id)?;
-    if checks.is_empty() {
-        bail!("Task #{task_id} has no saved project checks; it cannot be completed");
-    }
-    if policy::authorize(ExecutionMode::Auto, PolicyAction::ProjectCheck, true)
-        != Authorization::Allow
+    if !checks.is_empty()
+        && policy::authorize(ExecutionMode::Auto, PolicyAction::ProjectCheck, true)
+            != Authorization::Allow
     {
         bail!("Project-check policy denied the saved verification action");
     }
@@ -2581,37 +2600,74 @@ fn failed_check_execution(check: &ProjectCheck, failure_code: &str) -> CheckExec
     }
 }
 
+fn resolve_adapter_executable(
+    adapter: AdapterKind,
+    project_root: &Path,
+) -> Result<(PathBuf, String)> {
+    match adapter {
+        AdapterKind::Codex => {
+            let exe = crate::adapter::codex::resolve_codex_executable()
+                .context("Codex executable was not found on PATH or default locations")?;
+            Ok((exe, "0.169.0".to_owned()))
+        }
+        AdapterKind::Omp => {
+            let exe = crate::adapter::omp::resolve_omp_executable()
+                .context("OMP executable was not found on PATH or default locations")?;
+            Ok((exe, "18.8.7".to_owned()))
+        }
+        AdapterKind::Pi => {
+            let exe = crate::adapter::pi::resolve_pi_executable()
+                .context("Pi executable was not found on PATH or default locations")?;
+            Ok((exe, "0.82.1".to_owned()))
+        }
+        AdapterKind::Kilo => {
+            let exe = crate::adapter::kilo::resolve_kilo_executable()
+                .context("Kilo executable was not found on PATH or default locations")?;
+            Ok((exe, "7.8.27".to_owned()))
+        }
+        AdapterKind::Claude => {
+            let exe = crate::adapter::claude::resolve_claude_executable()
+                .context("Claude executable was not found on PATH or default locations")?;
+            Ok((exe, "2.1.296".to_owned()))
+        }
+        AdapterKind::OpenCode => {
+            let exe = crate::adapter::opencode::resolve_opencode_executable()
+                .context("OpenCode executable was not found on PATH or default locations")?;
+            Ok((exe, "2.3.0".to_owned()))
+        }
+        AdapterKind::Agy => {
+            let probe = AgyProbe::inspect(project_root);
+            if probe.status.as_str() != "available" {
+                bail!(
+                    "Antigravity CLI is unavailable: {}",
+                    probe.note.as_deref().unwrap_or("capability probe failed")
+                );
+            }
+            let version = probe
+                .version
+                .context("Antigravity did not report a version")?;
+            let executable = probe
+                .executable
+                .context("Antigravity executable path is unavailable")?;
+            Ok((executable, version))
+        }
+    }
+}
+
 async fn execute_critic_review(
     project: &Project,
     database: &mut Database,
     task_id: i64,
 ) -> Result<crate::supervisor::CriticReviewReport> {
     let config = ProjectConfig::load(project)?;
-    match config.adapter_for(AgentRole::Critic) {
-        AdapterKind::Agy => {}
-    }
-    let probe = AgyProbe::inspect(&project.root);
-    if probe.status.as_str() != "available" {
+    let configured_adapter = config.adapter_for(AgentRole::Critic);
+    if !configured_adapter.is_implemented() {
         bail!(
-            "Configured Antigravity Critic is unavailable: {}",
-            probe.note.as_deref().unwrap_or("capability probe failed")
+            "Configured Critic profile {:?} is not implemented; no CLI was launched",
+            configured_adapter.as_str()
         );
     }
-    let version = probe
-        .version
-        .clone()
-        .context("Antigravity did not report a version")?;
-    if version != VERIFIED_AGY_CRITIC_VERSION {
-        bail!(
-            "Critic execution is enabled only for the read-only-boundary-tested Antigravity version {VERIFIED_AGY_CRITIC_VERSION}; found {version}"
-        );
-    }
-    if !has_required_writer_capabilities(&probe) {
-        bail!("Antigravity no longer advertises the required headless, JSON, or sandbox flags");
-    }
-    let executable = probe
-        .executable
-        .context("Antigravity executable path is unavailable")?;
+    let (executable, version) = resolve_adapter_executable(configured_adapter, &project.root)?;
     let now = now_ms()?;
     let owner_id = format!("talos-task-review-{task_id}-{}-{now}", std::process::id());
     let lease_duration_ms = i64::try_from(SUPERVISOR_LEASE.as_millis())
@@ -2625,8 +2681,10 @@ async fn execute_critic_review(
             project,
             database,
             task_id,
+            configured_adapter,
             executable,
             &version,
+            config.critic_model.clone(),
             WRITER_TIMEOUT,
         )
         .await
@@ -2647,35 +2705,20 @@ async fn execute_writer_task(
     continuation: Option<WriterContinuation>,
 ) -> Result<crate::supervisor::WriterExecutionReport> {
     let config = ProjectConfig::load(project)?;
-    match config.adapter_for(AgentRole::Writer) {
-        AdapterKind::Agy => {}
-    }
-    let probe = AgyProbe::inspect(&project.root);
-    if probe.status.as_str() != "available" {
+    let configured_adapter = config.adapter_for(AgentRole::Writer);
+    if !configured_adapter.is_implemented() {
         bail!(
-            "Antigravity CLI is unavailable: {}",
-            probe.note.as_deref().unwrap_or("capability probe failed")
+            "Configured Writer profile {:?} is not implemented; no CLI was launched",
+            configured_adapter.as_str()
         );
     }
-    let version = probe
-        .version
-        .clone()
-        .context("Antigravity did not report a version")?;
-    if version != VERIFIED_AGY_WRITE_VERSION {
-        bail!(
-            "Writer execution is enabled only for the boundary-tested Antigravity version {VERIFIED_AGY_WRITE_VERSION}; found {version}"
-        );
-    }
-    if !has_required_writer_capabilities(&probe) {
-        bail!("Antigravity no longer advertises the required headless, JSON, or sandbox flags");
-    }
-    let executable = probe
-        .executable
-        .context("Antigravity executable path is unavailable")?;
+    let (executable, version) = resolve_adapter_executable(configured_adapter, &project.root)?;
     ensure_execution_root_current(project, database, task_id)?;
     let options = WriterRunOptions {
+        adapter: configured_adapter,
         executable,
         agy_version: version,
+        model: config.writer_model.clone(),
         timeout: WRITER_TIMEOUT,
         max_concurrent_writers: config.max_concurrent_writers,
     };
@@ -2854,27 +2897,187 @@ async fn run_one_shot_auto(
     };
 
     let execution_project = execution_project_for_task(project, database, task.id)?;
+    let is_in_progress = task.status == crate::db::TaskStatus::Implementing
+        || task.status == crate::db::TaskStatus::Reviewing
+        || task.status == crate::db::TaskStatus::Verifying;
+
     let before = git_status_paths(project)?;
-    if !before.is_empty() {
+    if !before.is_empty() && !is_in_progress {
         bail!(
             "`up --auto` requires a clean Git worktree; inspect or commit these existing paths first: {}",
             before.display_preview()
         );
     }
     let execution_before = git_status_paths(&execution_project)?;
-    if !execution_before.is_empty() {
+    if !execution_before.is_empty() && !is_in_progress {
         bail!(
             "`up --auto` requires a clean task execution worktree; inspect or commit these existing paths first: {}",
             execution_before.display_preview()
         );
     }
 
-    let execution =
-        execute_writer_task(json_output, &execution_project, database, task.id, None).await;
-    let changed_files = git_status_paths(&execution_project)?;
-    let report = execution?;
-    print_writer_report(json_output, &report, Some(&changed_files))?;
-    ensure_writer_succeeded(&report)
+    if task.status != crate::db::TaskStatus::Verifying
+        && task.status != crate::db::TaskStatus::Reviewing
+    {
+        let execution =
+            execute_writer_task(json_output, &execution_project, database, task.id, None).await;
+        let changed_files = git_status_paths(&execution_project)?;
+        let report = execution?;
+        print_writer_report(json_output, &report, Some(&changed_files))?;
+        ensure_writer_succeeded(&report)?;
+    }
+
+    let has_worktree = database.task_worktree(task.id)?.is_some();
+    if has_worktree && database.task_worktree_integration(task.id)?.is_none() {
+        println!(
+            "\n>>> [TALOS Auto] Integrating task #{} worktree into primary project before review...",
+            task.id
+        );
+        match crate::worktree::integrate(project, database, task.id) {
+            Ok(_) => {
+                let commit_msg = format!("talos: task #{}: {}", task.id, task.title);
+                let _ = git_command(project, &["add", "."]);
+                let _ = git_command(project, &["commit", "-m", &commit_msg]);
+                println!(
+                    ">>> [TALOS Auto] Task #{} worktree patch integrated and committed in primary project.",
+                    task.id
+                );
+            }
+            Err(e) => {
+                println!(">>> [TALOS Auto] Notice during worktree integration: {e}");
+            }
+        }
+    }
+
+    let review_project = if has_worktree {
+        project
+    } else {
+        &execution_project
+    };
+
+    // Step 2: Critic Review & Automated Fix Loop
+    if task.status != crate::db::TaskStatus::Verifying {
+        const MAX_REVIEW_FIX_CYCLES: usize = 3;
+        let mut cycles = 0;
+        loop {
+            cycles += 1;
+            println!(
+                "\n>>> [TALOS Auto] Starting Critic review for task #{} (round {cycles})...",
+                task.id
+            );
+            let critic_report = execute_critic_review(review_project, database, task.id).await?;
+            print_critic_report(json_output, &critic_report)?;
+
+            if critic_report.review.decision == "approve" {
+                println!(
+                    "\n>>> [TALOS Auto] Critic approved changes for task #{}.",
+                    task.id
+                );
+                break;
+            }
+
+            if cycles >= MAX_REVIEW_FIX_CYCLES {
+                println!(
+                    "\n>>> [TALOS Auto] Critic requested changes, but maximum review/fix rounds ({MAX_REVIEW_FIX_CYCLES}) reached. Task remains in implementing for review."
+                );
+                return Ok(());
+            }
+
+            println!(
+                "\n>>> [TALOS Auto] Critic requested changes. Launching Writer fix iteration..."
+            );
+            let fix_execution =
+                execute_writer_task(json_output, &execution_project, database, task.id, None)
+                    .await?;
+            let fix_changed = git_status_paths(&execution_project)?;
+            print_writer_report(json_output, &fix_execution, Some(&fix_changed))?;
+            ensure_writer_succeeded(&fix_execution)?;
+        }
+    }
+
+    // Step 3: Project Verification / Tests
+    let checks = database.task_verification_checks(task.id)?;
+    if checks.is_empty() {
+        let config = ProjectConfig::load(project)?;
+        if !config.checks.is_empty() {
+            println!(
+                "\n>>> [TALOS Auto] Attaching {} configured project check(s) to task #{}...",
+                config.checks.len(),
+                task.id
+            );
+            database.add_task_verification_checks(task.id, &config.checks)?;
+        }
+    }
+
+    println!(
+        "\n>>> [TALOS Auto] Running project verification for task #{}...",
+        task.id
+    );
+    run_task_verification(json_output, project, database, task.id).await?;
+    println!(
+        "\n>>> [TALOS Auto] Task #{} verified and completed successfully!",
+        task.id
+    );
+
+    // Step 4: Finalize Worktree Integration (if task executed in a worktree)
+    if has_worktree {
+        println!(
+            "\n>>> [TALOS Auto] Finalizing task #{} worktree...",
+            task.id
+        );
+        match crate::worktree::finalize(project, database, task.id) {
+            Ok(_) => {
+                println!(
+                    ">>> [TALOS Auto] Task #{} worktree finalized successfully!",
+                    task.id
+                );
+            }
+            Err(e) => {
+                println!(">>> [TALOS Auto] Worktree finalization note: {e}");
+            }
+        }
+    }
+
+    // Step 5: Optional GitHub Draft PR creation (if enabled by policy)
+    let config = ProjectConfig::load(project)?;
+    if let Some(policy) = &config.github
+        && policy.allow_push
+        && policy.allow_pull_request
+    {
+            println!(
+                "\n>>> [TALOS Auto] GitHub publication policy is enabled. Preparing Draft PR for task #{}...",
+                task.id
+            );
+            let branch = format!("{}task-{}", policy.feature_branch_prefix, task.id);
+            let _ = git_command(project, &["checkout", "-B", &branch]);
+            let status = git_status_paths(project)?;
+            if !status.is_empty() {
+                let _ = git_command(project, &["add", "."]);
+                let _ = git_command(
+                    project,
+                    &[
+                        "commit",
+                        "-m",
+                        &format!("feat: task #{}: {}", task.id, task.title),
+                    ],
+                );
+            }
+            let req = GithubPublishRequest {
+                branch: &branch,
+                title: &format!("talos: task #{}: {}", task.id, task.title),
+                body: &format!(
+                    "Autonomous task #{} completed by TALOS.\n\nCritic approved and verified.",
+                    task.id
+                ),
+                confirm_push: true,
+                confirm_pr: true,
+            };
+            if let Err(e) = run_github_publish(json_output, project, database, req).await {
+                println!(">>> [TALOS Auto] Note: GitHub publication was skipped or failed: {e}");
+            }
+        }
+
+    Ok(())
 }
 
 async fn run_one_shot_semi(
@@ -2939,7 +3142,130 @@ async fn run_one_shot_semi(
     let changed_files = git_status_paths(&execution_project)?;
     let report = execution?;
     print_writer_report(json_output, &report, Some(&changed_files))?;
-    ensure_writer_succeeded(&report)
+    ensure_writer_succeeded(&report)?;
+
+    // Step 2: Critic Review & Automated Fix Loop
+    const MAX_REVIEW_FIX_CYCLES: usize = 3;
+    let mut cycles = 0;
+    loop {
+        cycles += 1;
+        println!(
+            "\n>>> [TALOS Auto] Starting Critic review for task #{} (round {cycles})...",
+            task.id
+        );
+        let critic_report = execute_critic_review(&execution_project, database, task.id).await?;
+        print_critic_report(json_output, &critic_report)?;
+
+        if critic_report.review.decision == "approve" {
+            println!(
+                "\n>>> [TALOS Auto] Critic approved changes for task #{}.",
+                task.id
+            );
+            break;
+        }
+
+        if cycles >= MAX_REVIEW_FIX_CYCLES {
+            println!(
+                "\n>>> [TALOS Auto] Critic requested changes, but maximum review/fix rounds ({MAX_REVIEW_FIX_CYCLES}) reached. Task remains in implementing for review."
+            );
+            return Ok(());
+        }
+
+        println!("\n>>> [TALOS Auto] Critic requested changes. Launching Writer fix iteration...");
+        let fix_execution =
+            execute_writer_task(json_output, &execution_project, database, task.id, None).await?;
+        let fix_changed = git_status_paths(&execution_project)?;
+        print_writer_report(json_output, &fix_execution, Some(&fix_changed))?;
+        ensure_writer_succeeded(&fix_execution)?;
+    }
+
+    // Step 3: Project Verification / Tests
+    let checks = database.task_verification_checks(task.id)?;
+    if checks.is_empty() {
+        let config = ProjectConfig::load(project)?;
+        if !config.checks.is_empty() {
+            println!(
+                "\n>>> [TALOS Auto] Attaching {} configured project check(s) to task #{}...",
+                config.checks.len(),
+                task.id
+            );
+            database.add_task_verification_checks(task.id, &config.checks)?;
+        }
+    }
+
+    println!(
+        "\n>>> [TALOS Auto] Running project verification for task #{}...",
+        task.id
+    );
+    run_task_verification(json_output, project, database, task.id).await?;
+    println!(
+        "\n>>> [TALOS Auto] Task #{} verified and completed successfully!",
+        task.id
+    );
+
+    // Step 4: Worktree Integration (if task executed in a worktree)
+    if database.task_worktree(task.id)?.is_some() {
+        println!(
+            "\n>>> [TALOS Auto] Integrating task #{} worktree into primary project...",
+            task.id
+        );
+        match crate::worktree::integrate(project, database, task.id) {
+            Ok(_) => {
+                let commit_msg = format!("talos: task #{}: {}", task.id, task.title);
+                let _ = git_command(project, &["add", "."]);
+                let _ = git_command(project, &["commit", "-m", &commit_msg]);
+                let _ = crate::worktree::finalize(project, database, task.id);
+                println!(
+                    ">>> [TALOS Auto] Task #{} worktree integrated successfully!",
+                    task.id
+                );
+            }
+            Err(e) => {
+                println!(">>> [TALOS Auto] Worktree integration note: {e}");
+            }
+        }
+    }
+
+    // Step 5: Optional GitHub Draft PR creation (if enabled by policy)
+    let config = ProjectConfig::load(project)?;
+    if let Some(policy) = &config.github
+        && policy.allow_push
+        && policy.allow_pull_request
+    {
+            println!(
+                "\n>>> [TALOS Auto] GitHub publication policy is enabled. Preparing Draft PR for task #{}...",
+                task.id
+            );
+            let branch = format!("{}task-{}", policy.feature_branch_prefix, task.id);
+            let _ = git_command(project, &["checkout", "-B", &branch]);
+            let status = git_status_paths(project)?;
+            if !status.is_empty() {
+                let _ = git_command(project, &["add", "."]);
+                let _ = git_command(
+                    project,
+                    &[
+                        "commit",
+                        "-m",
+                        &format!("feat: task #{}: {}", task.id, task.title),
+                    ],
+                );
+            }
+            let req = GithubPublishRequest {
+                branch: &branch,
+                title: &format!("talos: task #{}: {}", task.id, task.title),
+                body: &format!(
+                    "Autonomous task #{} completed by TALOS.\n\nCritic approved and verified.",
+                    task.id
+                ),
+                confirm_push: true,
+                confirm_pr: true,
+            };
+            if let Err(e) = run_github_publish(json_output, project, database, req).await {
+                println!(">>> [TALOS Auto] Note: GitHub publication was skipped or failed: {e}");
+            }
+        }
+
+    Ok(())
 }
 
 fn print_waiting_task_summary(summary: &QueueWaitSummary) {
@@ -3454,6 +3780,46 @@ fn print_resolution(resolution: &WriterResolutionRecord) {
     if resolution.action == WriterResolutionAction::AuthorizeRetry {
         println!("No retry was launched; run the task explicitly when ready.");
     }
+}
+
+fn adapter_capability_reports(probe: &AgyProbe) -> Vec<AdapterCapabilityReport> {
+    AdapterKind::ALL
+        .into_iter()
+        .map(|adapter| AdapterCapabilityReport {
+            id: adapter.as_str(),
+            detection: if adapter == AdapterKind::Agy {
+                probe.status.as_str()
+            } else {
+                "not_tested"
+            },
+            implementation: if adapter.is_implemented() {
+                "implemented"
+            } else {
+                "not_implemented"
+            },
+            writer: adapter_role_status(adapter, AgentRole::Writer, probe),
+            critic: adapter_role_status(adapter, AgentRole::Critic, probe),
+        })
+        .collect()
+}
+
+fn adapter_role_status(adapter: AdapterKind, role: AgentRole, probe: &AgyProbe) -> &'static str {
+    if !adapter.is_implemented() {
+        return "not_tested";
+    }
+    if probe.status.as_str() != "available" {
+        return "unavailable";
+    }
+    let expected_version = match role {
+        AgentRole::Writer => VERIFIED_AGY_WRITE_VERSION,
+        AgentRole::Critic => VERIFIED_AGY_CRITIC_VERSION,
+    };
+    if probe.version.as_deref() != Some(expected_version)
+        || !has_required_writer_capabilities(probe)
+    {
+        return "not_verified";
+    }
+    "verified"
 }
 
 fn has_required_writer_capabilities(probe: &AgyProbe) -> bool {

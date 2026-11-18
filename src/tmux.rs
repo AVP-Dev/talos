@@ -184,20 +184,15 @@ mod tests {
 
     fn test_socket() -> PathBuf {
         let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-        PathBuf::from(format!(
-            "/private/tmp/talos-tmux-test-{}-{id}.sock",
-            std::process::id()
-        ))
+        std::env::temp_dir().join(format!("talos-tmux-test-{}-{id}.sock", std::process::id()))
     }
 
     fn fake_tmux() -> (PathBuf, PathBuf) {
         use std::os::unix::fs::PermissionsExt;
 
         let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
-        let root = PathBuf::from(format!(
-            "/private/tmp/talos-fake-tmux-{}-{id}",
-            std::process::id()
-        ));
+        let root =
+            std::env::temp_dir().join(format!("talos-fake-tmux-{}-{id}", std::process::id()));
         fs::create_dir_all(&root).expect("create fake tmux directory");
         let executable = root.join("tmux");
         let state_file = root.join("sessions");

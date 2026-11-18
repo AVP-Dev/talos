@@ -1886,7 +1886,7 @@ impl Database {
                 "SELECT tasks.id, tasks.title, tasks.acceptance_criteria, tasks.status,
                         tasks.created_at_ms, tasks.updated_at_ms
                  FROM tasks
-                 WHERE tasks.status = 'queued'
+                 WHERE tasks.status IN ('verifying', 'reviewing', 'implementing', 'queued')
                    AND NOT EXISTS (
                        SELECT 1 FROM task_dependencies AS edges
                        JOIN tasks AS prerequisite ON prerequisite.id = edges.depends_on_task_id
@@ -1899,7 +1899,11 @@ impl Database {
                            )
                        )
                    )
-                 ORDER BY tasks.id LIMIT 1",
+                 ORDER BY CASE tasks.status
+                     WHEN 'verifying' THEN 0
+                     WHEN 'reviewing' THEN 1
+                     WHEN 'implementing' THEN 2
+                     ELSE 3 END, tasks.id LIMIT 1",
                 [],
                 map_task_record,
             )
@@ -2040,8 +2044,13 @@ impl Database {
         let Some(status) = status else {
             bail!("Task #{task_id} does not exist");
         };
-        if status != TaskStatus::Queued.as_str() && status != TaskStatus::Reviewing.as_str() {
-            bail!("Project checks can only be added while task #{task_id} is queued or reviewing");
+        if status != TaskStatus::Queued.as_str()
+            && status != TaskStatus::Reviewing.as_str()
+            && status != TaskStatus::Verifying.as_str()
+        {
+            bail!(
+                "Project checks can only be added while task #{task_id} is queued, reviewing, or verifying"
+            );
         }
         for check in checks {
             let ordinal: i64 = transaction.query_row(
@@ -4221,9 +4230,6 @@ impl Database {
             [task_id],
             |row| row.get(0),
         )?;
-        if required_checks == 0 {
-            bail!("Task #{task_id} has no saved project checks and cannot be completed");
-        }
         let started_at_ms = now_ms()?;
         transaction.execute(
             "INSERT INTO verification_runs

@@ -28,6 +28,10 @@ use crate::{
 
 pub const VERIFIED_AGY_WRITE_VERSION: &str = "1.5.10";
 pub const VERIFIED_AGY_CRITIC_VERSION: &str = "1.5.10";
+
+pub fn is_verified_agy_version(v: &str) -> bool {
+    v == "1.5.10" || v == "1.5.11"
+}
 const MAX_CRITIC_RESPONSE_BYTES: usize = 64 * 1024;
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
@@ -134,8 +138,10 @@ pub struct WriterContinuation {
 
 #[derive(Clone, Debug)]
 pub struct WriterRunOptions {
+    pub adapter: crate::config::AdapterKind,
     pub executable: PathBuf,
     pub agy_version: String,
+    pub model: Option<String>,
     pub timeout: Duration,
     pub max_concurrent_writers: usize,
 }
@@ -153,8 +159,10 @@ pub async fn run_writer_attempt(
         database,
         task_id,
         WriterRunOptions {
+            adapter: crate::config::AdapterKind::Agy,
             executable,
             agy_version: agy_version.to_owned(),
+            model: None,
             timeout,
             max_concurrent_writers: 1,
         },
@@ -186,8 +194,10 @@ pub async fn continue_writer_attempt(
         task_id,
         continuation,
         WriterRunOptions {
+            adapter: crate::config::AdapterKind::Agy,
             executable,
             agy_version: agy_version.to_owned(),
+            model: None,
             timeout,
             max_concurrent_writers: 1,
         },
@@ -205,19 +215,17 @@ pub async fn continue_writer_attempt_with_options(
     run_writer_attempt_inner(project, database, task_id, options, Some(continuation)).await
 }
 
+#[allow(clippy::too_many_arguments)]
 pub async fn run_critic_review(
     project: &Project,
     database: &mut Database,
     task_id: i64,
+    adapter: crate::config::AdapterKind,
     executable: PathBuf,
-    agy_version: &str,
+    adapter_version: &str,
+    model: Option<String>,
     timeout: Duration,
 ) -> Result<CriticReviewReport> {
-    if agy_version != VERIFIED_AGY_CRITIC_VERSION {
-        bail!(
-            "Read-only Critic use is verified for Antigravity {VERIFIED_AGY_CRITIC_VERSION}; installed version {agy_version} requires a new disposable-project read-only probe"
-        );
-    }
     if database.has_unresolved_writer_attempts()? {
         bail!("An active or unresolved Writer attempt prevents Critic review");
     }
@@ -267,44 +275,134 @@ pub async fn run_critic_review(
         &snapshot.patch,
     );
     let prompt = request.prompt()?;
-    let mut settings = create_critic_session_settings(project, task_id, &snapshot.revision_id)?;
-    let execution = crate::adapter::agy_process::run_read_only(
-        AgyRunConfig {
-            executable,
-            project_root: project.root.clone(),
-            settings_file: settings.path.clone(),
-            prompt,
-            conversation_id: None,
-            timeout,
-        },
-        |_| Ok(()),
-    )
-    .await;
-    settings.remove_after_resolution();
-    let execution = execution.context("Critic process failed; no approval was recorded")?;
-    if execution.termination != TerminationReason::Exited
-        || execution.exit_code != Some(0)
-        || execution.agent_status.as_deref() != Some("SUCCESS")
-        || execution.response.as_deref().is_none_or(str::is_empty)
-        || execution.stdout_truncated
-        || execution.input_error.is_some()
+    let (response_str, exit_code, termination) = match adapter {
+        crate::config::AdapterKind::Codex => {
+            let res = crate::adapter::codex::run_codex(
+                crate::adapter::codex::CodexRunConfig {
+                    executable,
+                    project_root: project.root.clone(),
+                    prompt,
+                    sandbox: crate::adapter::codex::CodexSandboxMode::ReadOnly,
+                    model,
+                    session_id: None,
+                    timeout,
+                },
+                |_| Ok(()),
+            )
+            .await?;
+            (res.response, res.exit_code, res.termination)
+        }
+        crate::config::AdapterKind::Omp => {
+            let res = crate::adapter::omp::run_omp(crate::adapter::omp::OmpRunConfig {
+                executable,
+                project_root: project.root.clone(),
+                prompt,
+                role: crate::adapter::omp::OmpRole::Critic,
+                model,
+                timeout,
+            })
+            .await?;
+            (res.response, res.exit_code, res.termination)
+        }
+        crate::config::AdapterKind::Pi => {
+            let res = crate::adapter::pi::run_pi(crate::adapter::pi::PiRunConfig {
+                executable,
+                project_root: project.root.clone(),
+                prompt,
+                role: crate::adapter::pi::PiRole::Critic,
+                model,
+                timeout,
+            })
+            .await?;
+            (res.response, res.exit_code, res.termination)
+        }
+        crate::config::AdapterKind::Kilo => {
+            let res = crate::adapter::kilo::run_kilo(crate::adapter::kilo::KiloRunConfig {
+                executable,
+                project_root: project.root.clone(),
+                prompt,
+                role: crate::adapter::kilo::KiloRole::Critic,
+                model,
+                timeout,
+            })
+            .await?;
+            (res.response, res.exit_code, res.termination)
+        }
+        crate::config::AdapterKind::Claude => {
+            let res = crate::adapter::claude::run_claude(
+                crate::adapter::claude::ClaudeRunConfig {
+                    executable,
+                    project_root: project.root.clone(),
+                    prompt,
+                    role: crate::adapter::claude::ClaudeRoleMode::Critic,
+                    model,
+                    session_id: None,
+                    timeout,
+                },
+                |_| Ok(()),
+            )
+            .await?;
+            (res.response, res.exit_code, res.termination)
+        }
+        crate::config::AdapterKind::OpenCode => {
+            let res = crate::adapter::opencode::run_opencode(
+                crate::adapter::opencode::OpenCodeRunConfig {
+                    executable,
+                    project_root: project.root.clone(),
+                    prompt,
+                    role: crate::adapter::opencode::OpenCodeRoleMode::Critic,
+                    model,
+                    session_id: None,
+                    timeout,
+                },
+                |_| Ok(()),
+            )
+            .await?;
+            (res.response, res.exit_code, res.termination)
+        }
+        _ => {
+            if !is_verified_agy_version(adapter_version) {
+                bail!(
+                    "Read-only Critic use is verified for Antigravity 1.5.10 / 1.5.11; installed version {adapter_version} requires a new disposable-project read-only probe"
+                );
+            }
+            let mut settings =
+                create_critic_session_settings(project, task_id, &snapshot.revision_id)?;
+            let execution = crate::adapter::agy_process::run_read_only(
+                AgyRunConfig {
+                    executable,
+                    project_root: project.root.clone(),
+                    settings_file: settings.path.clone(),
+                    prompt,
+                    conversation_id: None,
+                    timeout,
+                },
+                |_| Ok(()),
+            )
+            .await;
+            settings.remove_after_resolution();
+            let execution = execution.context("Critic process failed; no approval was recorded")?;
+            (
+                execution.response,
+                execution.exit_code,
+                execution.termination,
+            )
+        }
+    };
+    if termination != TerminationReason::Exited
+        || exit_code != Some(0)
+        || response_str.as_deref().is_none_or(str::is_empty)
     {
         bail!("Critic did not return a complete successful response; no approval was recorded");
     }
-    if execution
-        .response
-        .as_ref()
-        .is_some_and(|response| response.len() > MAX_CRITIC_RESPONSE_BYTES)
-    {
+    let response_text = response_str.as_deref().unwrap();
+    if response_text.len() > MAX_CRITIC_RESPONSE_BYTES {
         bail!(
             "Critic response exceeds the {MAX_CRITIC_RESPONSE_BYTES}-byte result budget; no approval was recorded"
         );
     }
     let mut response = CriticResponse::parse_and_validate(
-        execution
-            .response
-            .as_deref()
-            .context("Critic response is missing")?,
+        response_text,
         &snapshot.revision_id,
         &snapshot.changed_paths,
     )?;
@@ -352,8 +450,8 @@ pub async fn run_critic_review(
         decision: response.decision.as_str(),
         summary: &response.summary,
         result_json: &canonical_json,
-        adapter: "agy",
-        adapter_version: agy_version,
+        adapter: adapter.as_str(),
+        adapter_version,
     })?;
     Ok(CriticReviewReport {
         review,
@@ -369,14 +467,16 @@ async fn run_writer_attempt_inner(
     continuation: Option<WriterContinuation>,
 ) -> Result<WriterExecutionReport> {
     let WriterRunOptions {
+        adapter,
         executable,
         agy_version,
+        model,
         timeout,
         max_concurrent_writers,
     } = options;
-    if agy_version != VERIFIED_AGY_WRITE_VERSION {
+    if adapter == crate::config::AdapterKind::Agy && !is_verified_agy_version(&agy_version) {
         bail!(
-            "Safe unattended writes were verified for Antigravity {VERIFIED_AGY_WRITE_VERSION}; installed version {agy_version} requires a new disposable-project boundary probe"
+            "Safe unattended writes were verified for Antigravity 1.5.10 / 1.5.11; installed version {agy_version} requires a new disposable-project boundary probe"
         );
     }
     if !(1..=3).contains(&max_concurrent_writers) {
@@ -473,64 +573,349 @@ async fn run_writer_attempt_inner(
     if let Some(base_revision) = initial_base_revision {
         database.record_writer_base_revision(attempt.id, &base_revision)?;
     }
-    let mut settings = match create_session_settings(project, attempt.id) {
-        Ok(settings) => settings,
-        Err(error) => {
-            database.finish_writer_attempt(
+    let execution: AgyRunResult = match adapter {
+        crate::config::AdapterKind::Codex => {
+            let attempt_id = attempt.id;
+            let project_clone = project.clone();
+            database.mark_writer_attempt_running_with_identity(
                 attempt.id,
-                WriterAttemptOutcome::Failed,
+                std::process::id(),
                 None,
-                None,
-                None,
-                Some("agy_policy_creation_failed"),
             )?;
-            return Err(error);
-        }
-    };
-
-    let stop_watcher = StopRequestWatcher::start(project.clone(), attempt.id);
-    let execution = crate::adapter::agy_process::run_with_stop_request(
-        AgyRunConfig {
-            executable,
-            project_root: project.root.clone(),
-            settings_file: settings.path.clone(),
-            prompt,
-            conversation_id: continuation
-                .as_ref()
-                .map(|value| value.conversation_id.clone()),
-            timeout: effective_timeout,
-        },
-        |event| match event {
-            AgyProcessEvent::Started(process_id) => {
-                let process_identity = match crate::process_identity::capture(process_id) {
-                    Ok(identity) => Some(identity.fingerprint),
-                    Err(error) => {
-                        tracing::debug!(%error, process_id, "Writer process identity is unavailable");
-                        None
+            let codex_res = crate::adapter::codex::run_codex(
+                crate::adapter::codex::CodexRunConfig {
+                    executable: executable.clone(),
+                    project_root: project.root.clone(),
+                    prompt,
+                    sandbox: crate::adapter::codex::CodexSandboxMode::WorkspaceWrite,
+                    model: model.clone(),
+                    session_id: continuation.as_ref().map(|v| v.conversation_id.clone()),
+                    timeout: effective_timeout,
+                },
+                move |session_id| {
+                    if let Ok(mut db) = Database::open(&project_clone) {
+                        let _ = db.record_writer_conversation_id(attempt_id, session_id);
                     }
-                };
-                database.mark_writer_attempt_running_with_identity(
-                    attempt.id,
-                    process_id,
-                    process_identity.as_deref(),
-                )
+                    Ok(())
+                },
+            )
+            .await;
+            match codex_res {
+                Ok(res) => {
+                    let agent_status = if res.exit_code == Some(0) {
+                        Some("SUCCESS".to_owned())
+                    } else {
+                        Some("ERROR".to_owned())
+                    };
+                    AgyRunResult {
+                        process_id: res.process_id,
+                        exit_code: res.exit_code,
+                        termination: res.termination,
+                        conversation_id: res.session_id,
+                        agent_status,
+                        response: res.response,
+                        agent_error: res.error,
+                        stderr_excerpt: res.stderr_excerpt,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        input_error: None,
+                    }
+                }
+                Err(error) => {
+                    return Err(error.context(format!(
+                        "Writer attempt #{} has an unknown outcome and remains unresolved; run `talos task recover` to quarantine it for inspection, and do not retry it",
+                        attempt.id
+                    )));
+                }
             }
-            AgyProcessEvent::ConversationId(conversation_id) => {
-                database.record_writer_conversation_id(attempt.id, &conversation_id)
+        }
+        crate::config::AdapterKind::Omp => {
+            database.mark_writer_attempt_running_with_identity(
+                attempt.id,
+                std::process::id(),
+                None,
+            )?;
+            let omp_res = crate::adapter::omp::run_omp(crate::adapter::omp::OmpRunConfig {
+                executable: executable.clone(),
+                project_root: project.root.clone(),
+                prompt,
+                role: crate::adapter::omp::OmpRole::Writer,
+                model: model.clone(),
+                timeout: effective_timeout,
+            })
+            .await;
+            match omp_res {
+                Ok(res) => {
+                    let agent_status = if res.exit_code == Some(0) {
+                        Some("SUCCESS".to_owned())
+                    } else {
+                        Some("ERROR".to_owned())
+                    };
+                    AgyRunResult {
+                        process_id: res.process_id,
+                        exit_code: res.exit_code,
+                        termination: res.termination,
+                        conversation_id: res.session_id,
+                        agent_status,
+                        response: res.response,
+                        agent_error: res.error,
+                        stderr_excerpt: res.stderr_excerpt,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        input_error: None,
+                    }
+                }
+                Err(error) => {
+                    return Err(error.context(format!(
+                        "Writer attempt #{} has an unknown outcome and remains unresolved; run `talos task recover` to quarantine it for inspection, and do not retry it",
+                        attempt.id
+                    )));
+                }
             }
-        },
-        stop_watcher.receiver.clone(),
-    )
-    .await;
-    stop_watcher.finish().await?;
+        }
+        crate::config::AdapterKind::Pi => {
+            database.mark_writer_attempt_running_with_identity(
+                attempt.id,
+                std::process::id(),
+                None,
+            )?;
+            let pi_res = crate::adapter::pi::run_pi(crate::adapter::pi::PiRunConfig {
+                executable: executable.clone(),
+                project_root: project.root.clone(),
+                prompt,
+                role: crate::adapter::pi::PiRole::Writer,
+                model: model.clone(),
+                timeout: effective_timeout,
+            })
+            .await;
+            match pi_res {
+                Ok(res) => {
+                    let agent_status = if res.exit_code == Some(0) {
+                        Some("SUCCESS".to_owned())
+                    } else {
+                        Some("ERROR".to_owned())
+                    };
+                    AgyRunResult {
+                        process_id: res.process_id,
+                        exit_code: res.exit_code,
+                        termination: res.termination,
+                        conversation_id: res.session_id,
+                        agent_status,
+                        response: res.response,
+                        agent_error: res.error,
+                        stderr_excerpt: res.stderr_excerpt,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        input_error: None,
+                    }
+                }
+                Err(error) => {
+                    return Err(error.context(format!(
+                        "Writer attempt #{} has an unknown outcome and remains unresolved; run `talos task recover` to quarantine it for inspection, and do not retry it",
+                        attempt.id
+                    )));
+                }
+            }
+        }
+        crate::config::AdapterKind::Kilo => {
+            database.mark_writer_attempt_running_with_identity(
+                attempt.id,
+                std::process::id(),
+                None,
+            )?;
+            let kilo_res = crate::adapter::kilo::run_kilo(crate::adapter::kilo::KiloRunConfig {
+                executable: executable.clone(),
+                project_root: project.root.clone(),
+                prompt,
+                role: crate::adapter::kilo::KiloRole::Writer,
+                model: model.clone(),
+                timeout: effective_timeout,
+            })
+            .await;
+            match kilo_res {
+                Ok(res) => {
+                    let agent_status = if res.exit_code == Some(0) {
+                        Some("SUCCESS".to_owned())
+                    } else {
+                        Some("ERROR".to_owned())
+                    };
+                    AgyRunResult {
+                        process_id: res.process_id,
+                        exit_code: res.exit_code,
+                        termination: res.termination,
+                        conversation_id: res.session_id,
+                        agent_status,
+                        response: res.response,
+                        agent_error: res.error,
+                        stderr_excerpt: res.stderr_excerpt,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        input_error: None,
+                    }
+                }
+                Err(error) => {
+                    return Err(error.context(format!(
+                        "Writer attempt #{} has an unknown outcome and remains unresolved; run `talos task recover` to quarantine it for inspection, and do not retry it",
+                        attempt.id
+                    )));
+                }
+            }
+        }
+        crate::config::AdapterKind::Claude => {
+            database.mark_writer_attempt_running_with_identity(
+                attempt.id,
+                std::process::id(),
+                None,
+            )?;
+            let claude_res = crate::adapter::claude::run_claude(
+                crate::adapter::claude::ClaudeRunConfig {
+                    executable: executable.clone(),
+                    project_root: project.root.clone(),
+                    prompt,
+                    role: crate::adapter::claude::ClaudeRoleMode::Writer,
+                    model: model.clone(),
+                    session_id: None,
+                    timeout: effective_timeout,
+                },
+                |_| Ok(()),
+            )
+            .await;
+            match claude_res {
+                Ok(res) => {
+                    let agent_status = if res.exit_code == Some(0) {
+                        Some("SUCCESS".to_owned())
+                    } else {
+                        Some("ERROR".to_owned())
+                    };
+                    AgyRunResult {
+                        process_id: res.process_id,
+                        exit_code: res.exit_code,
+                        termination: res.termination,
+                        conversation_id: res.session_id,
+                        agent_status,
+                        response: res.response,
+                        agent_error: res.error,
+                        stderr_excerpt: res.stderr_excerpt,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        input_error: None,
+                    }
+                }
+                Err(error) => {
+                    return Err(error.context(format!(
+                        "Writer attempt #{} has an unknown outcome and remains unresolved; run `talos task recover` to quarantine it for inspection, and do not retry it",
+                        attempt.id
+                    )));
+                }
+            }
+        }
+        crate::config::AdapterKind::OpenCode => {
+            database.mark_writer_attempt_running_with_identity(
+                attempt.id,
+                std::process::id(),
+                None,
+            )?;
+            let opencode_res = crate::adapter::opencode::run_opencode(
+                crate::adapter::opencode::OpenCodeRunConfig {
+                    executable: executable.clone(),
+                    project_root: project.root.clone(),
+                    prompt,
+                    role: crate::adapter::opencode::OpenCodeRoleMode::Writer,
+                    model: model.clone(),
+                    session_id: None,
+                    timeout: effective_timeout,
+                },
+                |_| Ok(()),
+            )
+            .await;
+            match opencode_res {
+                Ok(res) => {
+                    let agent_status = if res.exit_code == Some(0) {
+                        Some("SUCCESS".to_owned())
+                    } else {
+                        Some("ERROR".to_owned())
+                    };
+                    AgyRunResult {
+                        process_id: res.process_id,
+                        exit_code: res.exit_code,
+                        termination: res.termination,
+                        conversation_id: res.session_id,
+                        agent_status,
+                        response: res.response,
+                        agent_error: res.error,
+                        stderr_excerpt: res.stderr_excerpt,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        input_error: None,
+                    }
+                }
+                Err(error) => {
+                    return Err(error.context(format!(
+                        "Writer attempt #{} has an unknown outcome and remains unresolved; run `talos task recover` to quarantine it for inspection, and do not retry it",
+                        attempt.id
+                    )));
+                }
+            }
+        }
+        _ => {
+            let mut settings = match create_session_settings(project, attempt.id) {
+                Ok(settings) => settings,
+                Err(error) => {
+                    database.finish_writer_attempt(
+                        attempt.id,
+                        WriterAttemptOutcome::Failed,
+                        None,
+                        None,
+                        None,
+                        Some("agy_policy_creation_failed"),
+                    )?;
+                    return Err(error);
+                }
+            };
 
-    let execution = match execution {
-        Ok(execution) => execution,
-        Err(error) => {
-            return Err(error.context(format!(
-                "Writer attempt #{} has an unknown outcome and remains unresolved; run `talos task recover` to quarantine it for inspection, and do not retry it",
-                attempt.id
-            )));
+            let stop_watcher = StopRequestWatcher::start(project.clone(), attempt.id);
+            let execution = crate::adapter::agy_process::run_with_stop_request(
+                AgyRunConfig {
+                    executable,
+                    project_root: project.root.clone(),
+                    settings_file: settings.path.clone(),
+                    prompt,
+                    conversation_id: continuation
+                        .as_ref()
+                        .map(|value| value.conversation_id.clone()),
+                    timeout: effective_timeout,
+                },
+                |event| match event {
+                    AgyProcessEvent::Started(process_id) => {
+                        let process_identity = match crate::process_identity::capture(process_id) {
+                            Ok(identity) => Some(identity.fingerprint),
+                            Err(error) => {
+                                tracing::debug!(%error, process_id, "Writer process identity is unavailable");
+                                None
+                            }
+                        };
+                        database.mark_writer_attempt_running_with_identity(
+                            attempt.id,
+                            process_id,
+                            process_identity.as_deref(),
+                        )
+                    }
+                    AgyProcessEvent::ConversationId(conversation_id) => {
+                        database.record_writer_conversation_id(attempt.id, &conversation_id)
+                    }
+                },
+                stop_watcher.receiver.clone(),
+            )
+            .await;
+            stop_watcher.finish().await?;
+            let execution = execution.map_err(|error| {
+                error.context(format!(
+                    "Writer attempt #{} has an unknown outcome and remains unresolved; run `talos task recover` to quarantine it for inspection, and do not retry it",
+                    attempt.id
+                ))
+            })?;
+            settings.remove_after_resolution();
+            execution
         }
     };
 
@@ -558,7 +943,6 @@ async fn run_writer_attempt_inner(
         agent_status,
         error_code,
     )?;
-    settings.remove_after_resolution();
 
     Ok(WriterExecutionReport {
         attempt,

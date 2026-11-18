@@ -121,7 +121,8 @@ impl CriticResponse {
         expected_revision_id: &str,
         changed_paths: &[String],
     ) -> Result<Self> {
-        let parsed: Self = serde_json::from_str(response)
+        let json_str = extract_json(response);
+        let parsed: Self = serde_json::from_str(json_str)
             .context("Critic output is not a single valid JSON review object")?;
         parsed.validate(expected_revision_id, changed_paths)?;
         Ok(parsed)
@@ -188,6 +189,16 @@ fn validate_finding(finding: &CriticFinding, changed_paths: &[String]) -> Result
         bail!("Critic finding reason must be non-empty and at most 8000 bytes");
     }
     Ok(())
+}
+
+fn extract_json(raw: &str) -> &str {
+    let trimmed = raw.trim();
+    if let (Some(start), Some(end)) = (trimmed.find('{'), trimmed.rfind('}'))
+        && end >= start
+    {
+        return &trimmed[start..=end];
+    }
+    trimmed
 }
 
 #[cfg(test)]

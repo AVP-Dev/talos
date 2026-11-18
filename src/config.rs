@@ -3,6 +3,8 @@ use std::{fs, path::Path};
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
 
+pub use crate::adapter::AdapterId as AdapterKind;
+
 use crate::{
     checks::{ProjectCheck, validate_project_checks},
     project::Project,
@@ -26,23 +28,12 @@ impl AgentRole {
     }
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum AdapterKind {
-    Agy,
-}
-
-impl AdapterKind {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Agy => "agy",
-        }
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct ProjectConfig {
     pub writer: AdapterKind,
     pub critic: AdapterKind,
+    pub writer_model: Option<String>,
+    pub critic_model: Option<String>,
     pub checks: Vec<ProjectCheck>,
     pub github: Option<GithubPolicy>,
     pub max_concurrent_writers: usize,
@@ -71,6 +62,10 @@ struct FileConfig {
     writer: String,
     critic: String,
     #[serde(default)]
+    writer_model: Option<String>,
+    #[serde(default)]
+    critic_model: Option<String>,
+    #[serde(default)]
     checks: Vec<ProjectCheck>,
     #[serde(default)]
     github: Option<GithubPolicy>,
@@ -86,6 +81,8 @@ impl Default for ProjectConfig {
         Self {
             writer: AdapterKind::Agy,
             critic: AdapterKind::Agy,
+            writer_model: None,
+            critic_model: None,
             checks: Vec::new(),
             github: None,
             max_concurrent_writers: 1,
@@ -146,6 +143,8 @@ impl ProjectConfig {
         Ok(Self {
             writer: parse_adapter(&parsed.writer, AgentRole::Writer)?,
             critic: parse_adapter(&parsed.critic, AgentRole::Critic)?,
+            writer_model: parsed.writer_model,
+            critic_model: parsed.critic_model,
             checks: parsed.checks,
             github: parsed.github,
             max_concurrent_writers,
@@ -235,14 +234,12 @@ fn validate_github_policy(policy: &GithubPolicy) -> Result<()> {
 }
 
 fn parse_adapter(value: &str, role: AgentRole) -> Result<AdapterKind> {
-    if value == "agy" {
-        Ok(AdapterKind::Agy)
-    } else {
-        bail!(
-            "Configured {} adapter {value:?} is unavailable or has not passed TALOS's role-specific safety verification",
+    AdapterKind::parse(value).ok_or_else(|| {
+        anyhow::anyhow!(
+            "Configured {} adapter profile {value:?} is not a known TALOS profile",
             role.as_str()
         )
-    }
+    })
 }
 
 pub fn config_path(project_root: &Path) -> std::path::PathBuf {
@@ -277,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_an_unverified_role_adapter() {
+    fn accepts_claude_profile_in_configuration() {
         let root = temp_dir();
         let project = Project {
             root: root.clone(),
@@ -289,11 +286,57 @@ mod tests {
             .expect("create runtime directory");
         fs::write(
             super::config_path(&root),
-            r#"{"schema_version":1,"writer":"agy","critic":"codex"}"#,
+            r#"{"schema_version":1,"writer":"agy","critic":"claude"}"#,
         )
         .expect("write config");
-        let error = ProjectConfig::load(&project).expect_err("unverified Critic must be refused");
-        assert!(format!("{error:#}").contains("critic adapter"));
+        let config =
+            ProjectConfig::load(&project).expect("known profile ID is valid configuration");
+        assert_eq!(config.adapter_for(AgentRole::Writer), AdapterKind::Agy);
+        assert_eq!(config.adapter_for(AgentRole::Critic), AdapterKind::Claude);
+        assert!(config.critic.is_implemented());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn accepts_codex_profile_in_configuration() {
+        let root = temp_dir();
+        let project = Project {
+            root: root.clone(),
+            state_root: root.clone(),
+            discovery: crate::project::DiscoveryMethod::ProjectMarker("Cargo.toml".to_owned()),
+        };
+        project
+            .ensure_runtime_dir()
+            .expect("create runtime directory");
+        fs::write(
+            super::config_path(&root),
+            r#"{"schema_version":1,"writer":"codex","critic":"agy"}"#,
+        )
+        .expect("write config");
+        let config = ProjectConfig::load(&project).expect("load config");
+        assert_eq!(config.adapter_for(AgentRole::Writer), AdapterKind::Codex);
+        assert!(config.writer.is_implemented());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refuses_unknown_adapter_profile() {
+        let root = temp_dir();
+        let project = Project {
+            root: root.clone(),
+            state_root: root.clone(),
+            discovery: crate::project::DiscoveryMethod::ProjectMarker("Cargo.toml".to_owned()),
+        };
+        project
+            .ensure_runtime_dir()
+            .expect("create runtime directory");
+        fs::write(
+            super::config_path(&root),
+            r#"{"schema_version":1,"writer":"agy","critic":"unknown"}"#,
+        )
+        .expect("write config");
+        let error = ProjectConfig::load(&project).expect_err("unknown profile must be refused");
+        assert!(format!("{error:#}").contains("not a known TALOS profile"));
         let _ = fs::remove_dir_all(root);
     }
 

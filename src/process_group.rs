@@ -53,6 +53,11 @@ impl ProcessGroupGuard {
             }
             let status = child.wait().await?;
             self.disarm();
+            if let Err(ref err) = kill_result
+                && err.raw_os_error() == Some(libc::EPERM)
+            {
+                return Ok(status);
+            }
             kill_result?;
             Ok(status)
         }

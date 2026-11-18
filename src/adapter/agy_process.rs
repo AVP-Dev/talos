@@ -641,6 +641,7 @@ mod tests {
         .expect("write fake CLI");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
             .expect("make fake CLI executable");
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let result = run(
             AgyRunConfig {
@@ -683,6 +684,7 @@ mod tests {
         .expect("write fake CLI");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
             .expect("make fake CLI executable");
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let mut persisted_id = None;
         let result = run(
@@ -732,6 +734,7 @@ mod tests {
         .expect("write fake CLI");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
             .expect("make fake CLI executable");
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let result = run(
             AgyRunConfig {
@@ -761,6 +764,7 @@ mod tests {
         fs::write(&executable, "#!/bin/sh\nexec sleep 30\n").expect("write fake CLI");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
             .expect("make fake CLI executable");
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let result = run(
             AgyRunConfig {
@@ -799,6 +803,7 @@ mod tests {
         .expect("write fake CLI");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
             .expect("make fake CLI executable");
+        tokio::time::sleep(Duration::from_millis(50)).await;
         let (stop_sender, stop_receiver) = tokio::sync::watch::channel(false);
         let run_root = root.clone();
         let run = tokio::spawn(async move {
@@ -850,6 +855,7 @@ mod tests {
         .expect("write fake CLI");
         fs::set_permissions(&executable, fs::Permissions::from_mode(0o700))
             .expect("make fake CLI executable");
+        tokio::time::sleep(Duration::from_millis(50)).await;
 
         let result = run(
             AgyRunConfig {
