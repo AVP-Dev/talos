@@ -559,4 +559,10 @@ pub struct LogsArgs {
     /// Show the append-only project control history.
     #[arg(long)]
     pub project: bool,
+    /// Maximum events to print, from 1 through 100.
+    #[arg(long, default_value_t = 25)]
+    pub limit: usize,
+    /// Continue with older events before this event ID.
+    #[arg(long)]
+    pub before: Option<i64>,
 }

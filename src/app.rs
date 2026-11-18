@@ -40,6 +40,7 @@ use crate::{
 const WRITER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SUPERVISOR_LEASE: Duration = Duration::from_secs(35 * 60);
 const VERIFICATION_BUDGET: Duration = Duration::from_secs(25 * 60);
+const MAX_RESUME_TASK_ID_PREVIEW: usize = 50;
 
 #[derive(Serialize)]
 struct StatusReport {
@@ -592,25 +593,44 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         Command::Logs(arguments) => {
             if arguments.project {
-                let events = database.project_control_events()?;
+                let page =
+                    database.project_control_events_page(arguments.before, arguments.limit)?;
                 if cli.json {
-                    print_json(&events)?;
-                } else if events.is_empty() {
+                    print_json(&page)?;
+                } else if page.events.is_empty() {
                     println!("No project control events.");
                 } else {
-                    for event in events {
+                    for event in page.events {
                         print_project_control_event(&event);
+                    }
+                    if let Some(next_before) = page.next_before {
+                        println!(
+                            "More events are available: `talos logs --project --before {next_before}`."
+                        );
                     }
                 }
             } else {
-                let events = database.task_events(arguments.task_id)?;
+                let page = database.task_events_page(
+                    arguments.task_id,
+                    arguments.before,
+                    arguments.limit,
+                )?;
                 if cli.json {
-                    print_json(&events)?;
-                } else if events.is_empty() {
+                    print_json(&page)?;
+                } else if page.events.is_empty() {
                     println!("No matching events.");
                 } else {
-                    for event in events {
+                    for event in page.events {
                         print_event(&event);
+                    }
+                    if let Some(next_before) = page.next_before {
+                        let task_filter = arguments
+                            .task_id
+                            .map(|task_id| format!(" {task_id}"))
+                            .unwrap_or_default();
+                        println!(
+                            "More events are available: `talos logs{task_filter} --before {next_before}`."
+                        );
                     }
                 }
             }
@@ -674,11 +694,18 @@ pub async fn run(cli: Cli) -> Result<()> {
                     reconciled_manual_changes,
                     reopened_task_ids,
                 } => {
+                    let reopened_task_ids_preview = reopened_task_ids
+                        .iter()
+                        .take(MAX_RESUME_TASK_ID_PREVIEW)
+                        .copied()
+                        .collect::<Vec<_>>();
                     if cli.json {
                         print_json(&json!({
                             "queue_paused": false,
                             "reconciled_manual_changes": reconciled_manual_changes,
-                            "reopened_task_ids": reopened_task_ids,
+                            "reopened_task_count": reopened_task_ids.len(),
+                            "reopened_task_ids_preview": reopened_task_ids_preview,
+                            "reopened_task_ids_truncated": reopened_task_ids.len() > MAX_RESUME_TASK_ID_PREVIEW,
                         }))?;
                     } else {
                         if reconciled_manual_changes {
@@ -688,7 +715,16 @@ pub async fn run(cli: Cli) -> Result<()> {
                             if reopened_task_ids.is_empty() {
                                 println!("No verifying tasks needed to be reopened.");
                             } else {
-                                println!("Reopened tasks: {}", format_task_ids(&reopened_task_ids));
+                                println!(
+                                    "Reopened {} task(s); first IDs: {}",
+                                    reopened_task_ids.len(),
+                                    format_task_ids(&reopened_task_ids_preview)
+                                );
+                                if reopened_task_ids.len() > MAX_RESUME_TASK_ID_PREVIEW {
+                                    println!(
+                                        "ID list is truncated; use `talos task list` for task summaries."
+                                    );
+                                }
                             }
                         }
                         println!("Project queue resumed.");

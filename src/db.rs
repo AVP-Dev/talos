@@ -22,6 +22,8 @@ const MAX_CHILD_TASK_SCOPE_BYTES: usize = 16 * 1024;
 const MIN_CHILD_TASK_TIMEOUT_MS: i64 = 1_000;
 const MAX_CHILD_TASK_TIMEOUT_MS: i64 = 30 * 60 * 1_000;
 const MAX_TASK_LIST_PAGE_SIZE: usize = 100;
+const MAX_LOG_PAGE_SIZE: usize = 100;
+const MAX_REOPENED_TASK_IDS_IN_EVENT: usize = 50;
 type FinalizeReviewRow = (i64, String, String, String, Option<String>, Option<String>);
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -231,6 +233,15 @@ pub struct TaskEvent {
     pub event_type: String,
     pub reason: String,
     pub data_json: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct EventPage<T> {
+    pub events: Vec<T>,
+    pub before: Option<i64>,
+    pub limit: usize,
+    pub has_more: bool,
+    pub next_before: Option<i64>,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -2025,6 +2036,76 @@ impl Database {
         Ok(events)
     }
 
+    pub fn task_events_page(
+        &self,
+        task_id: Option<i64>,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<EventPage<TaskEvent>> {
+        validate_event_page(before, limit)?;
+        if task_id.is_some_and(|id| id <= 0) {
+            bail!("Task event filter must be a positive task ID");
+        }
+        let query_limit = log_page_query_limit(limit)?;
+        let mut events = if let Some(task_id) = task_id {
+            let mut statement = self.connection.prepare(
+                "SELECT id, task_id, occurred_at_ms, actor, event_type, reason, data_json
+                 FROM task_events
+                 WHERE task_id = ?1 AND (?2 IS NULL OR id < ?2)
+                 ORDER BY id DESC LIMIT ?3",
+            )?;
+            statement
+                .query_map(params![task_id, before, query_limit], |row| {
+                    Ok(TaskEvent {
+                        id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        occurred_at_ms: row.get(2)?,
+                        actor: row.get(3)?,
+                        event_type: row.get(4)?,
+                        reason: row.get(5)?,
+                        data_json: row.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        } else {
+            let mut statement = self.connection.prepare(
+                "SELECT id, task_id, occurred_at_ms, actor, event_type, reason, data_json
+                 FROM task_events
+                 WHERE (?1 IS NULL OR id < ?1)
+                 ORDER BY id DESC LIMIT ?2",
+            )?;
+            statement
+                .query_map(params![before, query_limit], |row| {
+                    Ok(TaskEvent {
+                        id: row.get(0)?,
+                        task_id: row.get(1)?,
+                        occurred_at_ms: row.get(2)?,
+                        actor: row.get(3)?,
+                        event_type: row.get(4)?,
+                        reason: row.get(5)?,
+                        data_json: row.get(6)?,
+                    })
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let has_more = events.len() > limit;
+        if has_more {
+            events.pop();
+        }
+        let next_before = if has_more {
+            events.last().map(|event| event.id)
+        } else {
+            None
+        };
+        Ok(EventPage {
+            events,
+            before,
+            limit,
+            has_more,
+            next_before,
+        })
+    }
+
     pub fn project_control_state(&self) -> Result<ProjectControlState> {
         self.connection
             .query_row(
@@ -2250,10 +2331,17 @@ impl Database {
                     params![task_id, now, data_json],
                 )?;
             }
+            let reopened_task_ids_preview = reopened_task_ids
+                .iter()
+                .take(MAX_REOPENED_TASK_IDS_IN_EVENT)
+                .copied()
+                .collect::<Vec<_>>();
             let data_json = serde_json::to_string(&serde_json::json!({
                 "pause_revision_id": pause_revision_id,
                 "current_revision_id": current_revision_id,
-                "reopened_task_ids": reopened_task_ids,
+                "reopened_task_count": reopened_task_ids.len(),
+                "reopened_task_ids_preview": reopened_task_ids_preview,
+                "reopened_task_ids_truncated": reopened_task_ids.len() > MAX_REOPENED_TASK_IDS_IN_EVENT,
             }))?;
             insert_project_control_event(
                 &transaction,
@@ -2272,7 +2360,13 @@ impl Database {
         )?;
         let data_json = serde_json::to_string(&serde_json::json!({
             "reconciled_manual_changes": !snapshots_match,
-            "reopened_task_ids": reopened_task_ids,
+            "reopened_task_count": reopened_task_ids.len(),
+            "reopened_task_ids_preview": reopened_task_ids
+                .iter()
+                .take(MAX_REOPENED_TASK_IDS_IN_EVENT)
+                .copied()
+                .collect::<Vec<_>>(),
+            "reopened_task_ids_truncated": reopened_task_ids.len() > MAX_REOPENED_TASK_IDS_IN_EVENT,
         }))?;
         insert_project_control_event(
             &transaction,
@@ -2305,6 +2399,48 @@ impl Database {
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(events)
+    }
+
+    pub fn project_control_events_page(
+        &self,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<EventPage<ProjectControlEvent>> {
+        validate_event_page(before, limit)?;
+        let query_limit = log_page_query_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, occurred_at_ms, event_type, reason, data_json
+             FROM project_control_events
+             WHERE (?1 IS NULL OR id < ?1)
+             ORDER BY id DESC LIMIT ?2",
+        )?;
+        let mut events = statement
+            .query_map(params![before, query_limit], |row| {
+                Ok(ProjectControlEvent {
+                    id: row.get(0)?,
+                    occurred_at_ms: row.get(1)?,
+                    event_type: row.get(2)?,
+                    reason: row.get(3)?,
+                    data_json: row.get(4)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = events.len() > limit;
+        if has_more {
+            events.pop();
+        }
+        let next_before = if has_more {
+            events.last().map(|event| event.id)
+        } else {
+            None
+        };
+        Ok(EventPage {
+            events,
+            before,
+            limit,
+            has_more,
+            next_before,
+        })
     }
 
     pub fn verification_history(&self, task_id: i64) -> Result<Vec<VerificationEvidenceRecord>> {
@@ -5380,6 +5516,22 @@ fn validate_changed_paths_json(value: &str) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_event_page(before: Option<i64>, limit: usize) -> Result<()> {
+    if before.is_some_and(|id| id <= 0) || !(1..=MAX_LOG_PAGE_SIZE).contains(&limit) {
+        bail!("Event history requires a limit from 1 to 100 and a positive cursor when specified");
+    }
+    Ok(())
+}
+
+fn log_page_query_limit(limit: usize) -> Result<i64> {
+    i64::try_from(
+        limit
+            .checked_add(1)
+            .context("Event history page limit is out of range")?,
+    )
+    .context("Event history page limit is out of range")
 }
 
 fn validate_child_task_text(title: &str, acceptance_criteria: &str) -> Result<()> {
