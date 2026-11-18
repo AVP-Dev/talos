@@ -4182,9 +4182,24 @@ fn ensure_talos_ignored(project: &Project) -> Result<()> {
     )?;
     match ignored.status.code() {
         Some(0) => Ok(()),
-        Some(1) => bail!(
-            "TALOS runtime path .talos/state.sqlite3 is not ignored by Git; add .talos/ to the project .gitignore and retry"
-        ),
+        Some(1) => {
+            let gitignore_path = project.root.join(".gitignore");
+            let mut content = if gitignore_path.exists() {
+                std::fs::read_to_string(&gitignore_path).unwrap_or_default()
+            } else {
+                String::new()
+            };
+            if !content.ends_with('\n') && !content.is_empty() {
+                content.push('\n');
+            }
+            content.push_str(".talos/\n");
+            std::fs::write(&gitignore_path, content)
+                .context("Failed to automatically add .talos/ to .gitignore")?;
+            eprintln!(
+                "Notice: added .talos/ to .gitignore to keep database and task state untracked."
+            );
+            Ok(())
+        }
         _ => bail!("Git could not determine whether .talos/state.sqlite3 is ignored"),
     }
 }
@@ -4818,7 +4833,7 @@ mod tests {
     }
 
     #[test]
-    fn git_project_requires_talos_ignore_before_creating_runtime_state() {
+    fn git_project_automatically_adds_talos_to_gitignore() {
         let project = temp_project();
         init_git(&project.root);
         let git_project = Project {
@@ -4826,13 +4841,13 @@ mod tests {
             state_root: project.root.clone(),
             discovery: DiscoveryMethod::Git,
         };
-        let error = ensure_talos_ignored(&git_project).expect_err("missing ignore must fail");
-        assert!(format!("{error:#}").contains("add .talos/ to the project .gitignore"));
-        assert!(!project.root.join(".talos").exists());
+        ensure_talos_ignored(&git_project).expect("automatically adds .talos/ to .gitignore");
+        let gitignore =
+            fs::read_to_string(project.root.join(".gitignore")).expect("read gitignore");
+        assert!(gitignore.contains(".talos/"));
 
-        fs::write(project.root.join(".gitignore"), ".talos/\n").expect("add ignore rule");
-        ensure_talos_ignored(&git_project).expect("ignored TALOS state is allowed");
-        assert!(!project.root.join(".talos").exists());
+        // Running it again is idempotent
+        ensure_talos_ignored(&git_project).expect("already ignored TALOS state is allowed");
         fs::remove_dir_all(&project.root).expect("remove temporary Git project");
     }
 
