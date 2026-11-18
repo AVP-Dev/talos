@@ -223,13 +223,25 @@ Each provider task is a separate vertical slice. Help output and parser fixtures
 
 **Exit criteria:** all six IDs are accepted by config as named profiles; `doctor` reports detected, verified, unsupported, and untested capabilities without conflating them; attempt/review records retain the selected profile and version; each profile is enabled only for roles that passed live disposable-project checks; cross-provider Writer/Critic selection works; failed or unavailable profiles fail closed. Linux-native checks remain deferred to the user's server and do not block macOS implementation.
 
+### R11 — Hybrid Team Orchestration
+
+Implement autonomous two-tier team orchestration where TALOS manages two distinct engineering teams: Writer Team (Writer Lead + optional Writer Workers) and Critic Team (Critic Lead + optional Critic Workers).
+
+- **Writer Team:** Writer Lead analyzes complex tasks, produces a technical plan, decomposes independent subtasks with strict file boundary contracts (`allowed_paths`), assigns Writer Workers (up to `max_writer_workers`, default 2), assists stuck workers, integrates changes, or implements directly.
+- **Critic Team:** Critic Lead oversees independent evaluation. Critic Workers (up to `max_critic_workers`, default 1) conduct specialized reviews (e.g. security, algorithms, testing). Critic Lead synthesizes worker findings and provides an authoritative structured verdict (`approve` or `request_changes`).
+- **Autonomous Lead Negotiation:** If Critic Lead requests changes, Writer Lead analyzes the critique, diff, and verification output, generates a rebuttal and fix iteration plan. Bounded by `max_review_rounds` (default 3).
+- **Delegation Mode:** Hybrid delegation detects CLI native subagent support, falling back deterministically to managed external CLI processes with worktree or path bounds.
+- **Backward Compatibility:** Sequential pair mode (`talos up --auto`) remains the default; team mode is activated via `talos up --auto --mode team` or configuration.
+
+**Exit criteria:** `talos up --auto` defaults to pair mode without regression; `talos up --auto --mode team` executes the full team orchestration loop; schema v19 migration operates atomically; all unit and integration tests pass with 0 warnings.
+
 ## 6. Dependency order
 
 ```text
 R0 → R1 → R2 → R3 → R4 → R5
                          └──→ R6
 R5 + R6 → R7 → R8 → R9
-R6 + R7 + R8 + R9 → R10
+R6 + R7 + R8 + R9 → R10 → R11
 ```
 
 Implementation details may change based on experiments. Preserve invariants and acceptance checks; update `docs/decisions.md`, `docs/tasks.md`, and `docs/state.md` when scope changes materially.
@@ -246,4 +258,4 @@ Implementation details may change based on experiments. Preserve invariants and 
 
 ## 8. Current continuation point
 
-R1–R5 delivered the initial Agy-only path; R6–R9 still have implementation acceptance gates. The current handoff records fresh binary and live Writer outcomes. Finish the current R9.5 local artifact batch, then continue T10.1 and implement the six requested profiles in the listed provider order. Native Linux checks remain deferred to the user's server; do not create a remote or contact GitHub until a repository is provided.
+R10 delivered all 7 multi-CLI adapter profiles with live verification. R11 delivered Hybrid Team Orchestration with schema v19, team subtasks table, Writer Lead decomposition and worker assistance, Critic Team multi-angle evaluation and consolidated review, rebuttal loop, and full backward-compatible pair mode preservation. Next action: proceed with ongoing task execution and user requests.

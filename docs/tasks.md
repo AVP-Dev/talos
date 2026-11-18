@@ -149,6 +149,17 @@ Dependency: R6–R8.
 | T10.7 | done | Add Claude Code profile | `claude` adapter implemented (`src/adapter/claude.rs`) with `claude -p --output-format json`, role-based tool restrictions (`--tools Read,Grep,Glob` for Critic, `--allow-dangerously-skip-permissions` for Writer), and model selection. |
 | T10.8 | done | Verify cross-provider role combinations and autonomous loop | Unified autonomous cycle (`talos up --auto`) implemented: Writer execution -> Critic review -> automated fix loop (up to 3 rounds) -> verification checks -> task completion. Tested end-to-end with live AI CLI. |
 
+## R11 — Hybrid Team Orchestration
+**Status:** complete. Autonomous two-tier team orchestration with Writer Team and Critic Team implemented. Backward compatibility with Pair mode (`talos up --auto`) fully preserved.
+
+| ID | Status | Task | Exit criteria |
+|---|---|---|---|
+| T11.1 | done | Schema v19 and configuration for team orchestration | Added `OrchestrationMode` (`pair`, `team`), `DelegationMode` (`hybrid`, `native`, `external`), and `OrchestrationConfig`. Advanced schema to v19 with `team_subtasks` table and foreign key indexes. Full backward compatibility with config v1-v4 and schema v1-v18. |
+| T11.2 | done | Writer Lead decomposition planning and delegation engine | Writer Lead prompt constructs technical plan and subtask breakdown with explicit `allowed_paths`. `detect_delegation` checks for safe headless native delegation and deterministically falls back to external processes. |
+| T11.3 | done | Writer Lead worker supervision and assistance for stuck/failing workers | Error/timeout diagnostics captured and delivered to Writer Lead. Writer Lead evaluates and chooses `RetryWithGuidance` (bounded by `max_help_attempts`), `Takeover` (Lead executes subtask), or `BlockSubtask`. |
+| T11.4 | done | Critic Team multi-angle evaluation and Critic Lead consolidated verdict | Critic Workers perform specialized domain audits (security, algorithms, testing) within read-only bounds. Critic Lead consolidates diff, plan, verification output, and worker findings into structured `approve` or `request_changes` verdict. Rebuttal and fix loop negotiated autonomously. |
+| T11.5 | done | Verification and backward compatibility preservation for Pair mode | Tested both `pair` and `team` workflows live in isolated git project `/private/tmp/talos-team-e2e` with Codex (Writer) and Agy (Critic). Parallel execution of two Writer Workers verified with exact millisecond timestamps (Worker 1: 1794996988535 ms, Worker 2: 1794996988668 ms; 30.7s concurrency overlap). Writer Lead automated integration, Critic Worker audit, Critic Lead approval, project checks (unittest), and git commit verified. Pair mode verified with Task #5 running sequentially. 140 unit and integration tests passing; format, clippy (0 warnings), and security checks clean. |
+
 ## Required end-to-end scenarios from the original request
 
 First launch/repeat `up`; Writer/Critic success and justified rejection; child task; independent parallel work; adding a task while work is running; manual takeover; CLI recovery; orchestrator crash; SSH disconnect/reconnect; Linux reboot autostart; PR without merge; duplicate-execution prevention; and rechecking original acceptance criteria before closeout. Keep separate evidence for each scenario; do not combine them into a misleading test.

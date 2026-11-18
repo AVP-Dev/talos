@@ -18,7 +18,7 @@ use crate::{
     secrets::contains_sensitive,
 };
 
-const SCHEMA_VERSION: i64 = 18;
+const SCHEMA_VERSION: i64 = 19;
 const MAX_CHILD_TASK_ALLOWED_PATHS: usize = 64;
 const MAX_CHILD_TASK_SCOPE_BYTES: usize = 16 * 1024;
 const MIN_CHILD_TASK_TIMEOUT_MS: i64 = 1_000;
@@ -145,6 +145,22 @@ pub struct ChildTaskContract {
     pub allowed_paths: Vec<String>,
     pub timeout_ms: i64,
     pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TeamSubtaskRecord {
+    pub id: i64,
+    pub parent_task_id: i64,
+    pub subtask_id: i64,
+    pub role: String,
+    pub adapter: String,
+    pub delegation_kind: String,
+    pub status: String,
+    pub dependencies: Vec<String>,
+    pub result_summary: Option<String>,
+    pub error_or_block_reason: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
 }
 
 #[derive(Clone, Copy, Debug, Serialize, PartialEq, Eq)]
@@ -700,8 +716,10 @@ impl Database {
         let Some(parent_status) = parent_status else {
             bail!("Parent task #{parent_task_id} does not exist");
         };
-        if parent_status != TaskStatus::Queued.as_str() {
-            bail!("A child task can only be added while its parent is queued");
+        if parent_status != TaskStatus::Queued.as_str()
+            && parent_status != TaskStatus::Implementing.as_str()
+        {
+            bail!("A child task can only be added while its parent is queued or implementing");
         }
         let now = now_ms()?;
         transaction.execute(
@@ -839,6 +857,166 @@ impl Database {
             has_more,
             next_after,
         })
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn add_team_subtask(
+        &mut self,
+        parent_task_id: i64,
+        subtask_id: i64,
+        role: &str,
+        adapter: &str,
+        delegation_kind: &str,
+        status: &str,
+        dependencies: &[String],
+    ) -> Result<TeamSubtaskRecord> {
+        let now = now_ms()?;
+        let dependencies_json = serde_json::to_string(dependencies)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot start team subtask insertion transaction")?;
+        transaction.execute(
+            "INSERT INTO team_subtasks
+             (parent_task_id, subtask_id, role, adapter, delegation_kind, status, dependencies_json, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+            params![
+                parent_task_id,
+                subtask_id,
+                role,
+                adapter,
+                delegation_kind,
+                status,
+                dependencies_json,
+                now,
+            ],
+        )?;
+        let id = transaction.last_insert_rowid();
+        transaction
+            .commit()
+            .context("Cannot commit team subtask insertion")?;
+        Ok(TeamSubtaskRecord {
+            id,
+            parent_task_id,
+            subtask_id,
+            role: role.to_owned(),
+            adapter: adapter.to_owned(),
+            delegation_kind: delegation_kind.to_owned(),
+            status: status.to_owned(),
+            dependencies: dependencies.to_vec(),
+            result_summary: None,
+            error_or_block_reason: None,
+            created_at_ms: now,
+            updated_at_ms: now,
+        })
+    }
+
+    pub fn update_team_subtask_status(
+        &mut self,
+        subtask_id: i64,
+        status: &str,
+        result_summary: Option<&str>,
+        error_or_block_reason: Option<&str>,
+    ) -> Result<()> {
+        let now = now_ms()?;
+        self.connection.execute(
+            "UPDATE team_subtasks
+             SET status = ?1, result_summary = ?2, error_or_block_reason = ?3, updated_at_ms = ?4
+             WHERE subtask_id = ?5",
+            params![
+                status,
+                result_summary,
+                error_or_block_reason,
+                now,
+                subtask_id
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn complete_team_subtask_integration(
+        &mut self,
+        child_task_id: i64,
+        reason: &str,
+    ) -> Result<()> {
+        let now = now_ms()?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot start subtask completion transaction")?;
+        transaction.execute(
+            "UPDATE tasks SET status = 'complete', updated_at_ms = ?1 WHERE id = ?2",
+            params![now, child_task_id],
+        )?;
+        let transition_data = serde_json::to_string(&serde_json::json!({
+            "from": "implementing",
+            "to": "complete",
+        }))?;
+        transaction.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, 'writer_lead', 'task.status_changed', ?3, ?4)",
+            params![child_task_id, now, reason, transition_data],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot commit subtask completion")?;
+        Ok(())
+    }
+
+    pub fn team_subtasks_for_parent(&self, parent_task_id: i64) -> Result<Vec<TeamSubtaskRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, parent_task_id, subtask_id, role, adapter, delegation_kind, status, dependencies_json, result_summary, error_or_block_reason, created_at_ms, updated_at_ms
+             FROM team_subtasks WHERE parent_task_id = ?1 ORDER BY id",
+        )?;
+        let rows = statement
+            .query_map([parent_task_id], |row| {
+                let dep_str: String = row.get(7)?;
+                let deps = serde_json::from_str(&dep_str).unwrap_or_default();
+                Ok(TeamSubtaskRecord {
+                    id: row.get(0)?,
+                    parent_task_id: row.get(1)?,
+                    subtask_id: row.get(2)?,
+                    role: row.get(3)?,
+                    adapter: row.get(4)?,
+                    delegation_kind: row.get(5)?,
+                    status: row.get(6)?,
+                    dependencies: deps,
+                    result_summary: row.get(8)?,
+                    error_or_block_reason: row.get(9)?,
+                    created_at_ms: row.get(10)?,
+                    updated_at_ms: row.get(11)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(rows)
+    }
+
+    pub fn team_subtask_by_id(&self, subtask_id: i64) -> Result<Option<TeamSubtaskRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, parent_task_id, subtask_id, role, adapter, delegation_kind, status, dependencies_json, result_summary, error_or_block_reason, created_at_ms, updated_at_ms
+             FROM team_subtasks WHERE subtask_id = ?1",
+        )?;
+        let record = statement
+            .query_row([subtask_id], |row| {
+                let dep_str: String = row.get(7)?;
+                let deps = serde_json::from_str(&dep_str).unwrap_or_default();
+                Ok(TeamSubtaskRecord {
+                    id: row.get(0)?,
+                    parent_task_id: row.get(1)?,
+                    subtask_id: row.get(2)?,
+                    role: row.get(3)?,
+                    adapter: row.get(4)?,
+                    delegation_kind: row.get(5)?,
+                    status: row.get(6)?,
+                    dependencies: deps,
+                    result_summary: row.get(8)?,
+                    error_or_block_reason: row.get(9)?,
+                    created_at_ms: row.get(10)?,
+                    updated_at_ms: row.get(11)?,
+                })
+            })
+            .optional()?;
+        Ok(record)
     }
 
     pub fn begin_task_worktree(
@@ -1888,6 +2066,9 @@ impl Database {
                  FROM tasks
                  WHERE tasks.status IN ('verifying', 'reviewing', 'implementing', 'queued')
                    AND NOT EXISTS (
+                       SELECT 1 FROM child_task_contracts WHERE child_task_id = tasks.id
+                   )
+                   AND NOT EXISTS (
                        SELECT 1 FROM task_dependencies AS edges
                        JOIN tasks AS prerequisite ON prerequisite.id = edges.depends_on_task_id
                        WHERE edges.task_id = tasks.id AND (
@@ -2227,6 +2408,23 @@ impl Database {
             )
             .optional()
             .context("Cannot read task")
+    }
+
+    pub fn record_task_event(
+        &mut self,
+        task_id: i64,
+        actor: &str,
+        event_type: &str,
+        reason: &str,
+        data_json: Option<&str>,
+    ) -> Result<()> {
+        let now = now_ms()?;
+        self.connection.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![task_id, now, actor, event_type, reason, data_json],
+        )?;
+        Ok(())
     }
 
     pub fn task_events(&self, task_id: Option<i64>) -> Result<Vec<TaskEvent>> {
@@ -5408,6 +5606,30 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .context("Cannot finalize Writer execution lease schema")?;
         migrated_version = 18;
     }
+    if migrated_version == 18 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE team_subtasks (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     parent_task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                     subtask_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+                     role TEXT NOT NULL,
+                     adapter TEXT NOT NULL,
+                     delegation_kind TEXT NOT NULL,
+                     status TEXT NOT NULL,
+                     dependencies_json TEXT NOT NULL,
+                     result_summary TEXT,
+                     error_or_block_reason TEXT,
+                     created_at_ms INTEGER NOT NULL,
+                     updated_at_ms INTEGER NOT NULL
+                 );
+                 CREATE INDEX team_subtasks_parent_id ON team_subtasks(parent_task_id);
+                 CREATE INDEX team_subtasks_subtask_id ON team_subtasks(subtask_id);
+                 PRAGMA user_version = 19;",
+            )
+            .context("Cannot add team subtasks schema")?;
+        migrated_version = 19;
+    }
     if migrated_version != SCHEMA_VERSION {
         bail!("Cannot migrate database from unsupported schema version {migrated_version}");
     }
@@ -6335,10 +6557,12 @@ fn is_allowed_transition(current: &TaskStatus, target: &TaskStatus) -> bool {
             | (TaskStatus::Implementing, TaskStatus::Reviewing)
             | (TaskStatus::Implementing, TaskStatus::Blocked)
             | (TaskStatus::Implementing, TaskStatus::Failed)
+            | (TaskStatus::Implementing, TaskStatus::Queued)
             | (TaskStatus::Reviewing, TaskStatus::Implementing)
             | (TaskStatus::Reviewing, TaskStatus::Verifying)
             | (TaskStatus::Reviewing, TaskStatus::Blocked)
             | (TaskStatus::Reviewing, TaskStatus::Failed)
+            | (TaskStatus::Reviewing, TaskStatus::Queued)
             | (TaskStatus::Verifying, TaskStatus::Implementing)
             | (TaskStatus::Verifying, TaskStatus::Reviewing)
             | (TaskStatus::Verifying, TaskStatus::Blocked)
@@ -6470,13 +6694,14 @@ mod tests {
     fn remove_schema_v15_to_v18(connection: &rusqlite::Connection) {
         connection
             .execute_batch(
-                "DROP TABLE github_ci_snapshots;
+                "DROP TABLE team_subtasks;
+                 DROP TABLE github_ci_snapshots;
                  DROP TABLE github_publication_events;
                  DROP TABLE github_publications;
                  DROP INDEX tasks_status_id;
                  DROP TABLE writer_execution_leases;",
             )
-            .expect("remove schema v15-v18 objects from a legacy fixture");
+            .expect("remove schema v15-v19 objects from a legacy fixture");
     }
 
     fn recovery_lease(database: &mut Database, owner_id: &str) -> super::SupervisorLease {
@@ -6569,7 +6794,7 @@ mod tests {
     fn initialization_is_idempotent_and_uses_wal() {
         let project = temp_project();
         let first = Database::open(&project).expect("initialize database");
-        assert_eq!(first.schema_version().expect("read schema version"), 18);
+        assert_eq!(first.schema_version().expect("read schema version"), 19);
         assert_eq!(
             first
                 .journal_mode()
@@ -6580,7 +6805,7 @@ mod tests {
         drop(first);
 
         let second = Database::open(&project).expect("open database again");
-        assert_eq!(second.schema_version().expect("read schema version"), 18);
+        assert_eq!(second.schema_version().expect("read schema version"), 19);
         drop(second);
         cleanup(&project);
     }
@@ -6608,7 +6833,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema-v5 duration fields");
-        assert_eq!(migrated.schema_version().unwrap(), 18);
+        assert_eq!(migrated.schema_version().unwrap(), 19);
         let columns: (i64, i64) = migrated
             .connection
             .query_row(
@@ -6648,7 +6873,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v6");
-        assert_eq!(migrated.schema_version().unwrap(), 18);
+        assert_eq!(migrated.schema_version().unwrap(), 19);
         assert_eq!(migrated.list_tasks().unwrap()[0].id, task.id);
         assert!(!migrated.project_control_state().unwrap().queue_paused);
         cleanup(&project);
@@ -6674,7 +6899,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v7");
-        assert_eq!(migrated.schema_version().unwrap(), 18);
+        assert_eq!(migrated.schema_version().unwrap(), 19);
         assert_eq!(
             migrated
                 .project_control_state()
@@ -6704,7 +6929,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v8");
-        assert_eq!(migrated.schema_version().unwrap(), 18);
+        assert_eq!(migrated.schema_version().unwrap(), 19);
         assert!(
             migrated
                 .writer_attempts(None)
@@ -6733,7 +6958,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v9");
-        assert_eq!(migrated.schema_version().unwrap(), 18);
+        assert_eq!(migrated.schema_version().unwrap(), 19);
         let dependencies_table_exists: bool = migrated
             .connection
             .query_row(
@@ -6763,7 +6988,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v10");
-        assert_eq!(migrated.schema_version().unwrap(), 18);
+        assert_eq!(migrated.schema_version().unwrap(), 19);
         let contracts_table_exists: bool = migrated
             .connection
             .query_row(
@@ -6773,6 +6998,103 @@ mod tests {
             )
             .expect("inspect migrated child-task table");
         assert!(contracts_table_exists);
+        cleanup(&project);
+    }
+
+    #[test]
+    fn schema_v18_migrates_to_v19_with_team_subtasks() {
+        let project = temp_project();
+        let database = Database::open(&project).expect("initialize current database");
+        database
+            .connection
+            .execute_batch(
+                "DROP TABLE team_subtasks;
+                 PRAGMA user_version = 18;",
+            )
+            .expect("simulate schema v18");
+        drop(database);
+
+        let migrated = Database::open(&project).expect("migrate schema v18");
+        assert_eq!(migrated.schema_version().unwrap(), 19);
+        let team_subtasks_exists: bool = migrated
+            .connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'team_subtasks')",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect migrated team_subtasks table");
+        assert!(team_subtasks_exists);
+        cleanup(&project);
+    }
+
+    #[test]
+    fn team_subtasks_crud_and_parent_lookup() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("initialize database");
+        let parent = database
+            .add_task("Parent Task", "Parent Acceptance Criteria")
+            .expect("add parent task");
+        let (child, _) = database
+            .add_child_task(
+                parent.id,
+                "Worker Subtask 1",
+                "Worker Criteria 1",
+                &["src/auth.rs".to_string()],
+                60_000,
+            )
+            .expect("add child task");
+
+        let record = database
+            .add_team_subtask(
+                parent.id,
+                child.id,
+                "writer_worker",
+                "codex",
+                "external",
+                "in_progress",
+                &["dep1".to_string()],
+            )
+            .expect("add team subtask");
+
+        assert_eq!(record.parent_task_id, parent.id);
+        assert_eq!(record.subtask_id, child.id);
+        assert_eq!(record.role, "writer_worker");
+        assert_eq!(record.delegation_kind, "external");
+        assert_eq!(record.status, "in_progress");
+
+        let fetched = database
+            .team_subtask_by_id(child.id)
+            .expect("fetch subtask")
+            .expect("record exists");
+        assert_eq!(fetched.id, record.id);
+        assert_eq!(fetched.status, "in_progress");
+
+        database
+            .update_team_subtask_status(
+                child.id,
+                "completed",
+                Some("Implemented auth endpoint"),
+                None,
+            )
+            .expect("update status");
+
+        let updated = database
+            .team_subtask_by_id(child.id)
+            .expect("fetch subtask")
+            .expect("record exists");
+        assert_eq!(updated.status, "completed");
+        assert_eq!(
+            updated.result_summary.as_deref(),
+            Some("Implemented auth endpoint")
+        );
+
+        let parent_subtasks = database
+            .team_subtasks_for_parent(parent.id)
+            .expect("list subtasks for parent");
+        assert_eq!(parent_subtasks.len(), 1);
+        assert_eq!(parent_subtasks[0].id, record.id);
+
         cleanup(&project);
     }
 
@@ -7122,7 +7444,7 @@ mod tests {
         drop(database);
 
         let mut migrated = Database::open(&project).expect("migrate the v4 approval");
-        assert_eq!(migrated.schema_version().unwrap(), 18);
+        assert_eq!(migrated.schema_version().unwrap(), 19);
         assert_eq!(
             migrated.list_tasks().unwrap()[0].status,
             TaskStatus::Reviewing
@@ -7306,7 +7628,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate existing database");
-        assert_eq!(database.schema_version().expect("read schema version"), 18);
+        assert_eq!(database.schema_version().expect("read schema version"), 19);
         let tasks = database.list_tasks().expect("read preserved tasks");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Existing v1 task");
@@ -7602,7 +7924,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate v2 database");
-        assert_eq!(database.schema_version().expect("read schema version"), 18);
+        assert_eq!(database.schema_version().expect("read schema version"), 19);
         assert!(
             database
                 .has_unresolved_writer_attempts()

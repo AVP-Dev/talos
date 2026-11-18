@@ -1,6 +1,7 @@
 use std::{fs, path::Path};
 
 use anyhow::{Context, Result, bail};
+use clap::ValueEnum;
 use serde::{Deserialize, Serialize};
 
 pub use crate::adapter::AdapterId as AdapterKind;
@@ -12,6 +13,88 @@ use crate::{
 
 const CONFIG_FILE_NAME: &str = "config.json";
 const MAX_CONFIG_BYTES: u64 = 16 * 1024;
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, ValueEnum, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OrchestrationMode {
+    #[default]
+    Pair,
+    Team,
+}
+
+impl OrchestrationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pair => "pair",
+            Self::Team => "team",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DelegationMode {
+    #[default]
+    Hybrid,
+    Native,
+    External,
+}
+
+impl DelegationMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hybrid => "hybrid",
+            Self::Native => "native",
+            Self::External => "external",
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct OrchestrationConfig {
+    #[serde(default)]
+    pub mode: OrchestrationMode,
+    #[serde(default)]
+    pub delegation: DelegationMode,
+    #[serde(default = "default_max_writer_workers")]
+    pub max_writer_workers: usize,
+    #[serde(default = "default_max_critic_workers")]
+    pub max_critic_workers: usize,
+    #[serde(default = "default_max_review_rounds")]
+    pub max_review_rounds: usize,
+    #[serde(default = "default_max_help_attempts")]
+    pub max_help_attempts: usize,
+}
+
+fn default_max_writer_workers() -> usize {
+    2
+}
+
+fn default_max_critic_workers() -> usize {
+    1
+}
+
+fn default_max_review_rounds() -> usize {
+    3
+}
+
+fn default_max_help_attempts() -> usize {
+    2
+}
+
+impl Default for OrchestrationConfig {
+    fn default() -> Self {
+        Self {
+            mode: OrchestrationMode::Pair,
+            delegation: DelegationMode::Hybrid,
+            max_writer_workers: 2,
+            max_critic_workers: 1,
+            max_review_rounds: 3,
+            max_help_attempts: 2,
+        }
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AgentRole {
@@ -37,6 +120,7 @@ pub struct ProjectConfig {
     pub checks: Vec<ProjectCheck>,
     pub github: Option<GithubPolicy>,
     pub max_concurrent_writers: usize,
+    pub orchestration: OrchestrationConfig,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -74,6 +158,8 @@ struct FileConfig {
         deserialize_with = "deserialize_optional_max_concurrent_writers"
     )]
     max_concurrent_writers: Option<usize>,
+    #[serde(default)]
+    orchestration: Option<OrchestrationConfig>,
 }
 
 impl Default for ProjectConfig {
@@ -86,6 +172,7 @@ impl Default for ProjectConfig {
             checks: Vec::new(),
             github: None,
             max_concurrent_writers: 1,
+            orchestration: OrchestrationConfig::default(),
         }
     }
 }
@@ -120,11 +207,14 @@ impl ProjectConfig {
             .with_context(|| format!("Cannot read project config {}", path.display()))?;
         let parsed: FileConfig = serde_json::from_slice(&bytes)
             .with_context(|| format!("Project config {} is not valid JSON", path.display()))?;
-        if !matches!(parsed.schema_version, 1..=4) {
+        if !matches!(parsed.schema_version, 1..=5) {
             bail!(
                 "Project config schema version {} is unsupported",
                 parsed.schema_version
             );
+        }
+        if parsed.schema_version < 5 && parsed.orchestration.is_some() {
+            bail!("orchestration requires project config schema version 5");
         }
         if parsed.schema_version < 4 && parsed.max_concurrent_writers.is_some() {
             bail!("max_concurrent_writers requires project config schema version 4");
@@ -140,6 +230,8 @@ impl ProjectConfig {
         if let Some(github) = &parsed.github {
             validate_github_policy(github)?;
         }
+        let orchestration = parsed.orchestration.unwrap_or_default();
+        validate_orchestration_config(&orchestration)?;
         Ok(Self {
             writer: parse_adapter(&parsed.writer, AgentRole::Writer)?,
             critic: parse_adapter(&parsed.critic, AgentRole::Critic)?,
@@ -148,6 +240,7 @@ impl ProjectConfig {
             checks: parsed.checks,
             github: parsed.github,
             max_concurrent_writers,
+            orchestration,
         })
     }
 
@@ -229,6 +322,22 @@ fn validate_github_policy(policy: &GithubPolicy) -> Result<()> {
         || policy.feature_branch_prefix.contains("//")
     {
         bail!("GitHub feature branch prefix must be a valid path beginning with `talos/`");
+    }
+    Ok(())
+}
+
+fn validate_orchestration_config(config: &OrchestrationConfig) -> Result<()> {
+    if !(1..=4).contains(&config.max_writer_workers) {
+        bail!("max_writer_workers must be between 1 and 4");
+    }
+    if config.max_critic_workers > 3 {
+        bail!("max_critic_workers must be between 0 and 3");
+    }
+    if !(1..=5).contains(&config.max_review_rounds) {
+        bail!("max_review_rounds must be between 1 and 5");
+    }
+    if !(1..=5).contains(&config.max_help_attempts) {
+        bail!("max_help_attempts must be between 1 and 5");
     }
     Ok(())
 }
@@ -380,6 +489,77 @@ mod tests {
         .expect("write invalid verification config");
         let error = ProjectConfig::load(&project).expect_err("unapproved tool must be refused");
         assert!(format!("{error:#}").contains("approved check-tool allowlist"));
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn loads_orchestration_config_from_schema_version_five() {
+        let root = temp_dir();
+        let project = Project {
+            root: root.clone(),
+            state_root: root.clone(),
+            discovery: crate::project::DiscoveryMethod::ProjectMarker("Cargo.toml".to_owned()),
+        };
+        project
+            .ensure_runtime_dir()
+            .expect("create runtime directory");
+        fs::write(
+            super::config_path(&root),
+            r#"{
+                "schema_version": 5,
+                "writer": "codex",
+                "critic": "agy",
+                "orchestration": {
+                    "mode": "team",
+                    "delegation": "hybrid",
+                    "max_writer_workers": 2,
+                    "max_critic_workers": 1,
+                    "max_review_rounds": 3,
+                    "max_help_attempts": 2
+                }
+            }"#,
+        )
+        .expect("write team config");
+        let config = ProjectConfig::load(&project).expect("load team config");
+        assert_eq!(config.orchestration.mode, super::OrchestrationMode::Team);
+        assert_eq!(
+            config.orchestration.delegation,
+            super::DelegationMode::Hybrid
+        );
+        assert_eq!(config.orchestration.max_writer_workers, 2);
+        assert_eq!(config.orchestration.max_critic_workers, 1);
+        assert_eq!(config.orchestration.max_review_rounds, 3);
+        assert_eq!(config.orchestration.max_help_attempts, 2);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn refuses_invalid_orchestration_config() {
+        let root = temp_dir();
+        let project = Project {
+            root: root.clone(),
+            state_root: root.clone(),
+            discovery: crate::project::DiscoveryMethod::ProjectMarker("Cargo.toml".to_owned()),
+        };
+        project
+            .ensure_runtime_dir()
+            .expect("create runtime directory");
+        fs::write(
+            super::config_path(&root),
+            r#"{
+                "schema_version": 5,
+                "writer": "codex",
+                "critic": "agy",
+                "orchestration": {
+                    "mode": "team",
+                    "max_writer_workers": 10
+                }
+            }"#,
+        )
+        .expect("write invalid team config");
+        let error =
+            ProjectConfig::load(&project).expect_err("excessive worker count must be refused");
+        assert!(format!("{error:#}").contains("max_writer_workers must be between 1 and 4"));
         let _ = fs::remove_dir_all(root);
     }
 

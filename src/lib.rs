@@ -12,6 +12,7 @@ pub mod review;
 pub mod revision;
 pub mod secrets;
 pub mod supervisor;
+pub mod team;
 pub mod tmux;
 pub mod worktree;
 

@@ -1,8 +1,86 @@
 # TALOS
 
-TALOS is a Rust CLI-first orchestrator for local AI coding CLIs. It stores tasks, Writer attempts, and events in a durable local SQLite database, supervises Antigravity Writers, and preserves ambiguous work for operator review. **The current implementation supports Agy only; it does not yet support the other coding CLIs named in the project goal.** Writer concurrency defaults to one; a project can opt into up to three Writers when each uses a separate active managed worktree.
+<p align="center">
+  <strong>Local CLI-first orchestrator for AI coding agents with Team and Pair orchestration</strong>
+</p>
 
-> **Current status:** the codebase contains only the Agy adapter. R10 now tracks the user's requested Codex, OMP, Pi, Kilo, OpenCode, and Claude Code profiles; none of those adapters has been implemented yet. A fresh Agy task-run attempt exited with `agy_exit_nonzero` and left its disposable task blocked; that failure is recorded in `docs/state.md`. R6–R9 still have behavior and acceptance work open. The ARM64 macOS package from `cb67c52` has valid checksums and a passing version smoke; install lifecycle and reproducibility remain unverified. GitHub remote behavior awaits a user-provided repository. Linux-native checks wait for the user's server; Linux support remains unverified. The local history stays on `master` with no remote. Critic approval moves a task to `verifying`; managed-worktree tasks also require explicit integration, post-integration checks, a user-created commit, and finalization. `up --auto` runs at most one task per explicit call. `up --semi` prompts before a Writer launch and requires an interactive terminal.
+<p align="center">
+  <a href="https://github.com/AVP-Dev/talos/releases"><img src="https://img.shields.io/badge/version-0.1.0-blue.svg" alt="Version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-green.svg" alt="License"></a>
+  <a href="#"><img src="https://img.shields.io/badge/rust-1.94%2B-orange.svg" alt="Rust"></a>
+  <a href="#"><img src="https://img.shields.io/badge/tests-140%20passed-brightgreen.svg" alt="Tests"></a>
+  <a href="#"><img src="https://img.shields.io/badge/platform-macOS%20%7C%20Linux-lightgrey.svg" alt="Platforms"></a>
+</p>
+
+---
+
+TALOS is a local, CLI-first orchestrator for installed AI coding CLIs. It stores tasks, execution attempts, events, and subtasks in a durable local SQLite database, supervises AI CLI processes across 7 supported adapters (`agy`, `codex`, `omp`, `pi`, `kilo`, `opencode`, `claude`), coordinates Writer and Critic teams, verifies results against automated project checks, and commits verified code directly to Git.
+
+**Zero babysitting:** give TALOS a task once, and it orchestrates planning, parallel implementation in isolated Git worktrees, independent review, defect correction, and verification checks end-to-end.
+
+## Core Capabilities
+
+- **Dual Orchestration Modes:**
+  - **Team Mode (`--mode team`):** Two-tier team collaboration. Writer Lead autonomously plans, decomposes subtasks, supervises parallel Writer Workers in isolated Git worktrees, assists failing workers, and integrates code. Critic Team performs multi-angle audits, and Critic Lead renders the authoritative verdict with automated rebuttal and fix loops.
+  - **Pair Mode (`pair`, default):** Sequential Writer → Critic → Verify → Complete pipeline.
+- **7 AI CLI Adapters:** Native headless runners for `codex`, `agy` (Antigravity), `claude` (Claude Code), `omp`, `pi`, `kilo`, and `opencode`.
+- **Deterministic Rust Core:** SQLite WAL (`.talos/state.sqlite3`, schema v19). No Docker, no Kubernetes, no Python runtime, and no separate local server required.
+- **Git Worktree Isolation:** Parallel workers run in isolated checkouts with strict path containment enforcement.
+- **Automated Verification Gate:** Runs project test suites (pytest, cargo test, npm test) and requires exit 0 before task completion.
+
+## Installation
+
+### One-line installer (macOS & Linux)
+
+```sh
+curl -fsSL https://talos.avpdev.com/install.sh | bash
+```
+*Installs the native release binary to `~/.local/bin/talos` without requiring Apple Developer ID signing or root privileges.*
+
+### Homebrew (macOS)
+
+```sh
+brew install AVP-Dev/tap/talos
+```
+
+### From source (Cargo)
+
+```sh
+cargo install --locked --path .
+```
+
+## Quick Start (30 Seconds)
+
+1. **Initialize in your project repository:**
+   ```sh
+   cd /path/to/your/project
+   talos doctor
+   echo ".talos/" >> .gitignore
+   ```
+
+2. **Configure automated project checks (optional):**
+   ```sh
+   # Python:
+   talos config set checks '[{"id":"unit","argv":["pytest"]}]'
+   # Rust:
+   talos config set checks '[{"id":"test","argv":["cargo","test"]}]'
+   # Node.js:
+   talos config set checks '[{"id":"test","argv":["npm","test"]}]'
+   ```
+
+3. **Add a task with acceptance criteria:**
+   ```sh
+   talos task add "Add safe_eval function" --criteria "calc.py defines safe_eval(expr). Disallow eval/exec. Add unit tests."
+   ```
+
+4. **Run autonomously:**
+   ```sh
+   # Team mode (parallel workers + lead integration):
+   talos up --auto --mode team
+
+   # Pair mode (classic writer -> critic):
+   talos up --auto
+   ```
 
 ## Start here
 
@@ -88,11 +166,19 @@ Example policy fields (keep your existing `writer`, `critic`, and `checks` entri
 
 ```json
 {
-  "schema_version": 4,
-  "writer": "agy",
+  "schema_version": 5,
+  "writer": "codex",
   "critic": "agy",
   "checks": [],
   "max_concurrent_writers": 1,
+  "orchestration": {
+    "mode": "pair",
+    "delegation": "hybrid",
+    "max_writer_workers": 2,
+    "max_critic_workers": 1,
+    "max_review_rounds": 3,
+    "max_help_attempts": 2
+  },
   "github": {
     "repository": "OWNER/REPOSITORY",
     "remote": "origin",

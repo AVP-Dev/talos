@@ -143,6 +143,9 @@ pub struct UpArgs {
     /// Select execution with operator approval at policy boundaries.
     #[arg(long)]
     pub semi: bool,
+    /// Orchestration mode: pair or team.
+    #[arg(long, value_enum)]
+    pub mode: Option<crate::config::OrchestrationMode>,
 }
 
 #[derive(Debug, Args)]
@@ -353,7 +356,7 @@ pub enum ResolveAction {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, ResolveAction, ResumeArgs, TaskArgs, TaskCommand};
+    use super::{Cli, Command, ResolveAction, ResumeArgs, TaskArgs, TaskCommand, UpArgs};
 
     #[test]
     fn task_continue_requires_project_inspection_confirmation() {
@@ -573,6 +576,25 @@ mod tests {
             "I inspected the process and project diff",
         ]);
         assert!(parsed.is_err());
+    }
+
+    #[test]
+    fn up_auto_parses_mode_team() {
+        let cli = Cli::try_parse_from(["talos", "up", "--auto", "--mode", "team"])
+            .expect("parse up --auto --mode team");
+        let Command::Up(UpArgs { auto, mode, .. }) = cli.command else {
+            panic!("expected up command");
+        };
+        assert!(auto);
+        assert_eq!(mode, Some(crate::config::OrchestrationMode::Team));
+
+        let cli_default =
+            Cli::try_parse_from(["talos", "up", "--auto"]).expect("parse up --auto default mode");
+        let Command::Up(UpArgs { auto, mode, .. }) = cli_default.command else {
+            panic!("expected up command");
+        };
+        assert!(auto);
+        assert_eq!(mode, None);
     }
 }
 

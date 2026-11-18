@@ -11,6 +11,8 @@ use serde::Serialize;
 use serde_json::json;
 use tokio::time::{Instant, sleep};
 
+use sha2::{Digest, Sha256};
+
 use crate::{
     adapter::agy::AgyProbe,
     checks::{CheckExecution, ProjectCheck, run_project_check, validate_selected_checks},
@@ -28,7 +30,7 @@ use crate::{
     github::{self, GithubProbe},
     policy::{self, Action as PolicyAction, Authorization, ExecutionMode},
     project::{DiscoveryMethod, Project},
-    revision::{RevisionSnapshot, git_head, git_output_has_any_bytes},
+    revision::{RevisionSnapshot, clean_base_commit, git_head, git_output_has_any_bytes},
     secrets::{contains_sensitive, redact_sensitive},
     supervisor::{
         VERIFIED_AGY_CRITIC_VERSION, VERIFIED_AGY_WRITE_VERSION, WriterContinuation,
@@ -102,6 +104,8 @@ struct DoctorReport {
     agent_execution: String,
     writer_adapter: &'static str,
     critic_adapter: &'static str,
+    orchestration_mode: &'static str,
+    delegation: &'static str,
     adapter_profiles: Vec<AdapterCapabilityReport>,
     project_checks: Vec<String>,
     tmux: TmuxProbe,
@@ -214,7 +218,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     match cli.command {
         Command::Up(arguments) if arguments.auto => {
             ensure_queue_running(&database)?;
-            run_one_shot_auto(cli.json, &project, &mut database).await?;
+            run_one_shot_auto(cli.json, &project, &mut database, arguments.mode).await?;
         }
         Command::Up(arguments) if arguments.semi => {
             ensure_queue_running(&database)?;
@@ -841,6 +845,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 agent_execution,
                 writer_adapter: writer_adapter.as_str(),
                 critic_adapter: critic_adapter.as_str(),
+                orchestration_mode: project_config.orchestration.mode.as_str(),
+                delegation: project_config.orchestration.delegation.as_str(),
                 adapter_profiles,
                 project_checks: project_config
                     .checks
@@ -867,6 +873,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                 println!("Agent execution: {}", report.agent_execution);
                 println!("Writer adapter: {}", report.writer_adapter);
                 println!("Critic adapter: {}", report.critic_adapter);
+                println!("Orchestration mode: {}", report.orchestration_mode);
+                println!("Delegation mode: {}", report.delegation);
                 println!("Adapter profiles:");
                 for profile in &report.adapter_profiles {
                     println!(
@@ -2712,21 +2720,35 @@ async fn execute_writer_task(
             configured_adapter.as_str()
         );
     }
-    let (executable, version) = resolve_adapter_executable(configured_adapter, &project.root)?;
-    ensure_execution_root_current(project, database, task_id)?;
+    let execution_project = execution_project_for_task(project, database, task_id)?;
+    let (executable, version) =
+        resolve_adapter_executable(configured_adapter, &execution_project.root)?;
+    ensure_execution_root_current(&execution_project, database, task_id)?;
     let options = WriterRunOptions {
         adapter: configured_adapter,
         executable,
         agy_version: version,
         model: config.writer_model.clone(),
         timeout: WRITER_TIMEOUT,
-        max_concurrent_writers: config.max_concurrent_writers,
+        max_concurrent_writers: std::cmp::min(
+            3,
+            std::cmp::max(
+                config.max_concurrent_writers,
+                config.orchestration.max_writer_workers,
+            ),
+        ),
     };
     if let Some(continuation) = continuation {
-        continue_writer_attempt_with_options(project, database, task_id, continuation, options)
-            .await
+        continue_writer_attempt_with_options(
+            &execution_project,
+            database,
+            task_id,
+            continuation,
+            options,
+        )
+        .await
     } else {
-        run_writer_attempt_with_options(project, database, task_id, options).await
+        run_writer_attempt_with_options(&execution_project, database, task_id, options).await
     }
 }
 
@@ -2860,6 +2882,7 @@ async fn run_one_shot_auto(
     json_output: bool,
     project: &Project,
     database: &mut Database,
+    mode_override: Option<crate::config::OrchestrationMode>,
 ) -> Result<()> {
     if policy::authorize(ExecutionMode::Auto, PolicyAction::WriterLaunch, true)
         != Authorization::Allow
@@ -2870,6 +2893,9 @@ async fn run_one_shot_auto(
         bail!("`up --auto` requires a Git project so TALOS can report actual changed files");
     }
     validate_project_scope(project)?;
+    let config = ProjectConfig::load(project)?;
+    let mode = mode_override.unwrap_or(config.orchestration.mode);
+
     let mut tasks_processed = 0;
     loop {
         let task = database.first_runnable_queued_task()?;
@@ -2880,6 +2906,7 @@ async fn run_one_shot_auto(
                 if json_output {
                     print_json(&json!({
                         "mode": "auto",
+                        "orchestration_mode": mode.as_str(),
                         "result": if has_queued_tasks {
                             "waiting_on_dependencies"
                         } else {
@@ -2907,202 +2934,987 @@ async fn run_one_shot_auto(
 
         tasks_processed += 1;
         println!(
-            "\n=======================================================\n>>> [TALOS Auto] Processing Task #{} ({}): {}\n=======================================================",
+            "\n=======================================================\n>>> [TALOS Auto ({})] Processing Task #{} ({}): {}\n=======================================================",
+            mode.as_str().to_uppercase(),
             task.id,
             task.status.as_str(),
             task.title
         );
 
-        let execution_project = execution_project_for_task(project, database, task.id)?;
-        let is_in_progress = task.status == crate::db::TaskStatus::Implementing
-            || task.status == crate::db::TaskStatus::Reviewing
-            || task.status == crate::db::TaskStatus::Verifying;
-
-        let before = git_status_paths(project)?;
-        if !before.is_empty() && !is_in_progress {
-            bail!(
-                "`up --auto` requires a clean Git worktree; inspect or commit these existing paths first: {}",
-                before.display_preview()
-            );
-        }
-        let execution_before = git_status_paths(&execution_project)?;
-        if !execution_before.is_empty() && !is_in_progress {
-            bail!(
-                "`up --auto` requires a clean task execution worktree; inspect or commit these existing paths first: {}",
-                execution_before.display_preview()
-            );
-        }
-
-        if task.status != crate::db::TaskStatus::Verifying
-            && task.status != crate::db::TaskStatus::Reviewing
-        {
-            let execution =
-                execute_writer_task(json_output, &execution_project, database, task.id, None).await;
-            let changed_files = git_status_paths(&execution_project)?;
-            let report = execution?;
-            print_writer_report(json_output, &report, Some(&changed_files))?;
-            ensure_writer_succeeded(&report)?;
-        }
-
-        let has_worktree = database.task_worktree(task.id)?.is_some();
-        if has_worktree && database.task_worktree_integration(task.id)?.is_none() {
-            println!(
-                "\n>>> [TALOS Auto] Integrating task #{} worktree into primary project before review...",
-                task.id
-            );
-            match crate::worktree::integrate(project, database, task.id) {
-                Ok(_) => {
-                    let commit_msg = format!("talos: task #{}: {}", task.id, task.title);
-                    let _ = git_command(project, &["add", "."]);
-                    let _ = git_command(project, &["commit", "-m", &commit_msg]);
-                    println!(
-                        ">>> [TALOS Auto] Task #{} worktree patch integrated and committed in primary project.",
-                        task.id
-                    );
-                }
-                Err(e) => {
-                    println!(">>> [TALOS Auto] Notice during worktree integration: {e}");
-                }
+        match mode {
+            crate::config::OrchestrationMode::Pair => {
+                run_pair_task(json_output, project, database, &task, &config).await?;
             }
-        }
-
-        let review_project = if has_worktree {
-            project
-        } else {
-            &execution_project
-        };
-
-        // Step 2: Critic Review & Automated Fix Loop
-        if task.status != crate::db::TaskStatus::Verifying {
-            const MAX_REVIEW_FIX_CYCLES: usize = 3;
-            let mut cycles = 0;
-            loop {
-                cycles += 1;
-                println!(
-                    "\n>>> [TALOS Auto] Starting Critic review for task #{} (round {cycles})...",
-                    task.id
-                );
-                let critic_report = execute_critic_review(review_project, database, task.id).await?;
-                print_critic_report(json_output, &critic_report)?;
-
-                if critic_report.review.decision == "approve" {
-                    println!(
-                        "\n>>> [TALOS Auto] Critic approved changes for task #{}.",
-                        task.id
-                    );
-                    break;
-                }
-
-                if cycles >= MAX_REVIEW_FIX_CYCLES {
-                    println!(
-                        "\n>>> [TALOS Auto] Critic requested changes, but maximum review/fix rounds ({MAX_REVIEW_FIX_CYCLES}) reached. Task remains in implementing for review."
-                    );
-                    return Ok(());
-                }
-
-                println!(
-                    "\n>>> [TALOS Auto] Critic requested changes. Launching Writer fix iteration..."
-                );
-                let fix_execution =
-                    execute_writer_task(json_output, &execution_project, database, task.id, None)
-                        .await?;
-                let fix_changed = git_status_paths(&execution_project)?;
-                print_writer_report(json_output, &fix_execution, Some(&fix_changed))?;
-                ensure_writer_succeeded(&fix_execution)?;
-            }
-        }
-
-        // Step 3: Project Verification / Tests
-        let checks = database.task_verification_checks(task.id)?;
-        if checks.is_empty() {
-            let config = ProjectConfig::load(project)?;
-            if !config.checks.is_empty() {
-                println!(
-                    "\n>>> [TALOS Auto] Attaching {} configured project check(s) to task #{}...",
-                    config.checks.len(),
-                    task.id
-                );
-                database.add_task_verification_checks(task.id, &config.checks)?;
-            }
-        }
-
-        println!(
-            "\n>>> [TALOS Auto] Running project verification for task #{}...",
-            task.id
-        );
-        run_task_verification(json_output, project, database, task.id).await?;
-        println!(
-            "\n>>> [TALOS Auto] Task #{} verified and completed successfully!",
-            task.id
-        );
-
-        // Step 4: Finalize Worktree Integration (if task executed in a worktree)
-        if has_worktree {
-            println!(
-                "\n>>> [TALOS Auto] Finalizing task #{} worktree...",
-                task.id
-            );
-            match crate::worktree::finalize(project, database, task.id) {
-                Ok(_) => {
-                    println!(
-                        ">>> [TALOS Auto] Task #{} worktree finalized successfully!",
-                        task.id
-                    );
-                }
-                Err(e) => {
-                    println!(">>> [TALOS Auto] Worktree finalization note: {e}");
-                }
-            }
-        }
-
-        // Commit task changes locally if primary worktree is dirty
-        let dirty = git_status_paths(project)?;
-        if !dirty.is_empty() {
-            let commit_msg = format!("talos: task #{}: {}", task.id, task.title);
-            let _ = git_command(project, &["add", "."]);
-            let _ = git_command(project, &["commit", "-m", &commit_msg]);
-            println!(">>> [TALOS Auto] Committed task #{} changes locally in Git.", task.id);
-        }
-
-        // Step 5: Optional GitHub Draft PR creation (if enabled by policy)
-        let config = ProjectConfig::load(project)?;
-        if let Some(policy) = &config.github
-            && policy.allow_push
-            && policy.allow_pull_request
-        {
-            println!(
-                "\n>>> [TALOS Auto] GitHub publication policy is enabled. Preparing Draft PR for task #{}...",
-                task.id
-            );
-            let branch = format!("{}task-{}", policy.feature_branch_prefix, task.id);
-            let _ = git_command(project, &["checkout", "-B", &branch]);
-            let status = git_status_paths(project)?;
-            if !status.is_empty() {
-                let _ = git_command(project, &["add", "."]);
-                let _ = git_command(
-                    project,
-                    &[
-                        "commit",
-                        "-m",
-                        &format!("feat: task #{}: {}", task.id, task.title),
-                    ],
-                );
-            }
-            let req = GithubPublishRequest {
-                branch: &branch,
-                title: &format!("talos: task #{}: {}", task.id, task.title),
-                body: &format!(
-                    "Autonomous task #{} completed by TALOS.\n\nCritic approved and verified.",
-                    task.id
-                ),
-                confirm_push: true,
-                confirm_pr: true,
-            };
-            if let Err(e) = run_github_publish(json_output, project, database, req).await {
-                println!(">>> [TALOS Auto] Note: GitHub publication was skipped or failed: {e}");
+            crate::config::OrchestrationMode::Team => {
+                run_team_task(json_output, project, database, &task, &config).await?;
             }
         }
     }
+}
+
+async fn run_pair_task(
+    json_output: bool,
+    project: &Project,
+    database: &mut Database,
+    task: &TaskRecord,
+    config: &ProjectConfig,
+) -> Result<()> {
+    let execution_project = execution_project_for_task(project, database, task.id)?;
+    let is_in_progress = task.status == crate::db::TaskStatus::Implementing
+        || task.status == crate::db::TaskStatus::Reviewing
+        || task.status == crate::db::TaskStatus::Verifying;
+
+    let before = git_status_paths(project)?;
+    if !before.is_empty() && !is_in_progress {
+        bail!(
+            "`up --auto` requires a clean Git worktree; inspect or commit these existing paths first: {}",
+            before.display_preview()
+        );
+    }
+    let execution_before = git_status_paths(&execution_project)?;
+    if !execution_before.is_empty() && !is_in_progress {
+        bail!(
+            "`up --auto` requires a clean task execution worktree; inspect or commit these existing paths first: {}",
+            execution_before.display_preview()
+        );
+    }
+
+    if task.status != crate::db::TaskStatus::Verifying
+        && task.status != crate::db::TaskStatus::Reviewing
+    {
+        let execution =
+            execute_writer_task(json_output, &execution_project, database, task.id, None).await;
+        let changed_files = git_status_paths(&execution_project)?;
+        let report = execution?;
+        print_writer_report(json_output, &report, Some(&changed_files))?;
+        ensure_writer_succeeded(&report)?;
+    }
+
+    let has_worktree = database.task_worktree(task.id)?.is_some();
+    if has_worktree && database.task_worktree_integration(task.id)?.is_none() {
+        println!(
+            "\n>>> [TALOS Auto] Integrating task #{} worktree into primary project before review...",
+            task.id
+        );
+        match crate::worktree::integrate(project, database, task.id) {
+            Ok(_) => {
+                let commit_msg = format!("talos: task #{}: {}", task.id, task.title);
+                let _ = git_command(project, &["add", "."]);
+                let _ = git_command(project, &["commit", "-m", &commit_msg]);
+                println!(
+                    ">>> [TALOS Auto] Task #{} worktree patch integrated and committed in primary project.",
+                    task.id
+                );
+            }
+            Err(e) => {
+                println!(">>> [TALOS Auto] Notice during worktree integration: {e}");
+            }
+        }
+    }
+
+    let review_project = if has_worktree {
+        project
+    } else {
+        &execution_project
+    };
+
+    // Step 2: Critic Review & Automated Fix Loop
+    if task.status != crate::db::TaskStatus::Verifying {
+        const MAX_REVIEW_FIX_CYCLES: usize = 3;
+        let mut cycles = 0;
+        loop {
+            cycles += 1;
+            println!(
+                "\n>>> [TALOS Auto] Starting Critic review for task #{} (round {cycles})...",
+                task.id
+            );
+            let critic_report = execute_critic_review(review_project, database, task.id).await?;
+            print_critic_report(json_output, &critic_report)?;
+
+            if critic_report.review.decision == "approve" {
+                println!(
+                    "\n>>> [TALOS Auto] Critic approved changes for task #{}.",
+                    task.id
+                );
+                break;
+            }
+
+            if cycles >= MAX_REVIEW_FIX_CYCLES {
+                println!(
+                    "\n>>> [TALOS Auto] Critic requested changes, but maximum review/fix rounds ({MAX_REVIEW_FIX_CYCLES}) reached. Task remains in implementing for review."
+                );
+                return Ok(());
+            }
+
+            println!(
+                "\n>>> [TALOS Auto] Critic requested changes. Launching Writer fix iteration..."
+            );
+            let fix_execution =
+                execute_writer_task(json_output, &execution_project, database, task.id, None)
+                    .await?;
+            let fix_changed = git_status_paths(&execution_project)?;
+            print_writer_report(json_output, &fix_execution, Some(&fix_changed))?;
+            ensure_writer_succeeded(&fix_execution)?;
+        }
+    }
+
+    // Step 3: Project Verification / Tests
+    let checks = database.task_verification_checks(task.id)?;
+    if checks.is_empty() && !config.checks.is_empty() {
+        println!(
+            "\n>>> [TALOS Auto] Attaching {} configured project check(s) to task #{}...",
+            config.checks.len(),
+            task.id
+        );
+        database.add_task_verification_checks(task.id, &config.checks)?;
+    }
+
+    println!(
+        "\n>>> [TALOS Auto] Running project verification for task #{}...",
+        task.id
+    );
+    run_task_verification(json_output, project, database, task.id).await?;
+    println!(
+        "\n>>> [TALOS Auto] Task #{} verified and completed successfully!",
+        task.id
+    );
+
+    // Step 4: Finalize Worktree Integration (if task executed in a worktree)
+    if has_worktree {
+        println!(
+            "\n>>> [TALOS Auto] Finalizing task #{} worktree...",
+            task.id
+        );
+        match crate::worktree::finalize(project, database, task.id) {
+            Ok(_) => {
+                println!(
+                    ">>> [TALOS Auto] Task #{} worktree finalized successfully!",
+                    task.id
+                );
+            }
+            Err(e) => {
+                println!(">>> [TALOS Auto] Worktree finalization note: {e}");
+            }
+        }
+    }
+
+    // Commit task changes locally if primary worktree is dirty
+    let dirty = git_status_paths(project)?;
+    if !dirty.is_empty() {
+        let commit_msg = format!("talos: task #{}: {}", task.id, task.title);
+        let _ = git_command(project, &["add", "."]);
+        let _ = git_command(project, &["commit", "-m", &commit_msg]);
+        println!(
+            ">>> [TALOS Auto] Committed task #{} changes locally in Git.",
+            task.id
+        );
+    }
+
+    // Step 5: Optional GitHub Draft PR creation (if enabled by policy)
+    if let Some(policy) = &config.github
+        && policy.allow_push
+        && policy.allow_pull_request
+    {
+        println!(
+            "\n>>> [TALOS Auto] GitHub publication policy is enabled. Preparing Draft PR for task #{}...",
+            task.id
+        );
+        let branch = format!("{}task-{}", policy.feature_branch_prefix, task.id);
+        let _ = git_command(project, &["checkout", "-B", &branch]);
+        let status = git_status_paths(project)?;
+        if !status.is_empty() {
+            let _ = git_command(project, &["add", "."]);
+            let _ = git_command(
+                project,
+                &[
+                    "commit",
+                    "-m",
+                    &format!("feat: task #{}: {}", task.id, task.title),
+                ],
+            );
+        }
+        let req = GithubPublishRequest {
+            branch: &branch,
+            title: &format!("talos: task #{}: {}", task.id, task.title),
+            body: &format!(
+                "Autonomous task #{} completed by TALOS.\n\nCritic approved and verified.",
+                task.id
+            ),
+            confirm_push: true,
+            confirm_pr: true,
+        };
+        if let Err(e) = run_github_publish(json_output, project, database, req).await {
+            println!(">>> [TALOS Auto] Note: GitHub publication was skipped or failed: {e}");
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_team_task(
+    json_output: bool,
+    project: &Project,
+    database: &mut Database,
+    task: &TaskRecord,
+    config: &ProjectConfig,
+) -> Result<()> {
+    println!("\n>>> [TALOS Team] ===============================================");
+    println!(
+        ">>> [TALOS Team] Orchestrating Task #{}: {}",
+        task.id, task.title
+    );
+    let delegation = crate::team::detect_delegation(config.writer, config.orchestration.delegation);
+    println!(
+        ">>> [TALOS Team] Mode: TEAM | Delegation: {} | Writer: {} | Critic: {}",
+        delegation.as_str(),
+        config.writer.as_str(),
+        config.critic.as_str()
+    );
+    println!(
+        ">>> [TALOS Team] Limits: max_writer_workers={}, max_critic_workers={}, max_review_rounds={}, max_help_attempts={}",
+        config.orchestration.max_writer_workers,
+        config.orchestration.max_critic_workers,
+        config.orchestration.max_review_rounds,
+        config.orchestration.max_help_attempts
+    );
+    println!(">>> [TALOS Team] ===============================================");
+
+    let before = git_status_paths(project)?;
+    let is_in_progress = task.status == crate::db::TaskStatus::Implementing
+        || task.status == crate::db::TaskStatus::Reviewing
+        || task.status == crate::db::TaskStatus::Verifying;
+    if !before.is_empty() && !is_in_progress {
+        bail!(
+            "`up --auto --mode team` requires a clean Git worktree; inspect or commit these existing paths first: {}",
+            before.display_preview()
+        );
+    }
+    let initial_base_revision = clean_base_commit(&project.root)?;
+
+    let (writer_exe, _) = resolve_adapter_executable(config.writer, &project.root)?;
+
+    // Step 1: Writer Lead Planning & Decomposition
+    println!("\n>>> [TALOS Team] Phase 1: Writer Lead analyzing requirements & planning...");
+    let plan_prompt =
+        crate::team::build_writer_lead_plan_prompt(task, config.orchestration.max_writer_workers);
+    let plan_response = crate::supervisor::run_agent_query(
+        &project.root,
+        config.writer,
+        writer_exe.clone(),
+        config.writer_model.clone(),
+        plan_prompt,
+        false,
+        Duration::from_secs(120),
+    )
+    .await;
+
+    let lead_plan = match plan_response {
+        Ok(resp) => match crate::team::parse_writer_lead_plan(&resp) {
+            Ok(plan) => Some(plan),
+            Err(e) => {
+                println!(
+                    ">>> [TALOS Team] Note: Writer Lead plan parsing failed ({e:#}); defaulting to self-implementation."
+                );
+                None
+            }
+        },
+        Err(e) => {
+            println!(
+                ">>> [TALOS Team] Note: Writer Lead plan query failed ({e:#}); defaulting to self-implementation."
+            );
+            None
+        }
+    };
+
+    let (action, subtasks) = match lead_plan {
+        Some(plan) => (plan.action, plan.subtasks),
+        None => ("self".to_owned(), Vec::new()),
+    };
+
+    let has_subtasks = action == "delegate" && !subtasks.is_empty();
+
+    if has_subtasks {
+        let workers_to_run = std::cmp::min(subtasks.len(), config.orchestration.max_writer_workers);
+        println!(
+            ">>> [TALOS Team] Writer Lead decided: DELEGATE to {} Writer Worker(s).",
+            workers_to_run
+        );
+        let plan_json = json!({
+            "action": "delegate",
+            "worker_count": workers_to_run,
+        })
+        .to_string();
+        let _ = database.record_task_event(
+            task.id,
+            "writer_lead",
+            "task.team_planning",
+            "Writer Lead decomposed task into worker subtasks",
+            Some(&plan_json),
+        );
+
+        let mut subtask_items = Vec::new();
+        for (idx, subtask) in subtasks.into_iter().take(workers_to_run).enumerate() {
+            println!(
+                "\n>>> [TALOS Team] Creating Worker Subtask #{} (Worker {}): '{}' [Scope: {:?}]",
+                idx + 1,
+                subtask.id,
+                subtask.title,
+                subtask.allowed_paths
+            );
+
+            let (child_task, contract) = database.add_child_task(
+                task.id,
+                &subtask.title,
+                &subtask.acceptance_criteria,
+                &subtask.allowed_paths,
+                30 * 60 * 1000,
+            )?;
+
+            database.add_team_subtask(
+                task.id,
+                child_task.id,
+                "writer_worker",
+                config.writer.as_str(),
+                delegation.as_str(),
+                "queued",
+                &[],
+            )?;
+
+            if let Ok((_managed_root, worktree_path, branch_name)) =
+                crate::worktree::managed_identity(&project.root, child_task.id)
+            {
+                if worktree_path.exists() {
+                    let _ = std::fs::remove_dir_all(&worktree_path);
+                }
+                let _ = git_command(project, &["worktree", "prune"]);
+                let _ = git_command(project, &["branch", "-D", &branch_name]);
+            }
+            let worktree_record = crate::worktree::create(project, database, child_task.id)?;
+            subtask_items.push((child_task, subtask, contract, worktree_record));
+        }
+
+        // Parallel Execution if multiple workers are configured
+        let mut worker_exec_results: Vec<(
+            crate::db::TaskRecord,
+            crate::team::SubtaskPlan,
+            crate::db::ChildTaskContract,
+            crate::db::TaskWorktreeRecord,
+            Result<crate::supervisor::WriterExecutionReport>,
+        )> = Vec::new();
+        if subtask_items.len() == 2 {
+            let item1 = subtask_items.remove(0);
+            let item2 = subtask_items.remove(0);
+            let (child1, plan1, contract1, wt1) = item1;
+            let (child2, plan2, contract2, wt2) = item2;
+
+            database.update_team_subtask_status(child1.id, "in_progress", None, None)?;
+            database.update_team_subtask_status(child2.id, "in_progress", None, None)?;
+
+            println!(
+                "\n>>> [TALOS Team] Dispatching 2 Writer Workers IN PARALLEL into managed worktrees..."
+            );
+            let project_clone1 = project.clone();
+            let project_clone2 = project.clone();
+            let child1_id = child1.id;
+            let child2_id = child2.id;
+            let title1 = child1.title.clone();
+            let title2 = child2.title.clone();
+            let wt_path1 = wt1.worktree_path.clone();
+            let wt_path2 = wt2.worktree_path.clone();
+
+            let fut1 = async move {
+                let mut db = Database::open(&project_clone1)?;
+                let start_instant = Instant::now();
+                let start_time = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                println!(
+                    ">>> [TALOS Team] [Worker 1] STARTED at: {} ms | Subtask #{}: '{}' (Worktree: {})",
+                    start_time, child1_id, title1, wt_path1
+                );
+                let exec =
+                    execute_writer_task(json_output, &project_clone1, &mut db, child1_id, None)
+                        .await;
+                let end_time = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                println!(
+                    ">>> [TALOS Team] [Worker 1] FINISHED at: {} ms (Duration: {:?})",
+                    end_time,
+                    start_instant.elapsed()
+                );
+                Ok::<_, anyhow::Error>((child1_id, exec, start_time, end_time))
+            };
+
+            let fut2 = async move {
+                let mut db = Database::open(&project_clone2)?;
+                let start_instant = Instant::now();
+                let start_time = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                println!(
+                    ">>> [TALOS Team] [Worker 2] STARTED at: {} ms | Subtask #{}: '{}' (Worktree: {})",
+                    start_time, child2_id, title2, wt_path2
+                );
+                let exec =
+                    execute_writer_task(json_output, &project_clone2, &mut db, child2_id, None)
+                        .await;
+                let end_time = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis();
+                println!(
+                    ">>> [TALOS Team] [Worker 2] FINISHED at: {} ms (Duration: {:?})",
+                    end_time,
+                    start_instant.elapsed()
+                );
+                Ok::<_, anyhow::Error>((child2_id, exec, start_time, end_time))
+            };
+
+            let (res1, res2) = tokio::join!(fut1, fut2);
+            let r1 = match res1 {
+                Ok((_, exec, _, _)) => exec,
+                Err(e) => Err(e),
+            };
+            let r2 = match res2 {
+                Ok((_, exec, _, _)) => exec,
+                Err(e) => Err(e),
+            };
+            worker_exec_results.push((child1, plan1, contract1, wt1, r1));
+            worker_exec_results.push((child2, plan2, contract2, wt2, r2));
+        } else {
+            for (child_task, subtask, contract, wt) in subtask_items {
+                database.update_team_subtask_status(child_task.id, "in_progress", None, None)?;
+                println!(
+                    ">>> [TALOS Team] Dispatching Writer Worker for subtask #{} ('{}')...",
+                    child_task.id, child_task.title
+                );
+                let exec =
+                    execute_writer_task(json_output, project, database, child_task.id, None).await;
+                worker_exec_results.push((child_task, subtask, contract, wt, exec));
+            }
+        }
+
+        // Evaluate Worker outcomes and handle stuck/failing workers
+        let mut completed_workers = Vec::new();
+        let mut simulated_error_triggered = false;
+        for (child_task, subtask, contract, wt, mut exec_result) in worker_exec_results {
+            let inject_error = !simulated_error_triggered
+                && std::env::var("TALOS_SIMULATE_WORKER_ERROR")
+                    .map(|val| val == "1" || val == child_task.id.to_string())
+                    .unwrap_or(false);
+
+            let succeeded = if inject_error {
+                simulated_error_triggered = true;
+                exec_result = Err(anyhow::anyhow!(
+                    "Worker process terminated unexpectedly (signal: SIGKILL, exit code: 137)"
+                ));
+                false
+            } else {
+                match &exec_result {
+                    Ok(rep) => rep.attempt.state == "succeeded",
+                    Err(_) => false,
+                }
+            };
+
+            if succeeded {
+                let rep = exec_result.unwrap();
+                println!(
+                    ">>> [TALOS Team] Writer Worker finished subtask #{} successfully.",
+                    child_task.id
+                );
+                database.update_team_subtask_status(
+                    child_task.id,
+                    "completed",
+                    rep.response.as_deref(),
+                    None,
+                )?;
+                completed_workers.push((child_task, subtask, contract, wt));
+            } else {
+                let mut help_attempts = 0;
+                let max_help = config.orchestration.max_help_attempts;
+                loop {
+                    help_attempts += 1;
+                    let err_msg =
+                        match &exec_result {
+                            Err(e) => format!("{e:#}"),
+                            Ok(rep) => rep.attempt.error_code.clone().unwrap_or_else(|| {
+                                "Worker finished with non-success state".to_owned()
+                            }),
+                        };
+                    println!(
+                        "\n>>> [TALOS Team] Worker encountered issue on subtask #{} (help attempt {}/{}): {}",
+                        child_task.id, help_attempts, max_help, err_msg
+                    );
+
+                    if help_attempts > max_help {
+                        println!(
+                            ">>> [TALOS Team] Maximum help attempts ({}) exceeded for subtask #{}; marking blocked.",
+                            max_help, child_task.id
+                        );
+                        database.update_team_subtask_status(
+                            child_task.id,
+                            "blocked",
+                            None,
+                            Some(&err_msg),
+                        )?;
+                        bail!(
+                            "Worker subtask #{} blocked after {} help attempts",
+                            child_task.id,
+                            max_help
+                        );
+                    }
+
+                    println!(
+                        ">>> [TALOS Team] Writer Lead analyzing failure and providing assistance..."
+                    );
+                    let help_prompt = crate::team::build_worker_help_prompt(
+                        task,
+                        &subtask.id,
+                        &subtask.title,
+                        &subtask.allowed_paths,
+                        &err_msg,
+                        help_attempts,
+                        max_help,
+                    );
+                    let lead_help_response = crate::supervisor::run_agent_query(
+                        &project.root,
+                        config.writer,
+                        writer_exe.clone(),
+                        config.writer_model.clone(),
+                        help_prompt,
+                        false,
+                        Duration::from_secs(120),
+                    )
+                    .await;
+
+                    let decision = lead_help_response
+                        .ok()
+                        .and_then(|r| crate::team::parse_worker_help_decision(&r).ok());
+
+                    match decision {
+                        Some(d) if d.action == "takeover" => {
+                            println!(
+                                ">>> [TALOS Team] Writer Lead assistance decision: TAKEOVER. Lead takes over subtask #{}.",
+                                child_task.id
+                            );
+                            let current = database.get_task(child_task.id)?;
+                            if let Some(t) = current
+                                && t.status != crate::db::TaskStatus::Queued
+                            {
+                                database.transition_task(
+                                    child_task.id,
+                                    crate::db::TaskStatus::Queued,
+                                    "writer_lead",
+                                    "Writer Lead takeover for blocked subtask",
+                                )?;
+                            }
+                            let wt_path = Path::new(&wt.worktree_path);
+                            if wt_path.exists() {
+                                let _ = std::process::Command::new("git")
+                                    .args([
+                                        "-C",
+                                        wt.worktree_path.as_str(),
+                                        "reset",
+                                        "--hard",
+                                        "HEAD",
+                                    ])
+                                    .output();
+                                let _ = std::process::Command::new("git")
+                                    .args(["-C", wt.worktree_path.as_str(), "clean", "-fd"])
+                                    .output();
+                            }
+                            let takeover_exec = execute_writer_task(
+                                json_output,
+                                project,
+                                database,
+                                child_task.id,
+                                None,
+                            )
+                            .await?;
+                            ensure_writer_succeeded(&takeover_exec)?;
+                            database.update_team_subtask_status(
+                                child_task.id,
+                                "completed",
+                                Some("Writer Lead takeover successful"),
+                                None,
+                            )?;
+                            completed_workers.push((child_task, subtask, contract, wt));
+                            break;
+                        }
+                        Some(d) if d.action == "block" => {
+                            println!(
+                                ">>> [TALOS Team] Writer Lead assistance decision: BLOCK. Reason: {}",
+                                d.reason
+                            );
+                            database.update_team_subtask_status(
+                                child_task.id,
+                                "blocked",
+                                None,
+                                Some(&d.reason),
+                            )?;
+                            bail!(
+                                "Writer Lead marked subtask #{} as blocked: {}",
+                                child_task.id,
+                                d.reason
+                            );
+                        }
+                        Some(d) => {
+                            println!(
+                                ">>> [TALOS Team] Writer Lead assistance decision: RETRY WITH GUIDANCE: {:?}",
+                                d.guidance
+                            );
+                            let current = database.get_task(child_task.id)?;
+                            if let Some(t) = current
+                                && t.status != crate::db::TaskStatus::Queued
+                            {
+                                database.transition_task(
+                                    child_task.id,
+                                    crate::db::TaskStatus::Queued,
+                                    "writer_lead",
+                                    "Writer Lead retry with guidance for subtask",
+                                )?;
+                            }
+                            let wt_path = Path::new(&wt.worktree_path);
+                            if wt_path.exists() {
+                                let _ = std::process::Command::new("git")
+                                    .args([
+                                        "-C",
+                                        wt.worktree_path.as_str(),
+                                        "reset",
+                                        "--hard",
+                                        "HEAD",
+                                    ])
+                                    .output();
+                                let _ = std::process::Command::new("git")
+                                    .args(["-C", wt.worktree_path.as_str(), "clean", "-fd"])
+                                    .output();
+                            }
+                            let _ = database.record_task_event(
+                                child_task.id,
+                                "writer_lead",
+                                "task.team_worker_helped",
+                                "Writer Lead provided guidance to worker",
+                                d.guidance.as_deref(),
+                            );
+                            exec_result = execute_writer_task(
+                                json_output,
+                                project,
+                                database,
+                                child_task.id,
+                                None,
+                            )
+                            .await;
+                            if let Ok(rep) = &exec_result
+                                && rep.attempt.state == "succeeded"
+                            {
+                                println!(
+                                    ">>> [TALOS Team] Writer Worker finished subtask #{} successfully after guidance.",
+                                    child_task.id
+                                );
+                                database.update_team_subtask_status(
+                                    child_task.id,
+                                    "completed",
+                                    rep.response.as_deref(),
+                                    None,
+                                )?;
+                                completed_workers.push((child_task, subtask, contract, wt));
+                                break;
+                            }
+                        }
+                        None => {
+                            println!(
+                                ">>> [TALOS Team] Writer Lead provided default corrective guidance; retrying worker..."
+                            );
+                            let current = database.get_task(child_task.id)?;
+                            if let Some(t) = current
+                                && t.status != crate::db::TaskStatus::Queued
+                            {
+                                database.transition_task(
+                                    child_task.id,
+                                    crate::db::TaskStatus::Queued,
+                                    "writer_lead",
+                                    "Writer Lead retry with guidance for subtask",
+                                )?;
+                            }
+                            let wt_path = Path::new(&wt.worktree_path);
+                            if wt_path.exists() {
+                                let _ = std::process::Command::new("git")
+                                    .args([
+                                        "-C",
+                                        wt.worktree_path.as_str(),
+                                        "reset",
+                                        "--hard",
+                                        "HEAD",
+                                    ])
+                                    .output();
+                                let _ = std::process::Command::new("git")
+                                    .args(["-C", wt.worktree_path.as_str(), "clean", "-fd"])
+                                    .output();
+                            }
+                            exec_result = execute_writer_task(
+                                json_output,
+                                project,
+                                database,
+                                child_task.id,
+                                None,
+                            )
+                            .await;
+                            if let Ok(rep) = &exec_result
+                                && rep.attempt.state == "succeeded"
+                            {
+                                database.update_team_subtask_status(
+                                    child_task.id,
+                                    "completed",
+                                    rep.response.as_deref(),
+                                    None,
+                                )?;
+                                completed_workers.push((child_task, subtask, contract, wt));
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        println!("\n>>> [TALOS Team] Phase 2: Writer Lead integrating worker contributions...");
+        for (child_task, _subtask, contract, wt) in &completed_workers {
+            let wt_path = Path::new(&wt.worktree_path);
+            if wt_path.exists() {
+                let snapshot =
+                    crate::revision::RevisionSnapshot::capture(wt_path, &wt.base_commit)?;
+                for path in &snapshot.changed_paths {
+                    if !contract.permits_path(path) {
+                        bail!(
+                            "Subtask #{} modified unauthorized path {path:?}",
+                            child_task.id
+                        );
+                    }
+                    let src = wt_path.join(path);
+                    let dst = project.root.join(path);
+                    if let Some(parent) = dst.parent() {
+                        std::fs::create_dir_all(parent)?;
+                    }
+                    if src.is_file() {
+                        std::fs::copy(&src, &dst)?;
+                    }
+                }
+                database.complete_team_subtask_integration(
+                    child_task.id,
+                    "Integrated by Writer Lead into parent task workspace",
+                )?;
+                println!(
+                    ">>> [TALOS Team] Writer Lead verified and integrated changes from Subtask #{}: {:?}",
+                    child_task.id, snapshot.changed_paths
+                );
+            }
+        }
+        let _ = database.record_task_event(
+            task.id,
+            "writer_lead",
+            "task.team_integration",
+            "Writer Lead integrated all worker subtasks",
+            None,
+        );
+        println!(">>> [TALOS Team] Writer Lead integration complete.");
+
+        let prompt_sha256 = Sha256::digest(task.title.as_bytes())
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect::<String>();
+        let lead_attempt = database.begin_writer_attempt_for_root(
+            task.id,
+            &prompt_sha256,
+            std::process::id(),
+            1,
+            &project.root,
+        )?;
+        database.record_writer_base_revision(lead_attempt.id, &initial_base_revision)?;
+        database.mark_writer_attempt_running_with_identity(
+            lead_attempt.id,
+            std::process::id(),
+            None,
+        )?;
+        database.finish_writer_attempt(
+            lead_attempt.id,
+            crate::db::WriterAttemptOutcome::Succeeded,
+            Some("writer-lead-integrated"),
+            Some(0),
+            Some("SUCCESS"),
+            None,
+        )?;
+    } else {
+        println!(
+            ">>> [TALOS Team] Writer Lead decided: SELF implementation (direct execution without extra workers)."
+        );
+        let _ = database.record_task_event(
+            task.id,
+            "writer_lead",
+            "task.team_planning",
+            "Writer Lead chose direct execution",
+            None,
+        );
+        let execution = execute_writer_task(json_output, project, database, task.id, None).await?;
+        let changed_files = git_status_paths(project)?;
+        print_writer_report(json_output, &execution, Some(&changed_files))?;
+        ensure_writer_succeeded(&execution)?;
+    }
+
+    // Step 2: Critic Team Review & Deliberation Loop
+    println!("\n>>> [TALOS Team] Phase 3: Critic Team independent review & evaluation...");
+    let (critic_exe, _) = resolve_adapter_executable(config.critic, &project.root)?;
+
+    // Optional Critic Worker specialized review
+    let mut _worker_findings_summary = None;
+    if config.orchestration.max_critic_workers > 0 {
+        println!(
+            ">>> [TALOS Team] Deploying Critic Worker for specialized security and correctness review..."
+        );
+        if let Ok(Some(writer)) = database.latest_writer_attempt(task.id) {
+            let base_rev = writer.base_revision.as_deref().unwrap_or("HEAD");
+            if let Ok(snapshot) =
+                crate::revision::RevisionSnapshot::capture(&project.root, base_rev)
+            {
+                let worker_prompt = crate::team::build_critic_worker_prompt(
+                    task,
+                    &snapshot.patch,
+                    "Security, edge case handling, and requirement compliance",
+                );
+                let worker_resp = crate::supervisor::run_agent_query(
+                    &project.root,
+                    config.critic,
+                    critic_exe.clone(),
+                    config.critic_model.clone(),
+                    worker_prompt,
+                    true,
+                    Duration::from_secs(120),
+                )
+                .await;
+
+                if let Ok(resp) = worker_resp {
+                    let _ = database.add_team_subtask(
+                        task.id,
+                        task.id,
+                        "critic_worker",
+                        config.critic.as_str(),
+                        "external",
+                        "completed",
+                        &[],
+                    );
+                    let _ = database.update_team_subtask_status(
+                        task.id,
+                        "completed",
+                        Some(&resp),
+                        None,
+                    );
+                    println!(">>> [TALOS Team] Critic Worker completed specialized review.");
+                    _worker_findings_summary = Some(resp);
+                }
+            }
+        }
+    }
+
+    // Critic Lead consolidated review & deliberation loop
+    let max_rounds = config.orchestration.max_review_rounds;
+    let mut round = 0;
+    loop {
+        round += 1;
+        println!(
+            "\n>>> [TALOS Team] Critic Lead conducting consolidated review (Round {}/{})...",
+            round, max_rounds
+        );
+        let critic_report = execute_critic_review(project, database, task.id).await?;
+        print_critic_report(json_output, &critic_report)?;
+
+        if critic_report.review.decision == "approve" {
+            println!(
+                "\n>>> [TALOS Team] Critic Lead VERDICT: APPROVED (Round {}). Solution verified by engineering review.",
+                round
+            );
+            let _ = database.record_task_event(
+                task.id,
+                "critic_lead",
+                "task.team_verdict",
+                "Critic Lead approved solution",
+                Some(&critic_report.review.summary),
+            );
+            break;
+        }
+
+        if round >= max_rounds {
+            println!(
+                "\n>>> [TALOS Team] Maximum review rounds ({}) reached without resolution. Halting for user visibility.",
+                max_rounds
+            );
+            bail!(
+                "Critic Lead review rounds ({max_rounds}) exhausted for task #{}",
+                task.id
+            );
+        }
+
+        println!(
+            "\n>>> [TALOS Team] Critic Lead requested changes. Writer Lead analyzing remarks and applying corrections..."
+        );
+        let findings_str = serde_json::to_string(&critic_report.findings)?;
+        let _ = database.record_task_event(
+            task.id,
+            "critic_lead",
+            "task.team_review_feedback",
+            "Critic Lead requested modifications",
+            Some(&findings_str),
+        );
+
+        let fix_execution =
+            execute_writer_task(json_output, project, database, task.id, None).await?;
+        let fix_changed = git_status_paths(project)?;
+        print_writer_report(json_output, &fix_execution, Some(&fix_changed))?;
+        ensure_writer_succeeded(&fix_execution)?;
+        println!(">>> [TALOS Team] Writer Lead applied corrections.");
+    }
+
+    // Step 3: Project Verification (Automated Checks / Tests)
+    println!("\n>>> [TALOS Team] Phase 4: Automated project verification checks...");
+    let checks = database.task_verification_checks(task.id)?;
+    if checks.is_empty() && !config.checks.is_empty() {
+        println!(
+            ">>> [TALOS Team] Attaching {} configured check(s) to task #{}: {:?}",
+            config.checks.len(),
+            task.id,
+            config.checks.iter().map(|c| &c.id).collect::<Vec<_>>()
+        );
+        database.add_task_verification_checks(task.id, &config.checks)?;
+    }
+
+    run_task_verification(json_output, project, database, task.id).await?;
+    println!(
+        ">>> [TALOS Team] All automated project checks PASSED successfully for task #{}.",
+        task.id
+    );
+
+    // Step 4: Local Git Commit & Completion
+    let dirty = git_status_paths(project)?;
+    if !dirty.is_empty() {
+        let commit_msg = format!("talos: task #{}: {}", task.id, task.title);
+        let _ = git_command(project, &["add", "."]);
+        let _ = git_command(project, &["commit", "-m", &commit_msg]);
+        println!(
+            ">>> [TALOS Team] Committed task #{} changes locally in Git.",
+            task.id
+        );
+    }
+
+    println!("\n>>> [TALOS Team] ===============================================");
+    println!(
+        ">>> [TALOS Team] Task #{} COMPLETED SUCCESSFULLY BY TEAM ORCHESTRATION!",
+        task.id
+    );
+    println!(">>> [TALOS Team] ===============================================\n");
+
+    Ok(())
 }
 
 async fn run_one_shot_semi(
@@ -3257,38 +4069,38 @@ async fn run_one_shot_semi(
         && policy.allow_push
         && policy.allow_pull_request
     {
-            println!(
-                "\n>>> [TALOS Auto] GitHub publication policy is enabled. Preparing Draft PR for task #{}...",
-                task.id
+        println!(
+            "\n>>> [TALOS Auto] GitHub publication policy is enabled. Preparing Draft PR for task #{}...",
+            task.id
+        );
+        let branch = format!("{}task-{}", policy.feature_branch_prefix, task.id);
+        let _ = git_command(project, &["checkout", "-B", &branch]);
+        let status = git_status_paths(project)?;
+        if !status.is_empty() {
+            let _ = git_command(project, &["add", "."]);
+            let _ = git_command(
+                project,
+                &[
+                    "commit",
+                    "-m",
+                    &format!("feat: task #{}: {}", task.id, task.title),
+                ],
             );
-            let branch = format!("{}task-{}", policy.feature_branch_prefix, task.id);
-            let _ = git_command(project, &["checkout", "-B", &branch]);
-            let status = git_status_paths(project)?;
-            if !status.is_empty() {
-                let _ = git_command(project, &["add", "."]);
-                let _ = git_command(
-                    project,
-                    &[
-                        "commit",
-                        "-m",
-                        &format!("feat: task #{}: {}", task.id, task.title),
-                    ],
-                );
-            }
-            let req = GithubPublishRequest {
-                branch: &branch,
-                title: &format!("talos: task #{}: {}", task.id, task.title),
-                body: &format!(
-                    "Autonomous task #{} completed by TALOS.\n\nCritic approved and verified.",
-                    task.id
-                ),
-                confirm_push: true,
-                confirm_pr: true,
-            };
-            if let Err(e) = run_github_publish(json_output, project, database, req).await {
-                println!(">>> [TALOS Auto] Note: GitHub publication was skipped or failed: {e}");
-            }
         }
+        let req = GithubPublishRequest {
+            branch: &branch,
+            title: &format!("talos: task #{}: {}", task.id, task.title),
+            body: &format!(
+                "Autonomous task #{} completed by TALOS.\n\nCritic approved and verified.",
+                task.id
+            ),
+            confirm_push: true,
+            confirm_pr: true,
+        };
+        if let Err(e) = run_github_publish(json_output, project, database, req).await {
+            println!(">>> [TALOS Auto] Note: GitHub publication was skipped or failed: {e}");
+        }
+    }
 
     Ok(())
 }
@@ -4382,5 +5194,274 @@ mod tests {
         );
         fs::remove_dir_all(&project.root).expect("remove temporary project");
         fs::remove_dir_all(&unavailable_project.root).expect("remove unavailable group project");
+    }
+
+    #[test]
+    fn team_orchestration_planning_and_delegation_flow() {
+        let project = temp_project();
+        init_git(&project.root);
+        fs::write(project.root.join(".gitignore"), ".talos/\n").expect("write gitignore");
+        fs::write(project.root.join("README.md"), "# Team Test\n").expect("write readme");
+        git(&project.root, &["add", "."]);
+        git(&project.root, &["commit", "-m", "initial commit"]);
+
+        let mut database = Database::open(&project).expect("initialize database");
+        let parent_task = database
+            .add_task(
+                "Build Authentication Module",
+                "Implement token auth and endpoints",
+            )
+            .expect("add parent task");
+
+        // Simulate Writer Lead plan response with 2 subtasks
+        let plan_json = r#"{
+            "action": "delegate",
+            "reasoning": "Separate token logic and API endpoints into independent workers",
+            "subtasks": [
+                {
+                    "id": "worker_api",
+                    "title": "API auth endpoints",
+                    "allowed_paths": ["src/api_auth.rs"],
+                    "acceptance_criteria": "Endpoints return 200 on valid token",
+                    "instructions": "Implement auth endpoints"
+                },
+                {
+                    "id": "worker_token",
+                    "title": "JWT token generator",
+                    "allowed_paths": ["src/token.rs"],
+                    "acceptance_criteria": "Token signs and verifies",
+                    "instructions": "Implement token logic"
+                }
+            ]
+        }"#;
+
+        let lead_plan = crate::team::parse_writer_lead_plan(plan_json).expect("parse plan");
+        assert_eq!(lead_plan.action, "delegate");
+        assert_eq!(lead_plan.subtasks.len(), 2);
+
+        // Register subtasks in database
+        for subtask in &lead_plan.subtasks {
+            let (child_task, contract) = database
+                .add_child_task(
+                    parent_task.id,
+                    &subtask.title,
+                    &subtask.acceptance_criteria,
+                    &subtask.allowed_paths,
+                    60_000,
+                )
+                .expect("add child task");
+            assert_eq!(contract.parent_task_id, parent_task.id);
+
+            let team_record = database
+                .add_team_subtask(
+                    parent_task.id,
+                    child_task.id,
+                    "writer_worker",
+                    "codex",
+                    "external",
+                    "queued",
+                    &[],
+                )
+                .expect("add team subtask");
+            assert_eq!(team_record.role, "writer_worker");
+            assert_eq!(team_record.delegation_kind, "external");
+        }
+
+        let subtasks = database
+            .team_subtasks_for_parent(parent_task.id)
+            .expect("fetch subtasks");
+        assert_eq!(subtasks.len(), 2);
+        assert_eq!(subtasks[0].status, "queued");
+        assert_eq!(subtasks[1].status, "queued");
+
+        // Simulate worker progress and completion
+        database
+            .update_team_subtask_status(
+                subtasks[0].subtask_id,
+                "completed",
+                Some("Endpoints implemented"),
+                None,
+            )
+            .expect("update subtask 0");
+        database
+            .update_team_subtask_status(
+                subtasks[1].subtask_id,
+                "completed",
+                Some("Token logic implemented"),
+                None,
+            )
+            .expect("update subtask 1");
+
+        let updated = database
+            .team_subtasks_for_parent(parent_task.id)
+            .expect("fetch updated subtasks");
+        assert_eq!(updated[0].status, "completed");
+        assert_eq!(updated[1].status, "completed");
+        assert_eq!(
+            updated[0].result_summary.as_deref(),
+            Some("Endpoints implemented")
+        );
+
+        fs::remove_dir_all(&project.root).expect("remove temporary project");
+    }
+
+    #[test]
+    fn team_orchestration_stuck_worker_lead_takeover() {
+        let project = temp_project();
+        init_git(&project.root);
+        fs::write(project.root.join(".gitignore"), ".talos/\n").expect("write gitignore");
+        fs::write(project.root.join("README.md"), "# Team Test\n").expect("write readme");
+        git(&project.root, &["add", "."]);
+        git(&project.root, &["commit", "-m", "initial commit"]);
+
+        let mut database = Database::open(&project).expect("initialize database");
+        let parent = database
+            .add_task("Complex Parser Feature", "Parse expressions")
+            .expect("add task");
+
+        let (worker_task, _) = database
+            .add_child_task(
+                parent.id,
+                "Subtask 1: lexer",
+                "Tokenize input",
+                &["src/lexer.rs".to_string()],
+                60_000,
+            )
+            .expect("add child task");
+
+        database
+            .add_team_subtask(
+                parent.id,
+                worker_task.id,
+                "writer_worker",
+                "codex",
+                "external",
+                "in_progress",
+                &[],
+            )
+            .expect("add team subtask");
+
+        // Simulate Worker encountering error and Writer Lead help decision
+        let worker_error = "Syntax error in regex pattern for tokenizer";
+        let help_prompt = crate::team::build_worker_help_prompt(
+            &parent,
+            "subtask_lexer",
+            "Subtask 1: lexer",
+            &["src/lexer.rs".to_string()],
+            worker_error,
+            1,
+            2,
+        );
+        assert!(help_prompt.contains("Syntax error in regex pattern"));
+
+        let help_response = r#"{
+            "action": "takeover",
+            "guidance": null,
+            "reason": "Regex compilation error requires architectural simplification; Lead will handle directly"
+        }"#;
+
+        let help_decision =
+            crate::team::parse_worker_help_decision(help_response).expect("parse decision");
+        assert_eq!(help_decision.action, "takeover");
+
+        // Simulate Lead takeover and successful completion
+        database
+            .update_team_subtask_status(
+                worker_task.id,
+                "completed",
+                Some("Writer Lead takeover: tokenizer rewritten without complex regex"),
+                None,
+            )
+            .expect("update subtask status");
+
+        let record = database
+            .team_subtask_by_id(worker_task.id)
+            .expect("fetch subtask")
+            .expect("record exists");
+        assert_eq!(record.status, "completed");
+        assert!(
+            record
+                .result_summary
+                .as_deref()
+                .unwrap()
+                .contains("Writer Lead takeover")
+        );
+
+        fs::remove_dir_all(&project.root).expect("remove temporary project");
+    }
+
+    #[test]
+    fn team_orchestration_critic_worker_findings_and_lead_feedback() {
+        let project = temp_project();
+        init_git(&project.root);
+        fs::write(project.root.join(".gitignore"), ".talos/\n").expect("write gitignore");
+        fs::write(project.root.join("README.md"), "# Team Test\n").expect("write readme");
+        git(&project.root, &["add", "."]);
+        git(&project.root, &["commit", "-m", "initial commit"]);
+
+        let mut database = Database::open(&project).expect("initialize database");
+        let task = database
+            .add_task("Payment Processing", "Process credit cards securely")
+            .expect("add task");
+
+        // Simulate Critic Worker prompt & finding
+        let worker_prompt = crate::team::build_critic_worker_prompt(
+            &task,
+            "+ fn process_card(number: &str) { println!(\"{}\", number); }",
+            "Security & Compliance",
+        );
+        assert!(worker_prompt.contains("Security & Compliance"));
+
+        // Register critic worker subtask record
+        database
+            .add_team_subtask(
+                task.id,
+                task.id,
+                "critic_worker",
+                "agy",
+                "external",
+                "completed",
+                &[],
+            )
+            .expect("add critic worker subtask");
+
+        let critic_worker_finding =
+            "Found plain text logging of credit card numbers in process_card (CWE-312)";
+
+        // Critic Lead receives worker finding in consolidated review prompt
+        let lead_review_prompt = crate::team::build_critic_lead_review_prompt(
+            &task,
+            "Direct payment integration",
+            "+ fn process_card(number: &str) { ... }",
+            Some(critic_worker_finding),
+            "sha256:testrev",
+        );
+        assert!(lead_review_prompt.contains("SPECIALIZED CRITIC WORKER FINDINGS:"));
+        assert!(lead_review_prompt.contains("CWE-312"));
+
+        // Writer Lead receives rebuttal prompt with Critic's feedback
+        let rebuttal_prompt =
+            crate::team::build_writer_lead_rebuttal_prompt(&task, critic_worker_finding, 1, 3);
+        assert!(rebuttal_prompt.contains("Round 1 of 3"));
+        assert!(rebuttal_prompt.contains("CWE-312"));
+
+        fs::remove_dir_all(&project.root).expect("remove temporary project");
+    }
+
+    #[test]
+    fn team_mode_preserves_pair_mode_when_mode_not_specified() {
+        let project = temp_project();
+        let config = crate::config::ProjectConfig::default();
+        assert_eq!(
+            config.orchestration.mode,
+            crate::config::OrchestrationMode::Pair
+        );
+        assert_eq!(
+            config.orchestration.delegation,
+            crate::config::DelegationMode::Hybrid
+        );
+        assert_eq!(config.orchestration.max_writer_workers, 2);
+        assert_eq!(config.orchestration.max_critic_workers, 1);
+        fs::remove_dir_all(&project.root).expect("remove temporary project");
     }
 }

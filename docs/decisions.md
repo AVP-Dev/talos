@@ -351,3 +351,27 @@ No schema change for process identity is selected or implemented. The separate s
 - **Contract:** a profile owns executable/version discovery, fixed argument construction, structured output parsing, public session identity/resume behavior when available, timeout/cancellation, and role-specific permission probes. Config may select only built-in profile IDs; it must not accept arbitrary shell commands or unrestricted argument strings. Writer and Critic may use different CLIs. Store the selected profile ID and observed version with each Writer attempt and Critic review so later configuration changes cannot rewrite history.
 - **Enablement:** capability help is discovery evidence only. Enable Writer only after a disposable-project run proves the actual write boundary; enable Critic only after a separate process proves the actual read-only boundary. A missing credential, blocked probe, unsafe permission mode, or failed live run leaves that role disabled. Parser fixtures and unit tests do not satisfy live acceptance.
 - **Limits:** do not inspect private CLI session databases or credential stores. Do not use dangerous permission bypasses. If public session resume is unavailable or incompatible, report it and use a fresh bounded task context. Native subagents, Guild entities, F1 project history, and F2 controlled-language ideas remain separate scope. Linux-native checks continue to wait for the user's server. Git remains local on `master` until the user creates a remote.
+
+## ADR-044 — Hybrid Team Orchestration with Writer and Critic Teams
+
+- **Status:** implemented and verified in R11.
+- **Decision:** implement autonomous two-tier team orchestration where TALOS manages two distinct engineering teams:
+  1. **Writer Team:** Led by Writer Lead with full task implementation authority, technical planning, subtask decomposition, worker assignment, progress supervision, and stuck worker recovery. Supported by up to `max_writer_workers` (default 2) Writer Workers bounded by explicit project-relative `allowed_paths`.
+  2. **Critic Team:** Led by Critic Lead with strict read-only permissions, responsible for consolidated architecture review, evaluating worker findings, debating discrepancies with Writer Lead, and rendering the final authoritative verdict (`approve` or `request_changes`). Supported by up to `max_critic_workers` (default 1) specialized Critic Workers (e.g. security, algorithms, edge-cases).
+- **Orchestration Modes:**
+  - `pair` (default): Preserves the exact existing sequential Writer -> Critic -> Verify -> Complete workflow when `talos up --auto` is called without `--mode`.
+  - `team`: Activated via `talos up --auto --mode team` or `config.json` `"orchestration": { "mode": "team" }`.
+- **Delegation Invariants:**
+  - `detect_delegation` checks whether the target CLI provides safe, confirmed headless programmatic subagent execution.
+  - Because no supported CLI exposes safe headless native subagent delegation without interactive prompts or trust dialogs, `DelegationKind::Hybrid` deterministically falls back to `DelegationKind::External`, using managed isolated CLI processes with worktree or path bounds.
+- **Worker Assistance & Recovery:**
+  - When a Writer Worker experiences process failure, timeout, or missing deliverables, Writer Lead is invoked with the failure diagnostics.
+  - Writer Lead can choose: `RetryWithGuidance` (bounded by `max_help_attempts`, default 2), `Takeover` (Lead executes the subtask directly), or `BlockSubtask` (mark failed/blocked).
+- **Debate & Rebuttal Loop:**
+  - If Critic Lead issues `request_changes`, Writer Lead receives the critique, diff, and verification results to produce a structured rebuttal and implementation fix plan.
+  - Fix iterations are bounded by `max_review_rounds` (default 3) before marking the task blocked.
+- **Durable State:**
+  - SQLite schema v19 introduces the `team_subtasks` table with foreign key references to parent tasks, recording subtask status, path boundaries, worker role, assignment, and assistance attempts.
+  - Backward compatibility is maintained for schema versions 1 through 18.
+- **Verification:**
+  - 137 automated unit and integration tests passing; verification profile clean.

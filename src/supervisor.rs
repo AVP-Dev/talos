@@ -216,6 +216,180 @@ pub async fn continue_writer_attempt_with_options(
 }
 
 #[allow(clippy::too_many_arguments)]
+pub async fn run_agent_query(
+    project_root: &Path,
+    adapter: crate::config::AdapterKind,
+    executable: PathBuf,
+    model: Option<String>,
+    prompt: String,
+    read_only: bool,
+    timeout: Duration,
+) -> Result<String> {
+    match adapter {
+        crate::config::AdapterKind::Codex => {
+            let res = crate::adapter::codex::run_codex(
+                crate::adapter::codex::CodexRunConfig {
+                    executable,
+                    project_root: project_root.to_path_buf(),
+                    prompt,
+                    sandbox: if read_only {
+                        crate::adapter::codex::CodexSandboxMode::ReadOnly
+                    } else {
+                        crate::adapter::codex::CodexSandboxMode::WorkspaceWrite
+                    },
+                    model,
+                    session_id: None,
+                    timeout,
+                },
+                |_| Ok(()),
+            )
+            .await?;
+            if res.exit_code != Some(0) {
+                bail!(
+                    "Codex exited with code {:?}: {:?}",
+                    res.exit_code,
+                    res.error
+                );
+            }
+            Ok(res.response.unwrap_or_default())
+        }
+        crate::config::AdapterKind::Omp => {
+            let res = crate::adapter::omp::run_omp(crate::adapter::omp::OmpRunConfig {
+                executable,
+                project_root: project_root.to_path_buf(),
+                prompt,
+                role: if read_only {
+                    crate::adapter::omp::OmpRole::Critic
+                } else {
+                    crate::adapter::omp::OmpRole::Writer
+                },
+                model,
+                timeout,
+            })
+            .await?;
+            if res.exit_code != Some(0) {
+                bail!("OMP exited with code {:?}: {:?}", res.exit_code, res.error);
+            }
+            Ok(res.response.unwrap_or_default())
+        }
+        crate::config::AdapterKind::Pi => {
+            let res = crate::adapter::pi::run_pi(crate::adapter::pi::PiRunConfig {
+                executable,
+                project_root: project_root.to_path_buf(),
+                prompt,
+                role: if read_only {
+                    crate::adapter::pi::PiRole::Critic
+                } else {
+                    crate::adapter::pi::PiRole::Writer
+                },
+                model,
+                timeout,
+            })
+            .await?;
+            if res.exit_code != Some(0) {
+                bail!("Pi exited with code {:?}: {:?}", res.exit_code, res.error);
+            }
+            Ok(res.response.unwrap_or_default())
+        }
+        crate::config::AdapterKind::Kilo => {
+            let res = crate::adapter::kilo::run_kilo(crate::adapter::kilo::KiloRunConfig {
+                executable,
+                project_root: project_root.to_path_buf(),
+                prompt,
+                role: if read_only {
+                    crate::adapter::kilo::KiloRole::Critic
+                } else {
+                    crate::adapter::kilo::KiloRole::Writer
+                },
+                model,
+                timeout,
+            })
+            .await?;
+            if res.exit_code != Some(0) {
+                bail!("Kilo exited with code {:?}: {:?}", res.exit_code, res.error);
+            }
+            Ok(res.response.unwrap_or_default())
+        }
+        crate::config::AdapterKind::Claude => {
+            let res = crate::adapter::claude::run_claude(
+                crate::adapter::claude::ClaudeRunConfig {
+                    executable,
+                    project_root: project_root.to_path_buf(),
+                    prompt,
+                    role: if read_only {
+                        crate::adapter::claude::ClaudeRoleMode::Critic
+                    } else {
+                        crate::adapter::claude::ClaudeRoleMode::Writer
+                    },
+                    model,
+                    session_id: None,
+                    timeout,
+                },
+                |_| Ok(()),
+            )
+            .await?;
+            if res.exit_code != Some(0) {
+                bail!(
+                    "Claude exited with code {:?}: {:?}",
+                    res.exit_code,
+                    res.error
+                );
+            }
+            Ok(res.response.unwrap_or_default())
+        }
+        crate::config::AdapterKind::OpenCode => {
+            let res = crate::adapter::opencode::run_opencode(
+                crate::adapter::opencode::OpenCodeRunConfig {
+                    executable,
+                    project_root: project_root.to_path_buf(),
+                    prompt,
+                    role: if read_only {
+                        crate::adapter::opencode::OpenCodeRoleMode::Critic
+                    } else {
+                        crate::adapter::opencode::OpenCodeRoleMode::Writer
+                    },
+                    model,
+                    session_id: None,
+                    timeout,
+                },
+                |_| Ok(()),
+            )
+            .await?;
+            if res.exit_code != Some(0) {
+                bail!(
+                    "OpenCode exited with code {:?}: {:?}",
+                    res.exit_code,
+                    res.error
+                );
+            }
+            Ok(res.response.unwrap_or_default())
+        }
+        crate::config::AdapterKind::Agy => {
+            let project = Project::discover(project_root)?;
+            let mut settings = create_critic_session_settings(&project, 0, "agy_query")?;
+            let execution = crate::adapter::agy_process::run_read_only(
+                AgyRunConfig {
+                    executable,
+                    project_root: project.root.clone(),
+                    settings_file: settings.path.clone(),
+                    prompt,
+                    conversation_id: None,
+                    timeout,
+                },
+                |_| Ok(()),
+            )
+            .await;
+            settings.remove_after_resolution();
+            let res = execution.context("Antigravity process failed")?;
+            if res.exit_code != Some(0) {
+                bail!("Antigravity exited with code {:?}", res.exit_code);
+            }
+            Ok(res.response.unwrap_or_default())
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 pub async fn run_critic_review(
     project: &Project,
     database: &mut Database,
@@ -265,6 +439,18 @@ pub async fn run_critic_review(
             "{}\n\nChild-task scope: only these project-relative paths may change: {allowed_paths}. Treat every changed path outside this list as a blocker.",
             review_task.acceptance_criteria
         );
+    }
+    if let Ok(team_subtasks) = database.team_subtasks_for_parent(task_id) {
+        for st in team_subtasks {
+            if st.role == "critic_worker"
+                && let Some(summary) = &st.result_summary
+            {
+                review_task.acceptance_criteria = format!(
+                    "{}\n\nCRITIC WORKER AUDIT FINDINGS (independently detected issues that Critic Lead must inspect and evaluate for request_changes):\n{summary}",
+                    review_task.acceptance_criteria
+                );
+            }
+        }
     }
     let request = ReviewRequest::new(
         &review_task,

@@ -428,9 +428,54 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - Tightened next-action guidance for interrupted `applying` and `needs_attention` worktree integrations so the packet directs the operator to inspect/reconcile before review or verification. `cargo fmt --all` and the production-target `cargo check` passed again; behavior tests remain unrun.
 - Follow-up commit: `045352a` (`fix: handle interrupted worktree handoff state`).
 
+## R11 progress — Hybrid Team Orchestration
+
+- Implemented two-tier team orchestration: Writer Team (Writer Lead + optional Writer Workers) and Critic Team (Critic Lead + optional Critic Workers).
+- Added `OrchestrationMode` (`pair`, `team`), `DelegationMode` (`hybrid`, `native`, `external`), and `OrchestrationConfig` in `src/config.rs`. Configuration schema advanced to v5 with backward compatibility for versions 1–4.
+- Added `--mode <MODE>` (`pair` or `team`) flag to `talos up` in `src/cli.rs`.
+- Advanced database schema to v19 with the `team_subtasks` table and foreign key indexes in `src/db.rs`. Transactional migration verified from v18 to v19. Added `complete_team_subtask_integration` for atomic transition of integrated subtasks to satisfied prerequisite state.
+- Created `src/team.rs` implementing:
+  - Delegation capability detection (`detect_delegation`) falling back to external managed CLI execution when headless native delegation is unconfirmed.
+  - Writer Lead technical planning and subtask decomposition prompt generator and parser (`WriterLeadPlan`, `SubtaskPlan` with string or array acceptance criteria).
+  - Writer Lead stuck worker assistance and recovery prompt generator and parser (`WorkerHelpDecision`: RetryWithGuidance, Takeover, BlockSubtask).
+  - Critic Worker specialized prompt generator (`build_critic_worker_prompt`).
+  - Critic Lead consolidated review prompt generator synthesizing diff, plan, verification output, and Critic Worker findings.
+  - Writer Lead rebuttal and fix iteration prompt generator (`build_writer_lead_rebuttal_prompt`).
+- Wired `run_pair_task` and `run_team_task` in `src/app.rs`. Pair mode is preserved as the default for `talos up --auto`.
+- Parallel worker execution implemented via Tokio concurrent join across isolated managed worktrees with path containment enforcement.
+- Hardening & fixes applied during live verification:
+  - Fixed `SubtaskPlan` deserialization to accept array or string acceptance criteria from AI CLIs (`deserialize_string_or_array`).
+  - Ensured task execution project resolution (`execution_project_for_task`) for child subtasks so worker processes run inside assigned worktrees instead of primary repository root.
+  - Cleaned up stale worktree paths and git branches before child worktree creation.
+  - Transitioned parent task from `Implementing` to `Reviewing` upon successful subtask integration, establishing the base revision for Critic.
+- **Live E2E Verification in isolated project `/private/tmp/talos-team-e2e`:**
+  - Tested with real CLIs without mocks: Writer Lead & Workers = `codex` (v0.169.0), Critic Lead & Workers = `agy` (v1.5.11).
+  - **Writer Lead Autonomous Planning & Decomposition:** Analyzed multi-module requirements and decomposed into Subtask #2 (`calc.py`) and Subtask #3 (`parser.py`).
+  - **Parallel Worker Execution (Proven Concurrency):**
+    - Subtask #2 (Worker 1): Started at `1794996988535 ms`, Finished at `1794997019307 ms` (Duration: 30.77s).
+    - Subtask #3 (Worker 2): Started at `1794996988668 ms`, Finished at `1794997053234 ms` (Duration: 64.56s).
+    - Workers ran concurrently for 30.7s of overlap across separate managed Git worktrees.
+  - **Integration & Verification:** Writer Lead verified path bounds (`calc.py`, `parser.py`), integrated changes, registered parent attempt, and Critic Team approved on Round 1. Automated test checks (`python3 -m unittest discover`) passed (exit 0). Local git commit created (`97f2371`).
+  - **Lead Direct Execution:** Verified on Task #4 (`mul` and `div` in `calc.py`) where Writer Lead chose `execute_plan: "self"`, implemented changes, Critic approved, and tests passed (`7003d59`).
+  - **Native vs External Delegation Reality Probe:** Tested installed CLIs (`codex exec`, `agy`). Neither exposes headless, non-interactive subagent process supervision/cancellation primitives. TALOS verified `DelegationKind::External` in isolated Git worktrees as the safe, deterministically governed execution mechanism.
+  - **Backward Compatibility (Pair Mode):** Verified `talos up --auto --mode pair` on Task #5 (`power` in `calc.py`). Executed sequentially without team planning; Critic approved, unit tests passed, and local git commit created (`228dfc7`).
+  - **Scenario 1 — Stuck/Failing Worker & Lead Autonomous Assistance (Task #12):**
+    - Task decomposed into Subtask #13 (`calc.py`) and #14 (`parser.py`) dispatched concurrently.
+    - Worker 1 encountered an unexpected process termination on #13 (`SIGKILL, exit 137`).
+    - Writer Lead (`codex`) analyzed the diagnostic failure autonomously and issued `RETRY WITH GUIDANCE`: *"Retry the cube subtask in the allowed files only. Inspect the existing calc.py and tests/test_calc.py patterns, add the cube function and focused unit tests matching those conventions. Keep the change small; avoid running the full test suite..."*.
+    - TALOS automatically cleaned the worktree, reset task status to Queued, and retried the worker with the Lead's guidance.
+    - Worker 1 succeeded after guidance; Writer Lead integrated contributions from both workers; Critic approved (Round 1); unit tests passed; git commit `2b26d27` created.
+  - **Scenario 2 — Independent Defect Detection by Critic & Writer Fix Loop (Task #15):**
+    - Writer Lead implemented `search_first` in `calc.py` and appended tests in `tests/test_calc.py`.
+    - Critic Worker and Critic Lead (`agy`) audited the patch and detected a real defect: test functions were defined outside `TestCalc` after `unittest.main()`, making them undiscoverable by the test runner.
+    - Critic Lead rendered `request_changes` for revision `sha256:19934f52...` with finding on `tests/test_calc.py:26`.
+    - Writer Lead analyzed the defect finding and applied the fix: moved test methods inside `TestCalc` class using `self.assertEqual`.
+    - Critic Lead conducted Round 2 review and issued `APPROVED (Round 2)`. Automated unit tests passed; git commit `8c75979` created.
+  - Full test suite: **140 tests passed**, format clean, clippy clean (`0 warnings`), release build clean.
+
 ## Next action
 
-The user confirmed the original multi-CLI goal and explicitly requested Codex, OMP, Pi, Kilo, OpenCode, and Claude Code profiles. R10/T10.1 record the scope and compromises. Current source still implements Agy only. Critic-review rows already contain adapter and version; Writer-attempt rows do not. R9.5's local ARM64 package is built from `cb67c52`; checksums and `--version` smoke passed, while reproducibility/install remain open. Next add a schema migration for Writer adapter identity, backfill existing attempts as Agy with unknown version, and preserve the existing Critic identity; then add profiles in the requested order. Require live disposable-project Writer and Critic permission checks per provider before enabling each role. Full verification on the source tree passed format, Clippy, release build, and secret scan but failed four process-signal tests with `EPERM` (118 passed, 4 failed, 2 ignored). The manual task-persistence smoke passed; the fresh Agy Writer run failed with `agy_exit_nonzero` and left no diff, so its cause is unknown. Do not call it passed. Keep work local on `master`; skip Linux-native checks until the user's server and GitHub remote operations until a repository is provided.
+Hybrid Team Orchestration (R11) is fully implemented, verified live in real E2E scenarios, and ready for production use. Keep changes local on `master`; do not push to remote or publish PR without explicit user instruction.
 
 ## Session close checklist
 

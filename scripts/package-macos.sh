@@ -73,4 +73,9 @@ EOF
   shasum -a 256 talos README.md BUILD-INFO.txt >SHA256SUMS
 )
 
+TARBALL="dist/talos-v${VERSION}-${TARGET}.tar.gz"
+tar -czf "$TARBALL" -C "$ARTIFACT_DIR" talos README.md BUILD-INFO.txt SHA256SUMS
+TARBALL_SHA256="$(shasum -a 256 "$TARBALL" | awk '{ print $1 }')"
+
 printf 'Created %s\n' "$ARTIFACT_DIR"
+printf 'Created release archive: %s (SHA-256: %s)\n' "$TARBALL" "$TARBALL_SHA256"

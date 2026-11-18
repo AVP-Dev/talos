@@ -496,7 +496,10 @@ pub fn finalize(
     database.complete_task_worktree_integration(task_id, &integration_commit)
 }
 
-fn managed_identity(project_root: &Path, task_id: i64) -> Result<(PathBuf, PathBuf, String)> {
+pub(crate) fn managed_identity(
+    project_root: &Path,
+    task_id: i64,
+) -> Result<(PathBuf, PathBuf, String)> {
     if task_id <= 0 {
         bail!("Task ID must be positive");
     }
