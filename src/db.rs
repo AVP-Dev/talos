@@ -26,6 +26,7 @@ const MAX_CHILD_TASK_TIMEOUT_MS: i64 = 30 * 60 * 1_000;
 const MAX_TASK_LIST_PAGE_SIZE: usize = 100;
 const MAX_CHILD_LIST_PAGE_SIZE: usize = 10;
 const MAX_HISTORY_PAGE_SIZE: usize = 100;
+const MAX_VERIFICATION_HISTORY_PAGE_SIZE: usize = 10;
 const MAX_REOPENED_TASK_IDS_IN_EVENT: usize = 50;
 const MAX_WAITING_TASK_PREVIEW: usize = 25;
 const MAX_WAITING_PREREQUISITE_PREVIEW: usize = 10;
@@ -2717,7 +2718,13 @@ impl Database {
         before: Option<i64>,
         limit: usize,
     ) -> Result<VerificationEvidencePage> {
-        validate_history_page(before, limit)?;
+        if before.is_some_and(|id| id <= 0)
+            || !(1..=MAX_VERIFICATION_HISTORY_PAGE_SIZE).contains(&limit)
+        {
+            bail!(
+                "Verification history pages require a limit from 1 to {MAX_VERIFICATION_HISTORY_PAGE_SIZE} and a positive cursor when specified"
+            );
+        }
         if task_id <= 0 {
             bail!("Verification history requires a positive task ID");
         }

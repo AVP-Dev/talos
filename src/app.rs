@@ -521,7 +521,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 let page = database.verification_history_page(task_id, before, limit)?;
                 if cli.json {
-                    print_json(&page)?;
+                    print_json(&verification_evidence_json(&page)?)?;
                 } else if page.runs.is_empty() {
                     if before.is_some() {
                         println!("No older verification runs for task #{task_id}.");
@@ -3180,6 +3180,48 @@ fn truncate_changed_path(path: &str) -> (String, bool) {
         end -= 1;
     }
     (format!("{}…", &path[..end]), true)
+}
+
+fn verification_evidence_json(
+    page: &crate::db::VerificationEvidencePage,
+) -> Result<serde_json::Value> {
+    const MAX_PATH_PREVIEW: usize = 10;
+
+    let runs = page
+        .runs
+        .iter()
+        .map(|evidence| {
+            let paths: Vec<String> = serde_json::from_str(&evidence.changed_paths_json)
+                .context("Saved verification paths are not valid JSON")?;
+            let mut changed_paths_preview = Vec::with_capacity(MAX_PATH_PREVIEW);
+            let mut changed_path_values_truncated = false;
+            for path in paths.iter().take(MAX_PATH_PREVIEW) {
+                let (preview, truncated) = truncate_changed_path(path);
+                changed_paths_preview.push(preview);
+                changed_path_values_truncated |= truncated;
+            }
+            let changed_paths_truncated = paths.len() > changed_paths_preview.len();
+            Ok(json!({
+                "run": &evidence.run,
+                "base_revision": &evidence.base_revision,
+                "head_commit": &evidence.head_commit,
+                "patch_sha256": &evidence.patch_sha256,
+                "changed_path_count": paths.len(),
+                "changed_paths_preview": changed_paths_preview,
+                "changed_paths_truncated": changed_paths_truncated,
+                "changed_path_values_truncated": changed_path_values_truncated,
+                "checks": &evidence.checks,
+            }))
+        })
+        .collect::<Result<Vec<_>>>()?;
+
+    Ok(json!({
+        "runs": runs,
+        "before": page.before,
+        "limit": page.limit,
+        "has_more": page.has_more,
+        "next_before": page.next_before,
+    }))
 }
 
 fn recover_writer_attempts(json_output: bool, database: &mut Database) -> Result<()> {

@@ -266,8 +266,8 @@ pub enum TaskCommand {
     Evidence {
         /// ID of the task whose verification history will be shown.
         task_id: i64,
-        /// Maximum verification runs to print, from 1 through 100.
-        #[arg(long, default_value_t = 25)]
+        /// Maximum verification runs to print, from 1 through 10.
+        #[arg(long, default_value_t = 5)]
         limit: usize,
         /// Continue with older verification runs before this run ID.
         #[arg(long)]

@@ -48,7 +48,7 @@ talos resume
 
 `talos logs` and `talos logs --project` return the latest 25 events by default (maximum 100 per page). Use `--before <EVENT_ID>` to continue with older events; JSON includes `has_more` and `next_before`. Event history remains stored locally.
 
-`talos task evidence <ID>` returns the latest 25 verification runs (maximum 100 per page). Use `--before <RUN_ID>` to continue with older runs; JSON includes `has_more` and `next_before`.
+`talos task evidence <ID>` returns the latest 5 verification runs (maximum 10 per page). Use `--before <RUN_ID>` to continue with older runs; JSON includes `has_more` and `next_before`. JSON reports the path count and at most 10 path previews per run; full changed paths remain saved in local evidence for revision checks.
 
 `talos resume --reconcile` reopens all verification approvals affected by inspected manual changes. Its output and audit event show the full task count and at most 50 task IDs.
 
