@@ -543,7 +543,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                             redact_sensitive(&evidence.head_commit),
                             evidence.patch_sha256
                         );
-                        for check in evidence.checks {
+                        for check in &evidence.checks {
                             let argv = serde_json::to_string(&check.argv)?;
                             println!(
                                 "  Check {}: exit={}, duration={}, version exit={}, version duration={}, passed={}",
