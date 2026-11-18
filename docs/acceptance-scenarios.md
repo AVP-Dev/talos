@@ -1,5 +1,7 @@
 # TALOS Acceptance Evidence
 
+[TALOS](../README.md) · [Operator guide](operator-runbook.md) · [Architecture](architecture.md)
+
 This record distinguishes observed live runs, deterministic fixture runs and code-level tests. A result applies to the configuration and build described in that row.
 
 ## v0.1.1 cockpit acceptance

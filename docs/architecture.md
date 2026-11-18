@@ -1,5 +1,7 @@
 # TALOS Architecture
 
+[TALOS](../README.md) · [Operator guide](operator-runbook.md) · [Architecture decisions](decisions.md)
+
 TALOS is a local Rust orchestrator for installed AI coding CLIs. One executable owns project discovery, the cockpit and command-line interface, the task queue, process supervision, and review and verification gates. SQLite WAL is the durable state store. No separate TALOS server is required.
 
 ```text

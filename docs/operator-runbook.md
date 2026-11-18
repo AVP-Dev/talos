@@ -1,5 +1,7 @@
 # TALOS Operator Guide
 
+[TALOS](../README.md) · [Architecture](architecture.md) · [Acceptance evidence](acceptance-scenarios.md)
+
 ## Install and update
 
 ### Homebrew on macOS

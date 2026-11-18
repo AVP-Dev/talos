@@ -18,12 +18,13 @@ use crossterm::{
 use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
-    layout::{Alignment, Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap},
 };
 use std::os::unix::fs::OpenOptionsExt;
+use unicode_segmentation::UnicodeSegmentation;
 
 use crate::{
     adapter::AdapterId as AdapterKind,
@@ -793,7 +794,7 @@ impl TuiApp {
         self.run_notice = None;
         self.reconnect_notice = None;
         self.scroll_offset = 0;
-        self.active_tab = ActiveTab::Feed;
+        self.select_tab(ActiveTab::Feed);
         self.screen = Screen::Main;
         self.notice("New session. Describe your next task and press Enter to review.");
         Ok(())
@@ -1015,7 +1016,7 @@ impl TuiApp {
             "/new" | "/session" => self.new_session()?,
             "/history" => self.open_history(None)?,
             "/feed" | "/фид" | "/лента" | "/overview" | "/обзор" => {
-                self.active_tab = ActiveTab::Feed;
+                self.select_tab(ActiveTab::Feed);
             }
             "/cli" | "/кли" | "/adapter" | "/адаптер" => {
                 let tokens: Vec<&str> = arg.split_whitespace().collect();
@@ -1088,14 +1089,14 @@ impl TuiApp {
                 }
             }
             "/dialogue" | "/chat" | "/диалог" | "/чат" => {
-                self.active_tab = ActiveTab::Dialogue;
+                self.select_tab(ActiveTab::Dialogue);
             }
             "/diff" | "/дифф" => {
-                self.active_tab = ActiveTab::Diff;
+                self.select_tab(ActiveTab::Diff);
                 self.load_git_diff();
             }
             "/audit" | "/review" | "/аудит" | "/ревью" => {
-                self.active_tab = ActiveTab::Audit;
+                self.select_tab(ActiveTab::Audit);
             }
             "/stop" | "/стоп" => {
                 let mut database = Database::open(&self.project)?;
@@ -1605,7 +1606,7 @@ impl TuiApp {
             self.screen = match self.screen {
                 Screen::Main if !self.input.is_empty() => Screen::Main,
                 Screen::Main => {
-                    self.active_tab = ActiveTab::Feed;
+                    self.select_tab(ActiveTab::Feed);
                     Screen::Main
                 }
                 Screen::Settings if self.draft.is_some() => {
@@ -1676,7 +1677,7 @@ impl TuiApp {
             Screen::Review => match key.code {
                 KeyCode::Char('s' | 'S') if !repeat => self.open_settings(),
                 KeyCode::Char('d' | 'D') if !repeat => {
-                    self.active_tab = ActiveTab::Diff;
+                    self.select_tab(ActiveTab::Diff);
                     self.load_git_diff();
                     self.screen = Screen::Main;
                     self.notice("Review your changes. Press F5 to return to the task draft.");
@@ -1688,6 +1689,10 @@ impl TuiApp {
                 KeyCode::Char('u' | 'U') if !repeat => self.execute_slash_command("/resume")?,
                 KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
                 KeyCode::Down => self.detail_scroll = self.detail_scroll.saturating_add(1),
+                KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
+                KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(10),
+                KeyCode::Home => self.detail_scroll = 0,
+                KeyCode::End => self.detail_scroll = u16::MAX,
                 _ => {}
             },
             Screen::History => match key.code {
@@ -1708,6 +1713,8 @@ impl TuiApp {
                 KeyCode::Down => self.detail_scroll = self.detail_scroll.saturating_add(1),
                 KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
                 KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(10),
+                KeyCode::Home => self.detail_scroll = 0,
+                KeyCode::End => self.detail_scroll = u16::MAX,
                 _ => {}
             },
             Screen::Task => match key.code {
@@ -1720,14 +1727,8 @@ impl TuiApp {
                 KeyCode::Down => self.detail_scroll = self.detail_scroll.saturating_add(1),
                 KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
                 KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(10),
-                KeyCode::End => {
-                    self.detail_scroll = self
-                        .task_details
-                        .lines()
-                        .count()
-                        .saturating_sub(10)
-                        .min(u16::MAX as usize) as u16
-                }
+                KeyCode::Home => self.detail_scroll = 0,
+                KeyCode::End => self.detail_scroll = u16::MAX,
                 KeyCode::Char('s' | 'S')
                     if !repeat
                         && self
@@ -1766,7 +1767,7 @@ impl TuiApp {
                     }
                 }
                 KeyCode::Char('d' | 'D') if !repeat && !self.dirty_paths.is_empty() => {
-                    self.active_tab = ActiveTab::Diff;
+                    self.select_tab(ActiveTab::Diff);
                     self.load_git_diff();
                     self.screen = Screen::Main;
                     self.notice(
@@ -1793,6 +1794,11 @@ impl TuiApp {
             _ => {}
         }
         Ok(())
+    }
+
+    fn select_tab(&mut self, tab: ActiveTab) {
+        self.active_tab = tab;
+        self.scroll_offset = 0;
     }
 
     fn edit_input(&mut self, key: KeyEvent, repeat: bool) {
@@ -1832,7 +1838,7 @@ impl TuiApp {
             KeyCode::End if !main || !self.input.is_empty() => self.cursor = self.input.len(),
             KeyCode::F(5) if main && self.draft.is_some() => self.screen = Screen::Review,
             KeyCode::Tab if main && self.input.is_empty() && !repeat => {
-                self.active_tab = self.active_tab.next();
+                self.select_tab(self.active_tab.next());
                 if self.active_tab == ActiveTab::Diff {
                     self.load_git_diff();
                 }
@@ -1844,37 +1850,49 @@ impl TuiApp {
             KeyCode::Char(ch @ '1'..='4')
                 if main && self.input.is_empty() && !repeat && !alt && !ctrl =>
             {
-                self.active_tab = [
-                    ActiveTab::Feed,
-                    ActiveTab::Dialogue,
-                    ActiveTab::Diff,
-                    ActiveTab::Audit,
-                ][ch as usize - '1' as usize];
+                self.select_tab(
+                    [
+                        ActiveTab::Feed,
+                        ActiveTab::Dialogue,
+                        ActiveTab::Diff,
+                        ActiveTab::Audit,
+                    ][ch as usize - '1' as usize],
+                );
                 if self.active_tab == ActiveTab::Diff {
                     self.load_git_diff();
                 }
             }
             KeyCode::Up if main && alt && self.active_tab == ActiveTab::Diff => {
                 self.diff_file_index = self.diff_file_index.saturating_sub(1);
+                self.scroll_offset = 0;
                 self.load_git_diff();
             }
             KeyCode::Down if main && alt && self.active_tab == ActiveTab::Diff => {
                 self.diff_file_index =
                     (self.diff_file_index + 1).min(self.modified_files.len().saturating_sub(1));
+                self.scroll_offset = 0;
                 self.load_git_diff();
             }
-            KeyCode::Up if main => self.scroll_offset = self.scroll_offset.saturating_add(1),
-            KeyCode::Down if main => self.scroll_offset = self.scroll_offset.saturating_sub(1),
-            KeyCode::PageUp if main => self.scroll_offset = self.scroll_offset.saturating_add(5),
-            KeyCode::PageDown if main => self.scroll_offset = self.scroll_offset.saturating_sub(5),
-            KeyCode::Home if main => self.scroll_offset = usize::MAX,
-            KeyCode::End if main => self.scroll_offset = 0,
+            KeyCode::Up if main => self.scroll_tab(false, 1),
+            KeyCode::Down if main => self.scroll_tab(true, 1),
+            KeyCode::PageUp if main => self.scroll_tab(false, 5),
+            KeyCode::PageDown if main => self.scroll_tab(true, 5),
+            KeyCode::Home if main => self.scroll_tab(false, usize::MAX),
+            KeyCode::End if main => self.scroll_tab(true, usize::MAX),
             KeyCode::Char(ch) if !ctrl && !alt && !ch.is_control() && self.input.len() < 8_000 => {
                 self.input.insert(self.cursor, ch);
                 self.cursor += ch.len_utf8();
             }
             _ => {}
         }
+    }
+
+    fn scroll_tab(&mut self, forward: bool, rows: usize) {
+        self.scroll_offset = if forward == (self.active_tab != ActiveTab::Feed) {
+            self.scroll_offset.saturating_add(rows)
+        } else {
+            self.scroll_offset.saturating_sub(rows)
+        };
     }
 
     fn paste(&mut self, text: &str) {
@@ -1958,67 +1976,72 @@ async fn run_app_loop(
     Ok(())
 }
 
-fn ui(frame: &mut Frame, app: &TuiApp) {
+fn ui(frame: &mut Frame, app: &mut TuiApp) {
     let size = frame.area();
     if app.screen != Screen::Main {
         render_workflow(frame, app, size);
         return;
     }
 
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(3), // Header
-            Constraint::Length(
-                if !app.dirty_paths.is_empty() || app.reconnect_notice.is_some() {
-                    2
-                } else {
-                    0
-                },
-            ), // Alerts banner
-            Constraint::Length(3), // Tabs navigation bar
-            Constraint::Min(8),    // Active Tab View Content
-            Constraint::Length(4), // Input bar
-            Constraint::Length(if app.status_message.is_some() { 2 } else { 0 }),
-        ])
-        .split(size);
+    let header = Paragraph::new(header_line(app)).wrap(Wrap { trim: true });
+    let header_rows = measure_rows(&header, size.width.saturating_sub(2), 4) + 2;
+    let alerts = alert_paragraph(app);
+    let alert_rows = if !app.dirty_paths.is_empty() || app.reconnect_notice.is_some() {
+        measure_rows(&alerts, size.width, 6) + 1
+    } else {
+        0
+    };
+    let notice = app
+        .status_message
+        .as_ref()
+        .map(|(message, _)| Paragraph::new(safe_display(message)).wrap(Wrap { trim: true }));
+    let notice_rows = notice.as_ref().map_or(0, |paragraph| {
+        measure_rows(paragraph, size.width, (size.height / 4).max(2))
+    });
+    let input = InputView::new(app, size);
+    let chunks = Layout::vertical([
+        Constraint::Length(header_rows),
+        Constraint::Length(alert_rows),
+        Constraint::Length(3),
+        Constraint::Min(4),
+        Constraint::Length(input.height),
+        Constraint::Length(notice_rows),
+    ])
+    .split(size);
 
-    render_header(frame, app, chunks[0]);
-
-    if !app.dirty_paths.is_empty() || app.reconnect_notice.is_some() {
-        render_alerts(frame, app, chunks[1]);
+    frame.render_widget(
+        header.block(Block::bordered().border_style(Style::default().fg(Color::Cyan))),
+        chunks[0],
+    );
+    if alert_rows != 0 {
+        frame.render_widget(
+            alerts.block(
+                Block::default()
+                    .borders(Borders::BOTTOM)
+                    .border_style(Style::default().fg(Color::DarkGray)),
+            ),
+            chunks[1],
+        );
     }
-
     render_tabs(frame, app, chunks[2]);
-
     match app.active_tab {
         ActiveTab::Feed => render_feed_tab(frame, app, chunks[3]),
         ActiveTab::Dialogue => render_dialogue_tab(frame, app, chunks[3]),
         ActiveTab::Diff => render_diff_tab(frame, app, chunks[3]),
         ActiveTab::Audit => render_audit_tab(frame, app, chunks[3]),
     }
-
-    render_input(frame, app, chunks[4]);
-    if let Some((message, _)) = &app.status_message {
-        frame.render_widget(
-            Paragraph::new(safe_display(message)).wrap(Wrap { trim: true }),
-            chunks[5],
-        );
+    input.render(frame, chunks[4]);
+    if let Some(notice) = notice {
+        frame.render_widget(notice, chunks[5]);
     }
 }
 
-fn render_workflow(frame: &mut Frame, app: &TuiApp, area: Rect) {
+fn render_workflow(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     let editing = matches!(
         app.screen,
         Screen::ChooseProject | Screen::WriterModel | Screen::CriticModel | Screen::Task
     );
-    let chunks = Layout::vertical([
-        Constraint::Length(3),
-        Constraint::Min(4),
-        Constraint::Length(if editing { 4 } else { 0 }),
-        Constraint::Length(4),
-    ])
-    .split(area);
+    let input = editing.then(|| InputView::new(app, area));
     let (title, body, actions) = match app.screen {
         Screen::ChooseProject => (
             "Choose project",
@@ -2093,9 +2116,7 @@ fn render_workflow(frame: &mut Frame, app: &TuiApp, area: Rect) {
             let body = if app.history.is_empty() {
                 "No tasks on this page. Press F4 to start a new task or Page Up for the latest tasks.".to_owned()
             } else {
-                let visible = usize::from(chunks[1].height).saturating_sub(2).max(1);
-                let start = app.selection.saturating_add(1).saturating_sub(visible);
-                app.history.iter().enumerate().skip(start).take(visible).map(|(index, entry)| {
+                app.history.iter().enumerate().map(|(index, entry)| {
                     let task = &entry.task;
                     let title = task.title.lines().next().unwrap_or_default();
                     let status = if entry.cancelled { "cancelled" } else { task.status.as_str() };
@@ -2142,32 +2163,59 @@ fn render_workflow(frame: &mut Frame, app: &TuiApp, area: Rect) {
         Screen::Main => unreachable!(),
     };
     let project = app.project.root.display();
-    frame.render_widget(
-        Paragraph::new(format!("{title} · {project}")).block(Block::bordered()),
-        chunks[0],
-    );
-    let body = safe_display(&body);
-    let body = Paragraph::new(body)
-        .wrap(Wrap { trim: false })
-        .block(Block::bordered());
-    let body = if matches!(app.screen, Screen::Task | Screen::Review | Screen::Changes) {
-        body.scroll((app.detail_scroll, 0))
-    } else {
-        body
-    };
-    frame.render_widget(body, chunks[1]);
-    if editing {
-        render_input(frame, app, chunks[2]);
-    }
+    let title =
+        Paragraph::new(safe_display(&format!("{title} · {project}"))).wrap(Wrap { trim: true });
+    let title_rows = measure_rows(&title, area.width.saturating_sub(2), 4) + 2;
     let message = app
         .status_message
         .as_ref()
-        .map(|(message, _)| message.as_str())
-        .unwrap_or("");
-    frame.render_widget(
-        Paragraph::new(format!("{actions}\n{message}")).wrap(Wrap { trim: true }),
-        chunks[3],
-    );
+        .map_or("", |(message, _)| message.as_str());
+    let footer = if message.is_empty() {
+        actions
+    } else {
+        format!("{actions}\n{message}")
+    };
+    let footer = Paragraph::new(safe_display(&footer)).wrap(Wrap { trim: true });
+    let footer_rows = measure_rows(&footer, area.width, (area.height / 3).max(2));
+    let chunks = Layout::vertical([
+        Constraint::Length(title_rows),
+        Constraint::Min(4),
+        Constraint::Length(input.as_ref().map_or(0, |input| input.height)),
+        Constraint::Length(footer_rows),
+    ])
+    .split(area);
+
+    frame.render_widget(title.block(Block::bordered()), chunks[0]);
+    let body = safe_display(&body);
+    let block = Block::bordered();
+    let inner = block.inner(chunks[1]);
+    let paragraph = Paragraph::new(body.as_str()).wrap(Wrap { trim: false });
+    let max_scroll = wrapped_scroll_limit(&paragraph, inner).min(u16::MAX as usize) as u16;
+    let scroll = match app.screen {
+        Screen::Task | Screen::Review | Screen::Changes => {
+            app.detail_scroll = app.detail_scroll.min(max_scroll);
+            app.detail_scroll
+        }
+        Screen::Settings | Screen::History => {
+            let lines = body
+                .lines()
+                .take(app.selection.saturating_add(1))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let selected_end = Paragraph::new(lines)
+                .wrap(Wrap { trim: false })
+                .line_count(inner.width);
+            selected_end
+                .saturating_sub(usize::from(inner.height))
+                .min(usize::from(max_scroll)) as u16
+        }
+        _ => 0,
+    };
+    frame.render_widget(paragraph.block(block).scroll((scroll, 0)), chunks[1]);
+    if let Some(input) = input {
+        input.render(frame, chunks[2]);
+    }
+    frame.render_widget(footer, chunks[3]);
 }
 
 fn adapter_label(adapter: AdapterKind, available: &[AdapterKind]) -> String {
@@ -2188,7 +2236,7 @@ fn safe_display(text: &str) -> String {
         .collect()
 }
 
-fn render_header(frame: &mut Frame, app: &TuiApp, area: Rect) {
+fn header_line(app: &TuiApp) -> Line<'static> {
     let mode_str = match app.config.orchestration.mode {
         OrchestrationMode::Pair => "PAIR",
         OrchestrationMode::Team => "TEAM",
@@ -2235,7 +2283,7 @@ fn render_header(frame: &mut Frame, app: &TuiApp, area: Rect) {
         .map(|n| n.to_string_lossy())
         .unwrap_or_default();
 
-    let header_text = vec![Line::from(vec![
+    Line::from(vec![
         Span::styled(
             "TALOS",
             Style::default()
@@ -2266,20 +2314,10 @@ fn render_header(frame: &mut Frame, app: &TuiApp, area: Rect) {
         ),
         status_span,
         tmux_span,
-    ])];
-
-    let header_block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(Color::Cyan));
-
-    let paragraph = Paragraph::new(header_text)
-        .block(header_block)
-        .alignment(Alignment::Left);
-
-    frame.render_widget(paragraph, area);
+    ])
 }
 
-fn render_alerts(frame: &mut Frame, app: &TuiApp, area: Rect) {
+fn alert_paragraph(app: &TuiApp) -> Paragraph<'static> {
     let mut alert_spans = Vec::new();
 
     if let Some(ref notice) = app.reconnect_notice {
@@ -2303,21 +2341,22 @@ fn render_alerts(frame: &mut Frame, app: &TuiApp, area: Rect) {
         ));
     }
 
-    let alert_p = Paragraph::new(Line::from(alert_spans)).block(
-        Block::default()
-            .borders(Borders::BOTTOM)
-            .border_style(Style::default().fg(Color::DarkGray)),
-    );
-    frame.render_widget(alert_p, area);
+    Paragraph::new(Line::from(alert_spans)).wrap(Wrap { trim: true })
 }
 
 fn render_tabs(frame: &mut Frame, app: &TuiApp, area: Rect) {
-    let titles = vec![
-        ActiveTab::Feed.title(),
-        ActiveTab::Dialogue.title(),
-        ActiveTab::Diff.title(),
-        ActiveTab::Audit.title(),
-    ];
+    let titles = if area.width < 42 {
+        ["1 Feed", "2 Rev", "3 Diff", "4 Test"]
+    } else if area.width < 81 {
+        ["1 Feed", "2 Review", "3 Diff", "4 Checks"]
+    } else {
+        [
+            ActiveTab::Feed.title(),
+            ActiveTab::Dialogue.title(),
+            ActiveTab::Diff.title(),
+            ActiveTab::Audit.title(),
+        ]
+    };
 
     let tabs = Tabs::new(titles)
         .select(app.active_tab as usize)
@@ -2336,7 +2375,7 @@ fn render_tabs(frame: &mut Frame, app: &TuiApp, area: Rect) {
     frame.render_widget(tabs, area);
 }
 
-fn render_feed_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
+fn render_feed_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     if area.width >= 100 {
         // Horizontal split: Left Cockpit Sidebar (34 cols), Right Unified Feed
         let chunks = Layout::default()
@@ -2346,6 +2385,8 @@ fn render_feed_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
 
         render_cockpit_sidebar(frame, app, chunks[0]);
         render_unified_feed(frame, app, chunks[1]);
+    } else if area.height < 12 {
+        render_unified_feed(frame, app, area);
     } else {
         // Narrow vertical split: Top Compact Cockpit (7 rows), Bottom Unified Feed
         let chunks = Layout::default()
@@ -2450,12 +2491,6 @@ fn render_cockpit_sidebar(frame: &mut Frame, app: &TuiApp, area: Rect) {
             TaskStatus::Blocked | TaskStatus::Failed => (Color::Red, "✖"),
         };
 
-        let title_clean = if task.title.len() > 30 {
-            format!("{}...", &task.title[..task.title.floor_char_boundary(27)])
-        } else {
-            task.title.clone()
-        };
-
         vec![
             Line::from(vec![
                 Span::styled(
@@ -2471,7 +2506,10 @@ fn render_cockpit_sidebar(frame: &mut Frame, app: &TuiApp, area: Rect) {
                         .add_modifier(Modifier::BOLD),
                 ),
             ]),
-            Line::from(Span::styled(title_clean, Style::default().fg(Color::White))),
+            Line::from(Span::styled(
+                safe_display(&task.title).replace('\n', " "),
+                Style::default().fg(Color::White),
+            )),
             Line::from(vec![
                 Span::styled("Worktrees: ", Style::default().fg(Color::DarkGray)),
                 Span::styled(
@@ -2511,7 +2549,12 @@ fn render_cockpit_sidebar(frame: &mut Frame, app: &TuiApp, area: Rect) {
             Color::DarkGray
         }));
 
-    frame.render_widget(Paragraph::new(task_lines).block(task_block), chunks[1]);
+    frame.render_widget(
+        Paragraph::new(task_lines)
+            .wrap(Wrap { trim: true })
+            .block(task_block),
+        chunks[1],
+    );
 
     // 3. Queue & Repository State Block
     let git_status_line = if app.dirty_paths.is_empty() {
@@ -2644,7 +2687,10 @@ fn render_cockpit_compact(frame: &mut Frame, app: &TuiApp, area: Rect) {
         .title(" 🎛 Cockpit Summary ")
         .border_style(Style::default().fg(Color::DarkGray));
 
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    frame.render_widget(
+        Paragraph::new(lines).wrap(Wrap { trim: true }).block(block),
+        area,
+    );
 }
 
 fn build_unified_feed_lines(app: &TuiApp) -> Vec<Line<'static>> {
@@ -2669,15 +2715,7 @@ fn build_unified_feed_lines(app: &TuiApp) -> Vec<Line<'static>> {
             format!("{:02}:{:02}:{:02}", h, m, s)
         };
 
-        let reason_clean = if event.reason.len() > 72 {
-            format!(
-                "{}...",
-                &event.reason[..event.reason.floor_char_boundary(69)]
-            )
-        } else {
-            event.reason.clone()
-        };
-
+        let reason_clean = safe_display(&event.reason).replace('\n', " ");
         feed.push(Line::from(vec![
             Span::styled(format!("{time_str} "), Style::default().fg(Color::DarkGray)),
             Span::styled(
@@ -2805,46 +2843,34 @@ fn build_unified_feed_lines(app: &TuiApp) -> Vec<Line<'static>> {
     feed
 }
 
-fn render_unified_feed(frame: &mut Frame, app: &TuiApp, area: Rect) {
-    let feed_lines = build_unified_feed_lines(app);
-    let total_lines = feed_lines.len();
-
-    let inner_height = area.height.saturating_sub(2) as usize;
-
-    let (visible_lines, title) = if total_lines <= inner_height {
-        (
-            feed_lines,
-            " ⚡ Live Unified Feed (Auto-scroll active) ".to_string(),
-        )
+fn render_unified_feed(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
+    let feed = Paragraph::new(build_unified_feed_lines(app)).wrap(Wrap { trim: true });
+    let block = Block::bordered().border_style(Style::default().fg(Color::Cyan));
+    let max_scroll = wrapped_scroll_limit(&feed, block.inner(area)).min(u16::MAX as usize);
+    app.scroll_offset = app.scroll_offset.min(max_scroll);
+    let start = (max_scroll - app.scroll_offset) as u16;
+    let title = if app.scroll_offset > 0 {
+        " Live Unified Feed · End to follow "
     } else {
-        let max_scroll = total_lines.saturating_sub(inner_height);
-        let actual_scroll = app.scroll_offset.min(max_scroll);
-
-        let end_idx = total_lines.saturating_sub(actual_scroll);
-        let start_idx = end_idx.saturating_sub(inner_height);
-
-        let title = if actual_scroll > 0 {
-            format!(
-                " ⚡ Live Unified Feed (Viewing earlier lines: -{} | Press 'End' to resume live stream) ",
-                actual_scroll
-            )
-        } else {
-            " ⚡ Live Unified Feed (Live stream • Auto-scroll) ".to_string()
-        };
-
-        (feed_lines[start_idx..end_idx].to_vec(), title)
+        " ⚡ Live Unified Feed (Auto-scroll active) "
     };
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(Style::default().fg(Color::Cyan));
-
-    let paragraph = Paragraph::new(visible_lines).block(block);
-    frame.render_widget(paragraph, area);
+    frame.render_widget(feed.block(block.title(title)).scroll((start, 0)), area);
 }
 
-fn render_dialogue_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
+fn render_reader(
+    frame: &mut Frame,
+    paragraph: Paragraph<'_>,
+    block: Block<'_>,
+    area: Rect,
+    offset: &mut usize,
+) {
+    let paragraph = paragraph.wrap(Wrap { trim: false });
+    let maximum = wrapped_scroll_limit(&paragraph, block.inner(area)).min(u16::MAX as usize);
+    *offset = (*offset).min(maximum);
+    frame.render_widget(paragraph.block(block).scroll((*offset as u16, 0)), area);
+}
+
+fn render_dialogue_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     let mut lines = Vec::new();
 
     lines.push(Line::from(vec![Span::styled(
@@ -2913,10 +2939,16 @@ fn render_dialogue_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
         .title(" 💬 Peer Review & Decision Log ")
         .border_style(Style::default().fg(Color::Magenta));
 
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    render_reader(
+        frame,
+        Paragraph::new(lines),
+        block,
+        area,
+        &mut app.scroll_offset,
+    );
 }
 
-fn render_diff_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
+fn render_diff_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     if !app.modified_files.is_empty() {
         let files_height = (app.modified_files.len() as u16 + 2).min(7);
         let chunks = Layout::default()
@@ -2961,14 +2993,14 @@ fn render_diff_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
     }
 }
 
-fn render_diff_view(frame: &mut Frame, app: &TuiApp, area: Rect) {
+fn render_diff_view(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     let mut items = Vec::new();
 
     if app.diff_lines.is_empty() {
-        items.push(ListItem::new(Line::from(Span::styled(
+        items.push(Line::from(Span::styled(
             "No uncommitted code changes in current working tree or active worktree.",
             Style::default().fg(Color::DarkGray),
-        ))));
+        )));
     } else {
         for line in &app.diff_lines {
             let style = if line.starts_with('+') && !line.starts_with("+++") {
@@ -2985,7 +3017,7 @@ fn render_diff_view(frame: &mut Frame, app: &TuiApp, area: Rect) {
                 Style::default().fg(Color::White)
             };
 
-            items.push(ListItem::new(Line::from(Span::styled(line.clone(), style))));
+            items.push(Line::from(Span::styled(line.clone(), style)));
         }
     }
 
@@ -3006,10 +3038,16 @@ fn render_diff_view(frame: &mut Frame, app: &TuiApp, area: Rect) {
         .title(title)
         .border_style(Style::default().fg(Color::Green));
 
-    frame.render_widget(List::new(items).block(block), area);
+    render_reader(
+        frame,
+        Paragraph::new(items),
+        block,
+        area,
+        &mut app.scroll_offset,
+    );
 }
 
-fn render_audit_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
+fn render_audit_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     let mut lines = Vec::new();
 
     lines.push(Line::from(Span::styled(
@@ -3025,7 +3063,7 @@ fn render_audit_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
             "No automated verification checks configured for this project.",
             Style::default().fg(Color::DarkGray),
         )));
-        lines.push(Line::from(Span::styled("In a shell, configure checks with talos config set checks '[{\"id\":\"test\",\"argv\":[\"cargo\",\"test\"]}]'", Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled("In a shell, configure checks with talos config set checks '[{\"id\":\"test\",\"argv\":[\"cargo\",\"test\"],\"version_argv\":[\"cargo\",\"--version\"],\"working_directory\":\".\"}]'", Style::default().fg(Color::DarkGray))));
     } else {
         for (i, check) in app.verification_checks.iter().enumerate() {
             lines.push(Line::from(vec![
@@ -3050,55 +3088,170 @@ fn render_audit_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
         .title(" 🧪 Verification Suite & Test Gate ")
         .border_style(Style::default().fg(Color::Cyan));
 
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    render_reader(
+        frame,
+        Paragraph::new(lines),
+        block,
+        area,
+        &mut app.scroll_offset,
+    );
 }
 
-fn render_input(frame: &mut Frame, app: &TuiApp, area: Rect) {
-    let title = match app.screen {
-        Screen::ChooseProject => " Project folder ",
-        Screen::Task => " /new New session · /config Settings · /history History ",
-        Screen::WriterModel | Screen::CriticModel => " Model name ",
-        _ if !app.available.contains(&app.config.writer)
-            || !app.available.contains(&app.config.critic) =>
-        {
-            " /config Set up agents · F2 Settings · F3 History "
-        }
-        _ => {
-            " Describe task · Enter Review · /config Settings · /new New session · F3 History · Esc Clear "
-        }
-    };
-    let before = &app.input[..app.cursor];
-    let after = &app.input[app.cursor..];
-    let mut lines: Vec<Line<'_>> = before.split('\n').map(Line::raw).collect();
-    let cursor_line = lines.last_mut().expect("split always has a line");
-    let mut suffix = after.split('\n');
-    let tail = suffix.next().unwrap_or_default();
-    let next = tail.chars().next().map_or(0, char::len_utf8);
-    let cursor_style = Style::default()
-        .fg(Color::Cyan)
-        .add_modifier(Modifier::REVERSED);
-    cursor_line.spans.push(Span::styled(
-        if next == 0 { " " } else { &tail[..next] },
-        cursor_style,
-    ));
-    cursor_line.spans.push(Span::raw(&tail[next..]));
-    let row = lines.len() - 1;
-    lines.extend(suffix.map(Line::raw));
-    let row_offset = row.saturating_sub(1);
-    let column = Line::raw(before.rsplit('\n').next().unwrap_or_default()).width();
-    let horizontal = column
-        .saturating_add(1)
-        .saturating_sub(area.width.saturating_sub(2) as usize);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .scroll((row_offset as u16, horizontal as u16))
-            .block(
-                Block::bordered()
-                    .title(title)
-                    .border_style(Style::default().fg(Color::Cyan)),
+struct InputView {
+    lines: Vec<Line<'static>>,
+    cursor: (usize, usize),
+    height: u16,
+    title: &'static str,
+    hint: Option<Paragraph<'static>>,
+    hint_rows: u16,
+}
+
+impl InputView {
+    fn new(app: &TuiApp, area: Rect) -> Self {
+        let (short_title, controls) = match app.screen {
+            Screen::ChooseProject => (" Project folder ", ""),
+            Screen::WriterModel | Screen::CriticModel => (" Model name ", ""),
+            Screen::Task => (
+                " Command ",
+                " /new New session · /config Settings · /history History ",
             ),
-        area,
-    );
+            _ if !app.available.contains(&app.config.writer)
+                || !app.available.contains(&app.config.critic) =>
+            {
+                (
+                    " Describe task ",
+                    " /config Set up agents · F2 Settings · F3 History ",
+                )
+            }
+            _ => (
+                " Describe task ",
+                " Describe task · Enter Review · /config Settings · /new New session · F3 History · Esc Clear ",
+            ),
+        };
+        let width = area.width.saturating_sub(2).max(1);
+        let (title, hint) = if controls.is_empty() {
+            (short_title, None)
+        } else if Line::raw(controls).width() <= usize::from(width) {
+            (controls, None)
+        } else {
+            (
+                short_title,
+                Some(Paragraph::new(controls.trim()).wrap(Wrap { trim: true })),
+            )
+        };
+        let hint_rows = hint.as_ref().map_or(0, |hint| measure_rows(hint, width, 4));
+        let (lines, cursor) = wrap_input(&app.input, app.cursor, usize::from(width));
+        let visible = lines
+            .len()
+            .max(2)
+            .min(usize::from((area.height / 4).max(2))) as u16;
+        Self {
+            lines,
+            cursor,
+            height: visible + hint_rows + 2,
+            title,
+            hint,
+            hint_rows,
+        }
+    }
+
+    fn render(self, frame: &mut Frame, area: Rect) {
+        let block = Block::bordered()
+            .title(self.title)
+            .border_style(Style::default().fg(Color::Cyan));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if inner.is_empty() {
+            return;
+        }
+        let hint_rows = self.hint_rows.min(inner.height.saturating_sub(1));
+        let input = Rect {
+            height: inner.height - hint_rows,
+            ..inner
+        };
+        let (row, column) = self.cursor;
+        let start = row
+            .saturating_add(1)
+            .saturating_sub(usize::from(input.height));
+        frame.render_widget(Paragraph::new(self.lines).scroll((start as u16, 0)), input);
+        frame.set_cursor_position((
+            input.x + column.min(usize::from(input.width - 1)) as u16,
+            input.y + (row - start) as u16,
+        ));
+        if let Some(hint) = self.hint {
+            frame.render_widget(
+                hint.style(Style::default().fg(Color::Gray)),
+                Rect {
+                    y: input.bottom(),
+                    height: hint_rows,
+                    ..inner
+                },
+            );
+        }
+    }
+}
+
+fn wrap_input(input: &str, cursor: usize, width: usize) -> (Vec<Line<'static>>, (usize, usize)) {
+    let mut lines = Vec::new();
+    let mut line = String::new();
+    let mut column = 0;
+    let mut position = (0, 0);
+    let mut at_word_start = true;
+    for (offset, grapheme) in input.grapheme_indices(true) {
+        let whitespace = grapheme.chars().all(char::is_whitespace);
+        let symbol = if grapheme == "\t" {
+            &"    "[..width.min(4)]
+        } else {
+            grapheme
+        };
+        let cells = Span::raw(symbol).width();
+        let word = if at_word_start && !whitespace {
+            Span::raw(
+                input[offset..]
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(grapheme),
+            )
+            .width()
+        } else {
+            0
+        };
+        at_word_start = whitespace;
+        let fits_on_next_line = word <= width && column + word > width;
+        if grapheme != "\n" && column > 0 && (column + cells > width || fits_on_next_line) {
+            lines.push(Line::raw(std::mem::take(&mut line)));
+            column = 0;
+        }
+        if (offset..offset + grapheme.len()).contains(&cursor) {
+            position = (lines.len(), column);
+        }
+        if grapheme == "\n" {
+            lines.push(Line::raw(std::mem::take(&mut line)));
+            column = 0;
+        } else {
+            line.push_str(symbol);
+            column += cells;
+        }
+    }
+    if cursor == input.len() {
+        if column >= width {
+            lines.push(Line::raw(std::mem::take(&mut line)));
+            column = 0;
+        }
+        position = (lines.len(), column);
+    }
+    lines.push(Line::raw(line));
+    (lines, position)
+}
+
+fn measure_rows(paragraph: &Paragraph<'_>, width: u16, limit: u16) -> u16 {
+    paragraph.line_count(width).min(usize::from(limit)) as u16
+}
+
+fn wrapped_scroll_limit(paragraph: &Paragraph<'_>, inner: Rect) -> usize {
+    paragraph
+        .line_count(inner.width)
+        .saturating_sub(usize::from(inner.height))
 }
 
 fn longest_common_prefix(strings: &[String]) -> String {
@@ -3190,7 +3343,7 @@ mod tests {
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(90, 25)).expect("terminal");
         terminal
-            .draw(|frame| ui(frame, &app))
+            .draw(|frame| ui(frame, &mut app))
             .expect("render Cyrillic draft");
 
         std::fs::write(project.root.join("local-edit.txt"), "user change").expect("dirty project");
@@ -3242,6 +3395,126 @@ mod tests {
             .expect("clear line");
         assert!(app.input.is_empty());
         std::fs::remove_dir_all(&project.root).expect("remove test project");
+    }
+
+    fn buffer_text(buffer: &ratatui::buffer::Buffer) -> String {
+        buffer
+            .content()
+            .chunks(usize::from(buffer.area.width))
+            .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn narrow_cockpit_shows_wrapped_input_and_keeps_controls_visible() {
+        let project = test_tui_project();
+        let mut app = TuiApp::with_adapters(
+            project.clone(),
+            vec![AdapterKind::Codex, AdapterKind::Claude],
+        )
+        .expect("open cockpit");
+        app.config.writer = AdapterKind::Codex;
+        app.config.critic = AdapterKind::Claude;
+        app.screen = Screen::Main;
+        app.paste(&format!("{}\nФИНАЛ", "Длинный русский текст ".repeat(9)));
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(48, 24)).expect("terminal");
+        terminal
+            .draw(|frame| ui(frame, &mut app))
+            .expect("draw cockpit");
+        let buffer = buffer_text(terminal.backend().buffer());
+        assert!(buffer.contains("ФИНАЛ"), "{buffer}");
+        assert!(
+            buffer.contains("Esc") && buffer.contains("Clear"),
+            "{buffer}"
+        );
+        app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))
+            .expect("move to beginning");
+        terminal
+            .draw(|frame| ui(frame, &mut app))
+            .expect("draw beginning");
+        assert!(buffer_text(terminal.backend().buffer()).contains("Длинный русский текст"));
+        std::fs::remove_dir_all(&project.root).expect("remove test project");
+    }
+
+    #[test]
+    fn live_feed_wraps_to_its_pane_and_follows_the_last_wrapped_row() {
+        let project = test_tui_project();
+        let mut app = TuiApp::with_adapters(project.clone(), Vec::new()).expect("open cockpit");
+        app.screen = Screen::Main;
+        app.supervisor_logs = vec![format!(
+            "FIRST-MARKER {} LAST-MARKER",
+            "The Live Feed entry wraps inside its own panel. ".repeat(30)
+        )];
+        for width in [70, 108] {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, 26)).expect("terminal");
+            terminal
+                .draw(|frame| ui(frame, &mut app))
+                .expect("draw live feed");
+            assert!(buffer_text(terminal.backend().buffer()).contains("LAST-MARKER"));
+            app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))
+                .expect("go to beginning");
+            terminal
+                .draw(|frame| ui(frame, &mut app))
+                .expect("draw feed beginning");
+            assert!(buffer_text(terminal.backend().buffer()).contains("FIRST-MARKER"));
+            app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+                .expect("follow live feed");
+            terminal
+                .draw(|frame| ui(frame, &mut app))
+                .expect("draw feed end");
+            assert!(buffer_text(terminal.backend().buffer()).contains("LAST-MARKER"));
+        }
+        std::fs::remove_dir_all(&project.root).expect("remove test project");
+    }
+
+    #[test]
+    fn wrapped_draft_and_diff_scroll_to_the_end_and_back() {
+        let project = test_tui_project();
+        let mut app = TuiApp::with_adapters(project.clone(), Vec::new()).expect("open cockpit");
+        let content = format!("{} КОНЕЦ", "Длинный текст для проверки ".repeat(48));
+        app.prepare_draft("Check wrap".into(), content.clone());
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(48, 24)).expect("terminal");
+        for (screen, tab) in [
+            (Screen::Review, ActiveTab::Feed),
+            (Screen::Main, ActiveTab::Diff),
+        ] {
+            app.screen = screen;
+            app.select_tab(tab);
+            app.diff_lines = vec![content.clone()];
+            app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
+                .expect("scroll to end");
+            terminal
+                .draw(|frame| ui(frame, &mut app))
+                .expect("draw end");
+            let buffer = buffer_text(terminal.backend().buffer());
+            assert!(buffer.contains("КОНЕЦ"), "{screen:?}\n{buffer}");
+            if screen == Screen::Review {
+                assert!(app.detail_scroll < u16::MAX);
+            } else {
+                assert!(app.scroll_offset < usize::MAX);
+            }
+            app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))
+                .expect("scroll to start");
+            terminal
+                .draw(|frame| ui(frame, &mut app))
+                .expect("draw start");
+            assert!(!buffer_text(terminal.backend().buffer()).contains("КОНЕЦ"));
+        }
+        std::fs::remove_dir_all(&project.root).expect("remove test project");
+    }
+
+    #[test]
+    fn input_wraps_on_terminal_cells_and_keeps_graphemes_intact() {
+        let input = "Ж界e\u{301}\nкрай";
+        let (lines, cursor) = wrap_input(input, "Ж界".len(), 3);
+        let text: Vec<_> = lines.iter().map(ToString::to_string).collect();
+        assert_eq!(text, ["Ж界", "e\u{301}", "кра", "й"]);
+        assert_eq!(cursor, (1, 0));
+        assert_eq!(wrap_input("abc", 3, 3).1, (1, 0));
     }
 
     #[test]
