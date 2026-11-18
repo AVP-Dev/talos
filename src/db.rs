@@ -2363,6 +2363,19 @@ impl Database {
         Ok(records)
     }
 
+    pub fn active_tasks(&self) -> Result<Vec<TaskRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT id, title, acceptance_criteria, status, created_at_ms, updated_at_ms
+             FROM tasks
+             WHERE status IN ('planning', 'implementing', 'reviewing', 'verifying')
+             ORDER BY id",
+        )?;
+        let records = statement
+            .query_map([], map_task_record)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(records)
+    }
+
     pub fn task_list_page(&self, after: i64, limit: usize) -> Result<TaskListPage> {
         if after < 0 || !(1..=MAX_TASK_LIST_PAGE_SIZE).contains(&limit) {
             bail!("Task list requires a non-negative cursor and a limit from 1 to 100");
@@ -2445,6 +2458,29 @@ impl Database {
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(events)
+    }
+
+    pub fn recent_events(&self, limit: usize) -> Result<Vec<TaskEvent>> {
+        let limit_i64 = i64::try_from(limit).unwrap_or(50);
+        let mut statement = self.connection.prepare(
+            "SELECT id, task_id, occurred_at_ms, actor, event_type, reason, data_json
+             FROM task_events ORDER BY id DESC LIMIT ?1",
+        )?;
+        let mut events = statement
+            .query_map([limit_i64], |row| {
+                Ok(TaskEvent {
+                    id: row.get(0)?,
+                    task_id: row.get(1)?,
+                    occurred_at_ms: row.get(2)?,
+                    actor: row.get(3)?,
+                    event_type: row.get(4)?,
+                    reason: row.get(5)?,
+                    data_json: row.get(6)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        events.reverse();
         Ok(events)
     }
 

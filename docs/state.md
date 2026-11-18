@@ -12,7 +12,7 @@
 5. GitHub Draft PR publication policy enforcement: remote git preflight validation, branch preparation (`talos/task-1`), and strict prohibition of auto-merge.
 6. Cross-platform execution on Linux (Ubuntu x86_64 server `nyxos`): toolchains, SQLite WAL, Codex Writer + Codex Critic execution, and task completion verified live on Linux.
 
-**Next action:** user confirmation and ongoing project task execution. Release v0.1.0 published on GitHub with multi-platform assets (macOS + Ubuntu), interactive 3-pane tmux workspace on bare `talos`, and dynamic `talos config [set]` CLI management.
+**Next action:** user confirmation and ongoing project task execution. Release v0.1.0 published on GitHub with multi-platform assets (macOS + Ubuntu). Terminal Orchestrator Cockpit (TUI) powered by `ratatui` and `crossterm` is now the default interface on bare `talos` (or `talos tui`), featuring live Writer/Critic stream monitoring, natural-language prompt dispatch, automatic background supervisor daemon execution, active session reconnection, and uncommitted work protection. Manual multi-terminal mode remains available via `talos attach`.
 
 ## Goal and fixed direction
 

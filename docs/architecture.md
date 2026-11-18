@@ -77,24 +77,36 @@ The core validates transitions and records each transition's time, actor, reason
 - `task verify <ID>`: runs exact allowlisted argv arrays from `.talos/config.json`, hashes bounded output, compares Git facts before and after checks, and marks `complete` transactionally only if the latest approval and every saved check remain valid. The Critic cannot provide an applicable patch; unknown patch fields are rejected.
 - `up --auto`: processes runnable queued tasks to completion, supporting both Pair mode (default) and Team mode (`--mode team`).
 
-## Process Supervision & Interactive Workspace
+## Process Supervision & Terminal Orchestrator (TUI)
 
 Tokio starts children with argument arrays, never through a shell string. Process output is drained concurrently to avoid pipe deadlocks. SIGINT/SIGTERM triggers bounded child cleanup and reaping. `task recover` quarantines unfinished attempts as `unknown`; `task resolve` requires explicit stopped-Writer/project-inspected attestations and never changes the recorded attempt outcome or starts a process.
 
-**Interactive 3-Pane Tmux Workspace:**
-When executed without arguments (`talos`) or via `talos attach`, TALOS checks whether tmux is available. Outside tmux, it creates or reconnects to an interactive 3-pane layout:
+**Unified Terminal Orchestrator Cockpit (`talos` or `talos tui`):**
+Running `talos` without subcommands inside a project launches the full-screen terminal orchestrator (built with `ratatui` + `crossterm`):
 ```text
-┌───────────────────────────────────────┬───────────────────────────────────────┐
-│ 🤖 Pane 1: Writer Stream (top-left)   │ 🕵️ Pane 2: Critic Stream (top-right)  │
-│ Live streaming agent output, file     │ Live audit diff, reviewer analysis,   │
-│ edits, and unit test execution.       │ defect notes, and verdicts.           │
-├───────────────────────────────────────┴───────────────────────────────────────┤
-│ 🎮 Pane 3: Console (bottom, focused)                                          │
-│ Interactive operator prompt for queueing tasks and controlling execution.     │
-│ talos> _                                                                      │
-└───────────────────────────────────────────────────────────────────────────────┘
+┌─ TALOS ────────────────────────────────────────────── [Team / Auto] ── [● Running] ─┐
+│ Project: pair-mailbox                      Queue: 1 active, 2 queued, 5 complete    │
+├─────────────────────────────────────┬───────────────────────────────────────────────┤
+│ 🖊  Writer Team (Codex)              │ 🛡  Critic Team (AGY)                         │
+│ Adapter Profile: codex              │ Adapter Profile: agy                          │
+│ Current Task: #18 Fix eval parser   │ Status: ● Auditing & Reviewing                │
+│ Status: ● implementing              │ Checks Configured: 2 verification checks      │
+│ Worktrees: 1 active                 │                                               │
+├─────────────────────────────────────┴───────────────────────────────────────────────┤
+│ 📜 Activity & Supervision Log (Auto-updates)                                        │
+│ [Task #18] [writer] child_task_created: Worker 1 started in task-18-w1              │
+│ [Task #18] [git] worktree_integrated: integrated patch into primary tree            │
+│ [Task #18] [critic] review_completed: approved revision R3                          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│ > Describe next task (Enter: Enqueue & Run | Ctrl+P: Pause/Resume | Ctrl+C/q: Exit) █
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
-The session persists across laptop lid closure or SSH disconnection. Re-running `talos` reattaches immediately to the active workspace.
+
+**Key TUI Features & Guarantees:**
+1. **Interactive Prompt Layer:** Users enter natural-language goals in the bottom prompt bar without remembering subcommands. Pressing `Enter` commits the task to SQLite and launches background execution.
+2. **Decoupled Execution & Reconnection:** Process execution is decoupled from terminal lifetimes. If the terminal is closed, an SSH session drops, or the laptop lid is shut, the background supervisor continues running. Re-running `talos` reconnects immediately, displaying the in-progress session and worktrees.
+3. **Uncommitted Work Guard:** If uncommitted repository files are detected at startup or before worktree execution, TALOS displays a warning banner and guards against accidental overwrites.
+4. **Manual Mode via Tmux (`talos attach`):** For manual, multi-terminal workflows, `talos attach` remains available to create and connect to a persistent 3-pane tmux workspace.
 
 ## Git and Worktree Isolation
 

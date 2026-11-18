@@ -58,33 +58,47 @@ Pre-compiled tarballs and SHA-256 checksums are attached to every GitHub release
 
 ## Interactive 3-Pane Workspace (`tmux`)
 
-When executed without subcommands or via `talos attach`, TALOS launches or reconnects to an interactive 3-pane persistent workspace:
+When executed inside your project repository without subcommands, TALOS opens the **Terminal Orchestrator Cockpit (TUI)**:
 
 ```sh
 # Inside your project repository:
 talos
 # Or explicitly:
-talos attach
+talos tui
 ```
 
-### Visual Layout
+### Terminal Orchestrator Cockpit (TUI)
 
 ```text
-┌───────────────────────────────────────┬───────────────────────────────────────┐
-│ 🤖 Pane 1: Writer Stream (top-left)   │ 🕵️ Pane 2: Critic Stream (top-right)  │
-│ ------------------------------------- │ ------------------------------------- │
-│ Live tail of active Writer worker:    │ Live tail of independent Critic:      │
-│ thoughts, worktree edits, test runs.  │ diff audit, findings, and verdicts.   │
-├───────────────────────────────────────┴───────────────────────────────────────┤
-│ 🎮 Pane 3: Console (bottom, focused)                                          │
-│ ----------------------------------------------------------------------------- │
-│ Operator prompt for managing tasks and queue execution.                       │
-│ talos> _                                                                      │
-└───────────────────────────────────────────────────────────────────────────────┘
+┌─ TALOS ────────────────────────────────────────────── [Team / Auto] ── [● Running] ─┐
+│ Project: pair-mailbox                      Queue: 1 active, 2 queued, 5 complete    │
+├─────────────────────────────────────┬───────────────────────────────────────────────┤
+│ 🖊  Writer Team (Codex)              │ 🛡  Critic Team (AGY)                         │
+│ Adapter Profile: codex              │ Adapter Profile: agy                          │
+│ Current Task: #18 Fix eval parser   │ Status: ● Auditing & Reviewing                │
+│ Status: ● implementing              │ Checks Configured: 2 verification checks      │
+│ Worktrees: 1 active                 │                                               │
+├─────────────────────────────────────┴───────────────────────────────────────────────┤
+│ 📜 Activity & Supervision Log (Auto-updates)                                        │
+│ [Task #18] [writer] child_task_created: Worker 1 started in task-18-w1              │
+│ [Task #18] [git] worktree_integrated: integrated patch into primary tree            │
+│ [Task #18] [critic] review_completed: approved revision R3                          │
+├─────────────────────────────────────────────────────────────────────────────────────┤
+│ > Describe next task (Enter: Enqueue & Run | Ctrl+P: Pause/Resume | Ctrl+C/q: Exit) █
+└─────────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- **Resilience:** If your terminal closes, your laptop lid is shut, or an SSH connection drops, the supervised processes continue executing in tmux. Running `talos` upon reconnection immediately reattaches to the workspace.
-- **Headless alternative:** If you prefer quiet background execution without tmux, run `talos up --auto`.
+- **Interactive Task Input:** Enter your task directly in the bottom input bar. TALOS automatically persists it into SQLite and runs the autonomous supervisor loop.
+- **Session Recovery & Reconnect:** If your connection drops, laptop sleeps, or SSH disconnects, background tasks keep executing. Re-opening `talos` reconnects to the active session and displays the in-progress state.
+- **Safety Guards:** Detects uncommitted changes in your repository before executing tasks to prevent merge conflicts or code loss.
+- **Controls:** `Ctrl+P` pauses or resumes the queue; `Ctrl+C` or `q` exits the interface without stopping background workers.
+
+### Manual Multi-Pane Mode (`talos attach`)
+
+If you prefer a 3-pane tmux workspace with dedicated shell panes:
+```sh
+talos attach
+```
 
 ## Configuration Management (`talos config`)
 

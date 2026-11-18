@@ -14,6 +14,7 @@ pub mod secrets;
 pub mod supervisor;
 pub mod team;
 pub mod tmux;
+pub mod tui;
 pub mod worktree;
 
 mod process_identity;

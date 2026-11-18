@@ -164,7 +164,7 @@ impl TmuxClient {
                 .arg("send-keys")
                 .arg("-t")
                 .arg(format!("{session_name}:.bottom"))
-                .arg("echo '=== TALOS INTERACTIVE WORKSPACE ==='; echo 'Ready. Enter commands below (e.g. talos task add \"...\" && talos up --auto):'")
+                .arg("talos tui")
                 .arg("C-m")
                 .output();
 

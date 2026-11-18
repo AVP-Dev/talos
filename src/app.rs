@@ -47,14 +47,14 @@ const VERIFICATION_BUDGET: Duration = Duration::from_secs(25 * 60);
 const MAX_CHANGED_PATHS_PREVIEW: usize = 50;
 const MAX_CHANGED_PATH_PREVIEW_BYTES: usize = 256;
 
-struct GitStatusPaths {
-    total_count: usize,
-    preview: Vec<String>,
-    preview_values_truncated: bool,
+pub(crate) struct GitStatusPaths {
+    pub total_count: usize,
+    pub preview: Vec<String>,
+    pub preview_values_truncated: bool,
 }
 
 impl GitStatusPaths {
-    fn is_empty(&self) -> bool {
+    pub fn is_empty(&self) -> bool {
         self.total_count == 0
     }
 
@@ -142,15 +142,10 @@ pub async fn run(cli: Cli) -> Result<()> {
     let command = match cli.command {
         Some(cmd) => cmd,
         None => {
-            if env::var_os("TMUX").is_some() {
+            if cli.json {
                 Command::Status
             } else {
-                let tmux = TmuxClient::default();
-                if tmux.probe().available {
-                    Command::Attach
-                } else {
-                    Command::Status
-                }
+                Command::Tui
             }
         }
     };
@@ -226,6 +221,10 @@ pub async fn run(cli: Cli) -> Result<()> {
         }
         tmux.attach_project_session(&session_name)?;
         return Ok(());
+    }
+
+    if matches!(&command, Command::Tui) {
+        return crate::tui::run_tui(project).await;
     }
 
     ensure_talos_ignored(&project)?;
@@ -1141,6 +1140,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
+        Command::Tui => unreachable!("TUI handled before database open"),
     }
     Ok(())
 }
@@ -2117,7 +2117,7 @@ fn ensure_queue_running(database: &Database) -> Result<()> {
     Ok(())
 }
 
-fn current_project_revision_id(project: &Project) -> Option<String> {
+pub(crate) fn current_project_revision_id(project: &Project) -> Option<String> {
     let head = git_head(&project.root).ok().flatten()?;
     RevisionSnapshot::capture(&project.root, &head)
         .ok()
@@ -4270,7 +4270,7 @@ fn request_operator_approval(action: &str) -> Result<()> {
     Ok(())
 }
 
-fn ensure_talos_ignored(project: &Project) -> Result<()> {
+pub(crate) fn ensure_talos_ignored(project: &Project) -> Result<()> {
     if !matches!(&project.discovery, DiscoveryMethod::Git) {
         return Ok(());
     }
@@ -4332,7 +4332,7 @@ fn git_command(project: &Project, arguments: &[&str]) -> Result<std::process::Ou
         .context("Cannot run Git while checking project runtime exclusions")
 }
 
-fn git_status_paths(project: &Project) -> Result<GitStatusPaths> {
+pub(crate) fn git_status_paths(project: &Project) -> Result<GitStatusPaths> {
     let mut command = ProcessCommand::new("git");
     command
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])

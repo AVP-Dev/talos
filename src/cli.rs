@@ -38,6 +38,8 @@ pub enum Command {
     Attach,
     /// View or modify project configuration (.talos/config.json).
     Config(ConfigArgs),
+    /// Launch the interactive terminal orchestrator dashboard.
+    Tui,
     /// Inspect the local GitHub CLI and optionally check its active authentication.
     Github(GithubArgs),
 }
@@ -484,6 +486,12 @@ mod tests {
         let cli = Cli::try_parse_from(["talos", "attach"])
             .expect("parse persistent control-session command");
         assert!(matches!(cli.command, Some(Command::Attach)));
+    }
+
+    #[test]
+    fn tui_parses_explicitly() {
+        let cli = Cli::try_parse_from(["talos", "tui"]).expect("parse tui command");
+        assert!(matches!(cli.command, Some(Command::Tui)));
     }
 
     #[test]

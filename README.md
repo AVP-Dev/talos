@@ -68,12 +68,16 @@ cargo install --locked --path .
 
 ## ⚡ Quick Start (30 Seconds)
 
-1. **Launch interactive 3-pane workspace (or check readiness):**
+1. **Launch the Terminal Orchestrator Cockpit:**
    ```sh
    cd /path/to/your/project
-   talos doctor
-   # Or launch the interactive 3-pane terminal workspace directly:
    talos
+   ```
+   *Opens the full-screen terminal dashboard with real-time Writer and Critic team status, live activity log, and an interactive task prompt.*
+
+   *(Optional) To check local readiness first:*
+   ```sh
+   talos doctor
    ```
 
 2. **Configure AI CLI roles and mode:**
