@@ -16,25 +16,57 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs},
 };
 
 use crate::{
     adapter::AdapterId as AdapterKind,
     app::{GitStatusPaths, current_project_revision_id, ensure_talos_ignored, git_status_paths},
+    checks::ProjectCheck,
     config::{OrchestrationMode, ProjectConfig},
-    db::{Database, QueueSummary, TaskEvent, TaskRecord, TaskStatus, TaskWorktreeRecord},
+    db::{
+        CriticReviewRecord, Database, QueueSummary, TaskEvent, TaskRecord, TaskStatus,
+        TaskWorktreeRecord,
+    },
     project::Project,
     tmux::{TmuxClient, project_session_name},
 };
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ActiveTab {
+    Overview = 0,
+    Dialogue = 1,
+    Diff = 2,
+    Audit = 3,
+}
+
+impl ActiveTab {
+    pub fn title(self) -> &'static str {
+        match self {
+            Self::Overview => " 1: Overview ",
+            Self::Dialogue => " 2: Dialogue & Review ",
+            Self::Diff => " 3: Git Diff ",
+            Self::Audit => " 4: Audit & Checks ",
+        }
+    }
+
+    pub fn next(self) -> Self {
+        match self {
+            Self::Overview => Self::Dialogue,
+            Self::Dialogue => Self::Diff,
+            Self::Diff => Self::Audit,
+            Self::Audit => Self::Overview,
+        }
+    }
+}
+
 pub struct TuiApp {
     project: Project,
     config: ProjectConfig,
+    active_tab: ActiveTab,
     input: String,
     status_message: Option<(String, Instant)>,
     scroll_offset: usize,
-    auto_scroll: bool,
 
     // Database metrics
     queue: QueueSummary,
@@ -45,6 +77,9 @@ pub struct TuiApp {
     active_tasks: Vec<TaskRecord>,
     worktrees: Vec<TaskWorktreeRecord>,
     recent_events: Vec<TaskEvent>,
+    latest_review: Option<CriticReviewRecord>,
+    verification_checks: Vec<ProjectCheck>,
+    diff_lines: Vec<String>,
     supervisor_logs: Vec<String>,
     dirty_paths: GitStatusPaths,
     reconnect_notice: Option<String>,
@@ -72,10 +107,10 @@ impl TuiApp {
         let mut app = Self {
             project,
             config,
+            active_tab: ActiveTab::Overview,
             input: String::new(),
             status_message: None,
             scroll_offset: 0,
-            auto_scroll: true,
             queue,
             queue_paused: false,
             pause_reason: None,
@@ -84,6 +119,9 @@ impl TuiApp {
             active_tasks: Vec::new(),
             worktrees: Vec::new(),
             recent_events: Vec::new(),
+            latest_review: None,
+            verification_checks: Vec::new(),
+            diff_lines: Vec::new(),
             supervisor_logs: Vec::new(),
             dirty_paths,
             reconnect_notice: None,
@@ -142,6 +180,17 @@ impl TuiApp {
         self.active_tasks = database.active_tasks().unwrap_or_default();
         self.worktrees = database.task_worktrees().unwrap_or_default();
         self.recent_events = database.recent_events(50).unwrap_or_default();
+
+        if let Some(active) = self.active_tasks.first() {
+            self.latest_review = database.latest_critic_review(active.id).ok().flatten();
+            self.verification_checks = database
+                .task_verification_checks(active.id)
+                .unwrap_or_default();
+        } else {
+            self.latest_review = None;
+            self.verification_checks = self.config.checks.clone();
+        }
+
         self.dirty_paths = git_status_paths(&self.project).unwrap_or(GitStatusPaths {
             total_count: 0,
             preview: Vec::new(),
@@ -149,6 +198,7 @@ impl TuiApp {
         });
 
         self.read_supervisor_logs();
+        self.load_git_diff();
         Ok(())
     }
 
@@ -163,6 +213,25 @@ impl TuiApp {
                 .collect();
             let start = lines.len().saturating_sub(25);
             self.supervisor_logs = lines[start..].to_vec();
+        }
+    }
+
+    fn load_git_diff(&mut self) {
+        let mut cmd = std::process::Command::new("git");
+        cmd.args(["diff", "HEAD"]).current_dir(&self.project.root);
+        if let Ok(out) = cmd.output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            if text.trim().is_empty() {
+                // If HEAD has no diff, check untracked diff or normal diff
+                let mut fallback_cmd = std::process::Command::new("git");
+                fallback_cmd.arg("diff").current_dir(&self.project.root);
+                if let Ok(fb_out) = fallback_cmd.output() {
+                    let fb_text = String::from_utf8_lossy(&fb_out.stdout);
+                    self.diff_lines = fb_text.lines().map(|s| s.to_string()).collect();
+                }
+            } else {
+                self.diff_lines = text.lines().map(|s| s.to_string()).collect();
+            }
         }
     }
 
@@ -205,9 +274,22 @@ impl TuiApp {
         match cmd.as_str() {
             "/help" => {
                 self.status_message = Some((
-                    "Commands: /writer <adapter> | /critic <adapter> | /model <name> | /mode <pair|team> | /commit <msg> | /run | /tmux".to_string(),
+                    "Navigation: /overview, /dialogue, /diff, /audit | Config: /writer, /critic, /model, /mode, /commit, /run, /tmux".to_string(),
                     Instant::now(),
                 ));
+            }
+            "/overview" => {
+                self.active_tab = ActiveTab::Overview;
+            }
+            "/dialogue" | "/chat" => {
+                self.active_tab = ActiveTab::Dialogue;
+            }
+            "/diff" => {
+                self.active_tab = ActiveTab::Diff;
+                self.load_git_diff();
+            }
+            "/audit" | "/review" => {
+                self.active_tab = ActiveTab::Audit;
             }
             "/writer" => {
                 if arg.is_empty() {
@@ -486,6 +568,25 @@ async fn run_app_loop(
                 {
                     return Ok(());
                 }
+                KeyCode::Tab => {
+                    app.active_tab = app.active_tab.next();
+                    if app.active_tab == ActiveTab::Diff {
+                        app.load_git_diff();
+                    }
+                }
+                KeyCode::Char('1') if app.input.is_empty() => {
+                    app.active_tab = ActiveTab::Overview;
+                }
+                KeyCode::Char('2') if app.input.is_empty() => {
+                    app.active_tab = ActiveTab::Dialogue;
+                }
+                KeyCode::Char('3') if app.input.is_empty() => {
+                    app.active_tab = ActiveTab::Diff;
+                    app.load_git_diff();
+                }
+                KeyCode::Char('4') if app.input.is_empty() => {
+                    app.active_tab = ActiveTab::Audit;
+                }
                 KeyCode::Enter => {
                     let _ = app.handle_submit();
                 }
@@ -496,16 +597,12 @@ async fn run_app_loop(
                     app.input.clear();
                 }
                 KeyCode::Up => {
-                    app.auto_scroll = false;
-                    if app.scroll_offset > 0 {
-                        app.scroll_offset -= 1;
-                    }
+                    app.scroll_offset = app.scroll_offset.saturating_sub(1);
                 }
                 KeyCode::Down => {
                     app.scroll_offset = app.scroll_offset.saturating_add(1);
                 }
                 KeyCode::PageUp => {
-                    app.auto_scroll = false;
                     app.scroll_offset = app.scroll_offset.saturating_sub(5);
                 }
                 KeyCode::PageDown => {
@@ -539,8 +636,8 @@ fn ui(frame: &mut Frame, app: &TuiApp) {
                     0
                 },
             ), // Alerts banner
-            Constraint::Length(8), // Team / Agents panel
-            Constraint::Min(6),    // Activity log
+            Constraint::Length(3), // Tabs navigation bar
+            Constraint::Min(8),    // Active Tab View Content
             Constraint::Length(3), // Input bar
         ])
         .split(size);
@@ -551,8 +648,15 @@ fn ui(frame: &mut Frame, app: &TuiApp) {
         render_alerts(frame, app, chunks[1]);
     }
 
-    render_agents(frame, app, chunks[2]);
-    render_activity(frame, app, chunks[3]);
+    render_tabs(frame, app, chunks[2]);
+
+    match app.active_tab {
+        ActiveTab::Overview => render_overview_tab(frame, app, chunks[3]),
+        ActiveTab::Dialogue => render_dialogue_tab(frame, app, chunks[3]),
+        ActiveTab::Diff => render_diff_tab(frame, app, chunks[3]),
+        ActiveTab::Audit => render_audit_tab(frame, app, chunks[3]),
+    }
+
     render_input(frame, app, chunks[4]);
 }
 
@@ -662,7 +766,7 @@ fn render_alerts(frame: &mut Frame, app: &TuiApp, area: Rect) {
     if !app.dirty_paths.is_empty() {
         alert_spans.push(Span::styled(
             format!(
-                " ⚠️ Warning: {} uncommitted file(s) in repository. Type '/commit <msg>' or clean git before worktree execution! ",
+                " ⚠️ Warning: {} uncommitted file(s) in repository. Type '/commit <msg>' to clean before worktree execution! ",
                 app.dirty_paths.total_count
             ),
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
@@ -675,6 +779,41 @@ fn render_alerts(frame: &mut Frame, app: &TuiApp, area: Rect) {
             .border_style(Style::default().fg(Color::DarkGray)),
     );
     frame.render_widget(alert_p, area);
+}
+
+fn render_tabs(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let titles = vec![
+        ActiveTab::Overview.title(),
+        ActiveTab::Dialogue.title(),
+        ActiveTab::Diff.title(),
+        ActiveTab::Audit.title(),
+    ];
+
+    let tabs = Tabs::new(titles)
+        .select(app.active_tab as usize)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)),
+        )
+        .style(Style::default().fg(Color::DarkGray))
+        .highlight_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        );
+
+    frame.render_widget(tabs, area);
+}
+
+fn render_overview_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let layout = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(8), Constraint::Min(6)])
+        .split(area);
+
+    render_agents(frame, app, layout[0]);
+    render_activity(frame, app, layout[1]);
 }
 
 fn render_agents(frame: &mut Frame, app: &TuiApp, area: Rect) {
@@ -807,7 +946,7 @@ fn render_agents(frame: &mut Frame, app: &TuiApp, area: Rect) {
 fn render_activity(frame: &mut Frame, app: &TuiApp, area: Rect) {
     let mut items = Vec::new();
 
-    // 1. Render recent SQLite task events
+    // 1. Render recent milestone SQLite events
     for event in &app.recent_events {
         let actor_color = match event.actor.as_str() {
             "writer" | "writer_lead" => Color::Yellow,
@@ -870,18 +1009,174 @@ fn render_activity(frame: &mut Frame, app: &TuiApp, area: Rect) {
 
     let log_block = Block::default()
         .borders(Borders::ALL)
-        .title(" 📜 Live Activity & Supervisor Stream (Auto-updates) ")
+        .title(" 📜 Live Milestone & Supervisor Activity (Press Tab / 2-4 to switch views) ")
         .border_style(Style::default().fg(Color::White));
 
     let list = List::new(items).block(log_block);
     frame.render_widget(list, area);
 }
 
+fn render_dialogue_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let mut lines = Vec::new();
+
+    lines.push(Line::from(vec![Span::styled(
+        "=== Agent Dialogue & Peer Review ===",
+        Style::default()
+            .fg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    )]));
+    lines.push(Line::from(Span::raw("")));
+
+    if let Some(ref review) = app.latest_review {
+        let decision_color = if review.decision == "approve" {
+            Color::Green
+        } else {
+            Color::Red
+        };
+        lines.push(Line::from(vec![
+            Span::styled(
+                "Critic Review Verdict: ",
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                review.decision.to_uppercase(),
+                Style::default()
+                    .fg(decision_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(format!(" (Revision R{})", review.revision_id)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Review Summary: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(&review.summary, Style::default().fg(Color::White)),
+        ]));
+        lines.push(Line::from(Span::raw("")));
+
+        lines.push(Line::from(Span::styled(
+            "Critic Findings / Defect Analysis:",
+            Style::default()
+                .fg(Color::Magenta)
+                .add_modifier(Modifier::BOLD),
+        )));
+        if review.result_json.trim().is_empty() || review.result_json == "{}" {
+            lines.push(Line::from(Span::styled(
+                "  • No defects found. Clean review.",
+                Style::default().fg(Color::Green),
+            )));
+        } else {
+            lines.push(Line::from(Span::styled(
+                format!("  {}", review.result_json),
+                Style::default().fg(Color::Yellow),
+            )));
+        }
+    } else {
+        lines.push(Line::from(Span::styled(
+            "No Critic reviews recorded yet for current task.",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled(
+            "When Writer submits code for review, Critic findings and discussion will appear here.",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" 💬 Peer Review & Decision Log ")
+        .border_style(Style::default().fg(Color::Magenta));
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn render_diff_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let mut items = Vec::new();
+
+    if app.diff_lines.is_empty() {
+        items.push(ListItem::new(Line::from(Span::styled(
+            "No uncommitted code changes in current working tree or active worktree.",
+            Style::default().fg(Color::DarkGray),
+        ))));
+    } else {
+        for line in &app.diff_lines {
+            let style = if line.starts_with('+') && !line.starts_with("+++") {
+                Style::default().fg(Color::Green)
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                Style::default().fg(Color::Red)
+            } else if line.starts_with("@@") {
+                Style::default().fg(Color::Cyan)
+            } else if line.starts_with("diff ") || line.starts_with("index ") {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::White)
+            };
+
+            items.push(ListItem::new(Line::from(Span::styled(line.clone(), style))));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(format!(
+            " 📄 Live Code Diff ({} lines changed) ",
+            app.diff_lines.len()
+        ))
+        .border_style(Style::default().fg(Color::Green));
+
+    frame.render_widget(List::new(items).block(block), area);
+}
+
+fn render_audit_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let mut lines = Vec::new();
+
+    lines.push(Line::from(Span::styled(
+        "=== Automated Verification Checks & Test Gate ===",
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::raw("")));
+
+    if app.verification_checks.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "No automated verification checks configured for this project.",
+            Style::default().fg(Color::DarkGray),
+        )));
+        lines.push(Line::from(Span::styled("Tip: Add checks with /config set checks '[{\"id\":\"test\",\"argv\":[\"cargo\",\"test\"]}]'", Style::default().fg(Color::DarkGray))));
+    } else {
+        for (i, check) in app.verification_checks.iter().enumerate() {
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("Check #{}: ", i + 1),
+                    Style::default().fg(Color::DarkGray),
+                ),
+                Span::styled(
+                    &check.id,
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::raw(" -> Command: "),
+                Span::styled(check.argv.join(" "), Style::default().fg(Color::White)),
+            ]));
+        }
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" 🧪 Verification Suite & Test Gate ")
+        .border_style(Style::default().fg(Color::Cyan));
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
 fn render_input(frame: &mut Frame, app: &TuiApp, area: Rect) {
     let title = if let Some((ref msg, _)) = app.status_message {
         format!(" Notice: {msg} ")
     } else {
-        " Describe task or type /help (/writer, /critic, /model, /commit, /run, /tmux) ".to_string()
+        " Describe task or type /help | Tabs: [1: Overview] [2: Dialogue] [3: Diff] [4: Audit] "
+            .to_string()
     };
 
     let input_line = Line::from(vec![
