@@ -23,18 +23,31 @@ case "$TARGET" in
   *) fail "unsupported native target '$TARGET'; supported targets are x86_64-unknown-linux-gnu and aarch64-unknown-linux-gnu" ;;
 esac
 
-exec 3< <(git status --porcelain=v1 -z --untracked-files=all)
+STATUS_DIR="$(mktemp -d "${TMPDIR:-/tmp}/talos-package-status.XXXXXX")" || fail "cannot create temporary status pipe"
+STATUS_FIFO="$STATUS_DIR/status"
+if ! mkfifo "$STATUS_FIFO"; then
+  rmdir "$STATUS_DIR"
+  fail "cannot create temporary status pipe"
+fi
+git status --porcelain=v1 -z --untracked-files=all >"$STATUS_FIFO" &
 STATUS_PID=$!
+exec 3<"$STATUS_FIFO"
 if IFS= read -r -n 1 -u 3 STATUS_BYTE; then
   exec 3<&-
   kill "$STATUS_PID" 2>/dev/null || true
   wait "$STATUS_PID" 2>/dev/null || true
+  rm -f "$STATUS_FIFO"
+  rmdir "$STATUS_DIR"
   fail "commit or remove working-tree changes before packaging"
 fi
 exec 3<&-
 if ! wait "$STATUS_PID"; then
+  rm -f "$STATUS_FIFO"
+  rmdir "$STATUS_DIR"
   fail "cannot inspect Git working-tree status"
 fi
+rm -f "$STATUS_FIFO"
+rmdir "$STATUS_DIR"
 
 VERSION="$(awk -F '"' '$1 ~ /^version = / { print $2; exit }' Cargo.toml)"
 [ -n "$VERSION" ] || fail "cannot read package version from Cargo.toml"
