@@ -137,6 +137,7 @@ impl AgyProbe {
     }
 }
 
+#[cfg(test)]
 fn parse_capabilities(help: &str) -> AgyCapabilities {
     parse_capabilities_streams(help.as_bytes(), &[])
 }
