@@ -272,7 +272,7 @@ No schema change for process identity is selected or implemented. The separate s
 
 ## ADR-042 — Run bounded Writers concurrently in separate managed worktrees
 
-- **Status:** accepted implementation direction; implementation in progress.
+- **Status:** implemented locally in `837b82c`; migration and behavior acceptance remain pending.
 - **Decision:** support parallel manual TALOS Writer runs only when each active task has its own active managed worktree. Keep direct primary-tree Writer execution exclusive. Add a project setting `max_concurrent_writers` with default `1` and a hard maximum of `3`; increasing it is an explicit project choice. Native Agy delegation remains a separate capability and stays disabled until verified.
 - **Invariants:** one unresolved Writer attempt per task; one durable execution lease per active attempt; every concurrent attempt must resolve to a distinct active managed worktree; a primary-tree attempt cannot overlap any other Writer; SQLite must atomically enforce the project cap and match the execution root selected by the caller to the current task route before launch. Review, verification, worktree integration, and recovery remain serialized by the project supervisor lease and cannot start new writes into an active Writer set.
 - **Recovery and failure handling:** persist the owning TALOS PID with each execution lease. A failed launch or lost supervisor leaves the lease and attempt unresolved. Recovery must refuse while any recorded owner PID is alive or cannot be checked. When all owners are absent, quarantine unfinished attempts as `unknown` and clear their execution leases in the same transaction. Never free a lease or retry work from process identity alone while the owner may still exist.

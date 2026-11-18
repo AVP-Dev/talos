@@ -18,8 +18,17 @@ case "$TARGET" in
   *) fail "target must be a macOS target triple (got '$TARGET')" ;;
 esac
 
-if [ -n "$(git status --porcelain --untracked-files=all)" ]; then
+exec 3< <(git status --porcelain=v1 -z --untracked-files=all)
+STATUS_PID=$!
+if IFS= read -r -n 1 -u 3 STATUS_BYTE; then
+  exec 3<&-
+  kill "$STATUS_PID" 2>/dev/null || true
+  wait "$STATUS_PID" 2>/dev/null || true
   fail "commit or remove working-tree changes before packaging"
+fi
+exec 3<&-
+if ! wait "$STATUS_PID"; then
+  fail "cannot inspect Git working-tree status"
 fi
 
 VERSION="$(awk -F '"' '$1 ~ /^version = / { print $2; exit }' Cargo.toml)"
