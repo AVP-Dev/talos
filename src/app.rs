@@ -4790,6 +4790,14 @@ mod tests {
             .output()
             .expect("run git init");
         assert!(output.status.success(), "git init succeeds");
+        let _ = Command::new("git")
+            .args(["config", "user.name", "TALOS Test"])
+            .current_dir(root)
+            .output();
+        let _ = Command::new("git")
+            .args(["config", "user.email", "talos-test@example.com"])
+            .current_dir(root)
+            .output();
     }
 
     fn git(root: &std::path::Path, arguments: &[&str]) -> String {
