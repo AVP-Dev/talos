@@ -45,6 +45,7 @@ pub struct ProjectConfig {
     pub critic: AdapterKind,
     pub checks: Vec<ProjectCheck>,
     pub github: Option<GithubPolicy>,
+    pub max_concurrent_writers: usize,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -73,6 +74,11 @@ struct FileConfig {
     checks: Vec<ProjectCheck>,
     #[serde(default)]
     github: Option<GithubPolicy>,
+    #[serde(
+        default,
+        deserialize_with = "deserialize_optional_max_concurrent_writers"
+    )]
+    max_concurrent_writers: Option<usize>,
 }
 
 impl Default for ProjectConfig {
@@ -82,6 +88,7 @@ impl Default for ProjectConfig {
             critic: AdapterKind::Agy,
             checks: Vec::new(),
             github: None,
+            max_concurrent_writers: 1,
         }
     }
 }
@@ -116,14 +123,21 @@ impl ProjectConfig {
             .with_context(|| format!("Cannot read project config {}", path.display()))?;
         let parsed: FileConfig = serde_json::from_slice(&bytes)
             .with_context(|| format!("Project config {} is not valid JSON", path.display()))?;
-        if !matches!(parsed.schema_version, 1..=3) {
+        if !matches!(parsed.schema_version, 1..=4) {
             bail!(
                 "Project config schema version {} is unsupported",
                 parsed.schema_version
             );
         }
+        if parsed.schema_version < 4 && parsed.max_concurrent_writers.is_some() {
+            bail!("max_concurrent_writers requires project config schema version 4");
+        }
         if parsed.github.is_some() && parsed.schema_version < 3 {
             bail!("GitHub publication policy requires project config schema version 3");
+        }
+        let max_concurrent_writers = parsed.max_concurrent_writers.unwrap_or(1);
+        if !(1..=3).contains(&max_concurrent_writers) {
+            bail!("max_concurrent_writers must be between 1 and 3");
         }
         validate_project_checks(&parsed.checks)?;
         if let Some(github) = &parsed.github {
@@ -134,6 +148,7 @@ impl ProjectConfig {
             critic: parse_adapter(&parsed.critic, AgentRole::Critic)?,
             checks: parsed.checks,
             github: parsed.github,
+            max_concurrent_writers,
         })
     }
 
@@ -143,6 +158,15 @@ impl ProjectConfig {
             AgentRole::Critic => self.critic,
         }
     }
+}
+
+fn deserialize_optional_max_concurrent_writers<'de, D>(
+    deserializer: D,
+) -> std::result::Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    usize::deserialize(deserializer).map(Some)
 }
 
 fn default_github_remote() -> String {

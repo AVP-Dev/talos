@@ -58,7 +58,7 @@ An approved review moves a task to `verifying`; only passing checks and any mana
 
 ## Pause, stop, and recovery
 
-`talos pause` prevents new Writer launches and continuations. It does not terminate a process already running. `talos stop` requests cooperative termination of the active Writer and reports whether termination was confirmed. If it times out or TALOS was killed, inspect the process and project changes before resolving the attempt.
+`talos pause` prevents new Writer launches and continuations. It does not terminate a process already running. `talos stop` requests cooperative termination of one active Writer and reports whether termination was confirmed; repeat it to stop another concurrent Writer. If it times out or TALOS was killed, inspect the process and project changes before resolving the attempt. If the crash happened before the Writer PID was saved, TALOS cannot probe its process group, so resolution relies on the operator attestations.
 
 Use `talos task recover` to quarantine interrupted attempts. Recovery reports `unknown`; it does not infer success, signal a process, resume a session, or retry work. `task resolve` requires explicit operator attestations. `authorize-retry` only returns the task to the queue; a separate later command must launch a Writer.
 

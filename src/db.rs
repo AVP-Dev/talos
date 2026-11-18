@@ -18,7 +18,7 @@ use crate::{
     secrets::contains_sensitive,
 };
 
-const SCHEMA_VERSION: i64 = 17;
+const SCHEMA_VERSION: i64 = 18;
 const MAX_CHILD_TASK_ALLOWED_PATHS: usize = 64;
 const MAX_CHILD_TASK_SCOPE_BYTES: usize = 16 * 1024;
 const MIN_CHILD_TASK_TIMEOUT_MS: i64 = 1_000;
@@ -326,6 +326,13 @@ pub struct WriterAttemptRecord {
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct WriterExecutionLeaseRecord {
+    pub attempt_id: i64,
+    pub task_id: i64,
+    pub owner_process_id: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 pub struct CriticReviewRecord {
     pub id: i64,
     pub task_id: i64,
@@ -566,6 +573,14 @@ impl Database {
 
     pub fn path(&self) -> &Path {
         &self.path
+    }
+
+    fn primary_project_root(&self) -> Result<std::path::PathBuf> {
+        self.path
+            .parent()
+            .and_then(Path::parent)
+            .map(Path::to_path_buf)
+            .context("Cannot determine the primary project root from the TALOS database path")
     }
 
     pub fn schema_version(&self) -> Result<i64> {
@@ -1057,67 +1072,6 @@ impl Database {
             .context("Cannot commit task worktree state")?;
         self.task_worktree(task_id)?
             .context("Task worktree disappeared after state update")
-    }
-
-    pub fn mark_task_worktree_writer_routed(&mut self, task_id: i64) -> Result<bool> {
-        let transaction = self
-            .connection
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .context("Cannot record task worktree Writer routing")?;
-        let record: Option<(String, Option<i64>)> = transaction
-            .query_row(
-                "SELECT state, writer_routed_at_ms FROM task_worktrees WHERE task_id = ?1",
-                [task_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        let Some((state, routed_at_ms)) = record else {
-            transaction.commit()?;
-            return Ok(false);
-        };
-        if state == TaskWorktreeState::Retired.as_str() {
-            transaction.commit()?;
-            return Ok(false);
-        }
-        if state != TaskWorktreeState::Active.as_str() {
-            bail!("Task #{task_id} worktree is {state}; it cannot become a Writer workspace");
-        }
-        if routed_at_ms.is_some() {
-            transaction.commit()?;
-            return Ok(false);
-        }
-        let prior_attempt_count: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM writer_attempts WHERE task_id = ?1",
-            [task_id],
-            |row| row.get(0),
-        )?;
-        if prior_attempt_count != 0 {
-            transaction.commit()?;
-            return Ok(false);
-        }
-        let task_status: Option<String> = transaction
-            .query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
-                row.get(0)
-            })
-            .optional()?;
-        if task_status.as_deref() != Some(TaskStatus::Queued.as_str()) {
-            bail!("Task #{task_id} must be queued before first Writer routing to its worktree");
-        }
-        let now = now_ms()?;
-        transaction.execute(
-            "UPDATE task_worktrees SET writer_routed_at_ms = ?1, updated_at_ms = ?1
-             WHERE task_id = ?2 AND state = 'active' AND writer_routed_at_ms IS NULL",
-            params![now, task_id],
-        )?;
-        transaction.execute(
-            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
-             VALUES (?1, ?2, 'talos', 'task.worktree_writer_routed', 'The first Writer attempt was routed to the active task worktree', '{}')",
-            params![task_id, now],
-        )?;
-        transaction
-            .commit()
-            .context("Cannot record task worktree Writer route")?;
-        Ok(true)
     }
 
     pub fn begin_task_worktree_integration(
@@ -2428,6 +2382,23 @@ impl Database {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Cannot request Writer shutdown")?;
+        let existing: Option<i64> = transaction.query_row(
+            "SELECT stop_requested_attempt_id FROM project_control_state WHERE singleton = 1",
+            [],
+            |row| row.get(0),
+        )?;
+        if let Some(attempt_id) = existing {
+            let still_active: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM writer_attempts
+                 WHERE id = ?1 AND state IN ('launching', 'running'))",
+                [attempt_id],
+                |row| row.get(0),
+            )?;
+            if still_active {
+                transaction.commit()?;
+                return Ok(StopRequestOutcome::Requested { attempt_id });
+            }
+        }
         let active_attempt: Option<i64> = transaction
             .query_row(
                 "SELECT id FROM writer_attempts
@@ -2437,18 +2408,16 @@ impl Database {
             )
             .optional()?;
         let Some(attempt_id) = active_attempt else {
+            if existing.is_some() {
+                transaction.execute(
+                    "UPDATE project_control_state SET stop_requested_attempt_id = NULL
+                     WHERE singleton = 1 AND stop_requested_attempt_id = ?1",
+                    [existing],
+                )?;
+            }
             transaction.commit()?;
             return Ok(StopRequestOutcome::NoActiveWriter);
         };
-        let existing: Option<i64> = transaction.query_row(
-            "SELECT stop_requested_attempt_id FROM project_control_state WHERE singleton = 1",
-            [],
-            |row| row.get(0),
-        )?;
-        if existing == Some(attempt_id) {
-            transaction.commit()?;
-            return Ok(StopRequestOutcome::Requested { attempt_id });
-        }
         let now = now_ms()?;
         transaction.execute(
             "UPDATE project_control_state SET stop_requested_attempt_id = ?1, updated_at_ms = ?2
@@ -2869,8 +2838,37 @@ impl Database {
         task_id: i64,
         prompt_sha256: &str,
     ) -> Result<WriterAttemptRecord> {
+        self.begin_writer_attempt_with_limit(task_id, prompt_sha256, std::process::id(), 1)
+    }
+
+    pub fn begin_writer_attempt_with_limit(
+        &mut self,
+        task_id: i64,
+        prompt_sha256: &str,
+        owner_pid: u32,
+        max_concurrent_writers: usize,
+    ) -> Result<WriterAttemptRecord> {
+        let primary_root = self.primary_project_root()?;
+        self.begin_writer_attempt_for_root(
+            task_id,
+            prompt_sha256,
+            owner_pid,
+            max_concurrent_writers,
+            &primary_root,
+        )
+    }
+
+    pub fn begin_writer_attempt_for_root(
+        &mut self,
+        task_id: i64,
+        prompt_sha256: &str,
+        owner_pid: u32,
+        max_concurrent_writers: usize,
+        expected_execution_root: &Path,
+    ) -> Result<WriterAttemptRecord> {
         validate_writer_prompt_digest(prompt_sha256)?;
         let now = now_ms()?;
+        let primary_root = self.primary_project_root()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
@@ -2884,61 +2882,15 @@ impl Database {
         let Some(current_status) = current_status else {
             bail!("Task #{task_id} does not exist");
         };
-        let worktree_record: Option<(String, Option<i64>)> = transaction
-            .query_row(
-                "SELECT state, writer_routed_at_ms FROM task_worktrees WHERE task_id = ?1",
-                [task_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .optional()?;
-        if let Some((state, _)) = worktree_record.as_ref()
-            && state != TaskWorktreeState::Active.as_str()
-            && state != TaskWorktreeState::Retired.as_str()
-        {
-            bail!(
-                "Task #{task_id} has a managed worktree in state {state}; reconcile or inspect it before running a Writer"
-            );
-        }
-        let integration_state: Option<String> = transaction
-            .query_row(
-                "SELECT state FROM task_worktree_integrations WHERE task_id = ?1",
-                [task_id],
-                |row| row.get(0),
-            )
-            .optional()?;
-        if matches!(
-            integration_state.as_deref(),
-            Some("applying" | "needs_attention")
-        ) {
-            bail!(
-                "Task #{task_id} worktree integration needs reconciliation before another Writer can run"
-            );
-        }
-        let prior_attempt_count: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM writer_attempts WHERE task_id = ?1",
-            [task_id],
-            |row| row.get(0),
+        validate_and_mark_writer_execution_target(
+            &transaction,
+            task_id,
+            owner_pid,
+            max_concurrent_writers,
+            now,
+            expected_execution_root,
+            &primary_root,
         )?;
-        if worktree_record
-            .as_ref()
-            .is_some_and(|(state, _)| state == TaskWorktreeState::Retired.as_str())
-            && integration_state.is_some()
-        {
-            bail!(
-                "Task #{task_id} has integration history for its retired worktree and requires reconciliation"
-            );
-        }
-        if worktree_record
-            .as_ref()
-            .is_some_and(|(state, routed_at_ms)| {
-                state == TaskWorktreeState::Active.as_str() && routed_at_ms.is_none()
-            })
-            && prior_attempt_count == 0
-        {
-            bail!(
-                "Task #{task_id} active worktree must be marked as the Writer workspace before the first attempt"
-            );
-        }
         let unmet_dependencies: i64 = transaction.query_row(
             "SELECT COUNT(*)
              FROM task_dependencies AS edges
@@ -2990,17 +2942,6 @@ impl Database {
             bail!("Task #{task_id} already has an unresolved Writer attempt");
         }
 
-        let project_unresolved: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM writer_attempts
-             WHERE state IN ('launching', 'running')
-                OR (state = 'unknown' AND operator_resolution IS NULL)",
-            [],
-            |row| row.get(0),
-        )?;
-        if project_unresolved != 0 {
-            bail!("An unresolved Writer attempt exists for this project");
-        }
-
         if current_status == TaskStatus::Queued.as_str() {
             let changed = transaction.execute(
                 "UPDATE tasks SET status = 'implementing', updated_at_ms = ?1 WHERE id = ?2 AND status = 'queued'",
@@ -3028,6 +2969,7 @@ impl Database {
             ],
         )?;
         let attempt_id = transaction.last_insert_rowid();
+        insert_writer_execution_lease(&transaction, attempt_id, owner_pid, now)?;
         let attempt_data = serde_json::to_string(&serde_json::json!({"attempt_id": attempt_id}))?;
         transaction.execute(
             "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
@@ -3275,27 +3217,63 @@ impl Database {
         conversation_id: &str,
         project_inspected_attested: bool,
     ) -> Result<WriterAttemptRecord> {
+        self.begin_writer_continuation_with_limit(
+            task_id,
+            prompt_sha256,
+            source_attempt_id,
+            conversation_id,
+            project_inspected_attested,
+            std::process::id(),
+            1,
+        )
+    }
+
+    pub fn begin_writer_continuation_with_limit(
+        &mut self,
+        task_id: i64,
+        prompt_sha256: &str,
+        source_attempt_id: i64,
+        conversation_id: &str,
+        project_inspected_attested: bool,
+        owner_pid: u32,
+        max_concurrent_writers: usize,
+    ) -> Result<WriterAttemptRecord> {
+        let primary_root = self.primary_project_root()?;
+        self.begin_writer_continuation_for_root(
+            task_id,
+            prompt_sha256,
+            source_attempt_id,
+            conversation_id,
+            project_inspected_attested,
+            owner_pid,
+            max_concurrent_writers,
+            &primary_root,
+        )
+    }
+
+    pub fn begin_writer_continuation_for_root(
+        &mut self,
+        task_id: i64,
+        prompt_sha256: &str,
+        source_attempt_id: i64,
+        conversation_id: &str,
+        project_inspected_attested: bool,
+        owner_pid: u32,
+        max_concurrent_writers: usize,
+        expected_execution_root: &Path,
+    ) -> Result<WriterAttemptRecord> {
         if !project_inspected_attested {
             bail!("Writer continuation requires an explicit project-inspection attestation");
         }
         validate_writer_prompt_digest(prompt_sha256)?;
         validate_public_conversation_id(conversation_id)?;
+        let primary_root = self.primary_project_root()?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Cannot start Writer continuation transaction")?;
         ensure_queue_not_paused(&transaction)?;
         let now = now_ms()?;
-        let unresolved: i64 = transaction.query_row(
-            "SELECT COUNT(*) FROM writer_attempts
-             WHERE state IN ('launching', 'running')
-                OR (state = 'unknown' AND operator_resolution IS NULL)",
-            [],
-            |row| row.get(0),
-        )?;
-        if unresolved != 0 {
-            bail!("An unresolved Writer attempt exists for this project");
-        }
         let task_status: Option<String> = transaction
             .query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
                 row.get(0)
@@ -3307,6 +3285,15 @@ impl Database {
         if task_status != TaskStatus::Blocked.as_str() {
             bail!("Task #{task_id} must be blocked after a failed Writer attempt to continue");
         }
+        validate_and_mark_writer_execution_target(
+            &transaction,
+            task_id,
+            owner_pid,
+            max_concurrent_writers,
+            now,
+            expected_execution_root,
+            &primary_root,
+        )?;
         let latest: Option<WriterAttemptRecord> = transaction
             .query_row(
                 "SELECT id, task_id, state, process_id, started_at_ms, finished_at_ms,
@@ -3362,6 +3349,7 @@ impl Database {
             ],
         )?;
         let attempt_id = transaction.last_insert_rowid();
+        insert_writer_execution_lease(&transaction, attempt_id, owner_pid, now)?;
         let attempt_data = serde_json::to_string(&serde_json::json!({
             "attempt_id": attempt_id,
             "source_attempt_id": source_attempt_id,
@@ -3494,6 +3482,10 @@ impl Database {
         if changed != 1 {
             bail!("Writer attempt #{attempt_id} changed while being finalized");
         }
+        transaction.execute(
+            "DELETE FROM writer_execution_leases WHERE attempt_id = ?1",
+            [attempt_id],
+        )?;
 
         let task_status: String =
             transaction.query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
@@ -3789,6 +3781,10 @@ impl Database {
             if changed != 1 {
                 bail!("Writer attempt #{attempt_id} changed during recovery");
             }
+            transaction.execute(
+                "DELETE FROM writer_execution_leases WHERE attempt_id = ?1",
+                [attempt_id],
+            )?;
 
             if task_status == TaskStatus::Implementing.as_str() {
                 let changed = transaction.execute(
@@ -3867,6 +3863,39 @@ impl Database {
             .query_map([task_id], map_writer_attempt_record)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(attempts)
+    }
+
+    pub fn active_writer_execution_leases(&self) -> Result<Vec<WriterExecutionLeaseRecord>> {
+        let mut statement = self.connection.prepare(
+            "SELECT leases.attempt_id, attempts.task_id, leases.owner_process_id
+             FROM writer_execution_leases AS leases
+             JOIN writer_attempts AS attempts ON attempts.id = leases.attempt_id
+             WHERE attempts.state IN ('launching', 'running')
+             ORDER BY leases.attempt_id",
+        )?;
+        let rows = statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        rows.into_iter()
+            .map(|(attempt_id, task_id, owner_process_id)| {
+                Ok(WriterExecutionLeaseRecord {
+                    attempt_id,
+                    task_id,
+                    owner_process_id: owner_process_id
+                        .map(|pid| {
+                            u32::try_from(pid)
+                                .context("Writer execution lease process ID is out of range")
+                        })
+                        .transpose()?,
+                })
+            })
+            .collect()
     }
 
     pub fn unresolved_writer_attempts(&self) -> Result<Vec<WriterAttemptRecord>> {
@@ -4545,6 +4574,25 @@ impl Database {
         now: i64,
         duration_ms: i64,
     ) -> Result<Option<SupervisorLease>> {
+        self.acquire_supervisor_lease_inner(owner_id, now, duration_ms, false)
+    }
+
+    pub fn acquire_recovery_supervisor_lease(
+        &mut self,
+        owner_id: &str,
+        now: i64,
+        duration_ms: i64,
+    ) -> Result<Option<SupervisorLease>> {
+        self.acquire_supervisor_lease_inner(owner_id, now, duration_ms, true)
+    }
+
+    fn acquire_supervisor_lease_inner(
+        &mut self,
+        owner_id: &str,
+        now: i64,
+        duration_ms: i64,
+        allow_active_writer_slots: bool,
+    ) -> Result<Option<SupervisorLease>> {
         if owner_id.trim().is_empty() || duration_ms <= 0 {
             bail!("Lease owner and a positive duration are required");
         }
@@ -4555,6 +4603,17 @@ impl Database {
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .context("Cannot start supervisor lease transaction")?;
+        if !allow_active_writer_slots {
+            let active_writers: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM writer_attempts WHERE state IN ('launching', 'running')",
+                [],
+                |row| row.get(0),
+            )?;
+            if active_writers != 0 {
+                transaction.commit()?;
+                return Ok(None);
+            }
+        }
         let current: Option<(String, i64, i64)> = transaction
             .query_row(
                 "SELECT owner_id, fencing_token, expires_at_ms FROM supervisor_lease WHERE singleton = 1",
@@ -5305,6 +5364,51 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .context("Cannot index task queue status")?;
         migrated_version = 17;
     }
+    if migrated_version == 17 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE writer_execution_leases (
+                     attempt_id INTEGER PRIMARY KEY REFERENCES writer_attempts(id) ON DELETE RESTRICT,
+                     owner_process_id INTEGER CHECK(owner_process_id IS NULL OR owner_process_id > 0),
+                     acquired_at_ms INTEGER NOT NULL
+                 );",
+            )
+            .context("Cannot add Writer execution leases")?;
+        let owner_id: Option<String> = transaction
+            .query_row(
+                "SELECT owner_id FROM supervisor_lease WHERE singleton = 1",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let active_attempt_ids = {
+            let mut statement = transaction.prepare(
+                "SELECT id FROM writer_attempts WHERE state IN ('launching', 'running') ORDER BY id",
+            )?;
+            statement
+                .query_map([], |row| row.get::<_, i64>(0))?
+                .collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        let owner_pid = if active_attempt_ids.len() == 1 {
+            owner_id
+                .as_deref()
+                .and_then(parse_supervisor_owner_process_id)
+        } else {
+            None
+        };
+        let acquired_at_ms = now_ms()?;
+        for attempt_id in active_attempt_ids {
+            transaction.execute(
+                "INSERT INTO writer_execution_leases (attempt_id, owner_process_id, acquired_at_ms)
+                 VALUES (?1, ?2, ?3)",
+                params![attempt_id, owner_pid.map(i64::from), acquired_at_ms],
+            )?;
+        }
+        transaction
+            .execute_batch("PRAGMA user_version = 18;")
+            .context("Cannot finalize Writer execution lease schema")?;
+        migrated_version = 18;
+    }
     if migrated_version != SCHEMA_VERSION {
         bail!("Cannot migrate database from unsupported schema version {migrated_version}");
     }
@@ -5313,6 +5417,270 @@ fn migrate(connection: &mut Connection) -> Result<()> {
         .commit()
         .context("Cannot commit database schema")?;
     Ok(())
+}
+
+fn validate_and_mark_writer_execution_target(
+    transaction: &rusqlite::Transaction<'_>,
+    task_id: i64,
+    owner_pid: u32,
+    max_concurrent_writers: usize,
+    now: i64,
+    expected_execution_root: &Path,
+    primary_project_root: &Path,
+) -> Result<()> {
+    if owner_pid == 0 {
+        bail!("Writer execution owner PID must be positive");
+    }
+    if !(1..=3).contains(&max_concurrent_writers) {
+        bail!("Maximum concurrent Writers must be between 1 and 3");
+    }
+
+    let active_supervisor_lease: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM supervisor_lease WHERE singleton = 1 AND expires_at_ms > ?1",
+        [now],
+        |row| row.get(0),
+    )?;
+    if active_supervisor_lease != 0 {
+        bail!("A project supervisor operation is active; Writer launch must wait");
+    }
+
+    let unresolved_unknown: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM writer_attempts
+         WHERE state = 'unknown' AND operator_resolution IS NULL",
+        [],
+        |row| row.get(0),
+    )?;
+    if unresolved_unknown != 0 {
+        bail!("An unresolved Writer outcome requires operator inspection before another launch");
+    }
+
+    let active_without_slot: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM writer_attempts AS attempts
+         WHERE attempts.state IN ('launching', 'running')
+           AND NOT EXISTS (
+               SELECT 1 FROM writer_execution_leases AS leases
+               WHERE leases.attempt_id = attempts.id
+           )",
+        [],
+        |row| row.get(0),
+    )?;
+    if active_without_slot != 0 {
+        bail!("An active Writer attempt has no durable execution lease; reconcile it first");
+    }
+
+    let inactive_with_slot: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM writer_execution_leases AS leases
+         JOIN writer_attempts AS attempts ON attempts.id = leases.attempt_id
+         WHERE attempts.state NOT IN ('launching', 'running')",
+        [],
+        |row| row.get(0),
+    )?;
+    if inactive_with_slot != 0 {
+        bail!("A resolved Writer attempt still owns an execution lease; reconcile it first");
+    }
+
+    let task_unresolved: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM writer_attempts
+         WHERE task_id = ?1
+           AND (state IN ('launching', 'running')
+                OR (state = 'unknown' AND operator_resolution IS NULL))",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    if task_unresolved != 0 {
+        bail!("Task #{task_id} already has an unresolved Writer attempt");
+    }
+
+    let worktree: Option<(String, String, Option<i64>)> = transaction
+        .query_row(
+            "SELECT state, worktree_path, writer_routed_at_ms
+             FROM task_worktrees WHERE task_id = ?1",
+            [task_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let integration_exists: bool = transaction.query_row(
+        "SELECT EXISTS(SELECT 1 FROM task_worktree_integrations WHERE task_id = ?1)",
+        [task_id],
+        |row| row.get(0),
+    )?;
+    let integration_state: Option<String> = transaction
+        .query_row(
+            "SELECT state FROM task_worktree_integrations WHERE task_id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if matches!(
+        integration_state.as_deref(),
+        Some("applying" | "needs_attention")
+    ) {
+        bail!(
+            "Task #{task_id} worktree integration needs reconciliation before another Writer can run"
+        );
+    }
+    let prior_attempt_count: i64 = transaction.query_row(
+        "SELECT COUNT(*) FROM writer_attempts WHERE task_id = ?1",
+        [task_id],
+        |row| row.get(0),
+    )?;
+
+    let mut target_worktree_path = None;
+    if let Some((state, worktree_path, routed_at_ms)) = worktree.as_ref() {
+        match state.as_str() {
+            "active" if !integration_exists => {
+                if routed_at_ms.is_some() {
+                    target_worktree_path = Some(worktree_path.clone());
+                } else if prior_attempt_count == 0 {
+                    let task_status: Option<String> = transaction
+                        .query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                            row.get(0)
+                        })
+                        .optional()?;
+                    if task_status.as_deref() != Some(TaskStatus::Queued.as_str()) {
+                        bail!(
+                            "Task #{task_id} must be queued before its first Writer worktree route"
+                        );
+                    }
+                    let changed = transaction.execute(
+                        "UPDATE task_worktrees SET writer_routed_at_ms = ?1, updated_at_ms = ?1
+                         WHERE task_id = ?2 AND state = 'active' AND writer_routed_at_ms IS NULL",
+                        params![now, task_id],
+                    )?;
+                    if changed != 1 {
+                        bail!(
+                            "Task #{task_id} worktree route changed while creating its first Writer attempt"
+                        );
+                    }
+                    transaction.execute(
+                        "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+                         VALUES (?1, ?2, 'talos', 'task.worktree_writer_routed', 'The first Writer attempt was routed to the active task worktree', '{}')",
+                        params![task_id, now],
+                    )?;
+                    target_worktree_path = Some(worktree_path.clone());
+                }
+            }
+            "active" | "retired" => {}
+            _ => bail!(
+                "Task #{task_id} has a managed worktree in state {state}; reconcile or inspect it before running a Writer"
+            ),
+        }
+        if state == "retired" && integration_exists {
+            bail!(
+                "Task #{task_id} has integration history for its retired worktree and requires reconciliation"
+            );
+        }
+    }
+
+    let active_leases = {
+        let mut statement = transaction.prepare(
+            "SELECT attempts.id, attempts.task_id, worktrees.state, worktrees.worktree_path,
+                    worktrees.writer_routed_at_ms,
+                    EXISTS(SELECT 1 FROM task_worktree_integrations AS integrations
+                           WHERE integrations.task_id = attempts.task_id)
+             FROM writer_execution_leases AS leases
+             JOIN writer_attempts AS attempts ON attempts.id = leases.attempt_id
+             LEFT JOIN task_worktrees AS worktrees ON worktrees.task_id = attempts.task_id
+             WHERE attempts.state IN ('launching', 'running')
+             ORDER BY attempts.id",
+        )?;
+        statement
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, Option<String>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, bool>(5)?,
+                ))
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?
+    };
+
+    let max_concurrent = i64::try_from(max_concurrent_writers)
+        .context("Maximum concurrent Writer count is outside the supported range")?;
+    if i64::try_from(active_leases.len())? >= max_concurrent {
+        bail!(
+            "The configured maximum of {max_concurrent_writers} concurrent Writers is already active"
+        );
+    }
+    if !active_leases.is_empty() && target_worktree_path.is_none() {
+        bail!("A primary-tree Writer cannot overlap another active Writer");
+    }
+
+    let mut active_worktree_paths = Vec::with_capacity(active_leases.len() + 1);
+    for (active_attempt_id, active_task_id, state, path, routed_at_ms, has_integration) in
+        &active_leases
+    {
+        let Some(path) = path.as_ref() else {
+            bail!(
+                "Active Writer attempt #{active_attempt_id} is not assigned to a managed worktree"
+            );
+        };
+        if state.as_deref() != Some("active") || routed_at_ms.is_none() || *has_integration {
+            bail!(
+                "Active Writer attempt #{active_attempt_id} is not isolated in an active routed worktree"
+            );
+        }
+        if *active_task_id == task_id || active_worktree_paths.contains(path) {
+            bail!("Active Writers must use distinct managed worktrees and tasks");
+        }
+        active_worktree_paths.push(path.clone());
+    }
+    if let Some(path) = target_worktree_path.as_deref()
+        && active_worktree_paths
+            .iter()
+            .any(|active_path| active_path.as_str() == path)
+    {
+        bail!("Task #{task_id} worktree is already used by another active Writer");
+    }
+    let expected_target_root = target_worktree_path
+        .as_deref()
+        .map(Path::new)
+        .unwrap_or(primary_project_root);
+    if expected_execution_root != expected_target_root {
+        bail!(
+            "Task #{task_id} execution worktree changed before the Writer attempt was claimed; resolve the current task worktree and retry"
+        );
+    }
+    Ok(())
+}
+
+fn insert_writer_execution_lease(
+    transaction: &rusqlite::Transaction<'_>,
+    attempt_id: i64,
+    owner_pid: u32,
+    acquired_at_ms: i64,
+) -> Result<()> {
+    if owner_pid == 0 {
+        bail!("Writer execution owner PID must be positive");
+    }
+    transaction.execute(
+        "INSERT INTO writer_execution_leases (attempt_id, owner_process_id, acquired_at_ms)
+         VALUES (?1, ?2, ?3)",
+        params![attempt_id, i64::from(owner_pid), acquired_at_ms],
+    )?;
+    Ok(())
+}
+
+fn parse_supervisor_owner_process_id(owner_id: &str) -> Option<u32> {
+    let parts = owner_id.split('-').collect::<Vec<_>>();
+    if parts.len() < 5
+        || parts[0] != "talos"
+        || !matches!(parts[1], "task" | "worktree")
+        || parts[2..parts.len() - 2].iter().any(|part| {
+            part.is_empty()
+                || !part
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+        })
+    {
+        return None;
+    }
+    let pid = parts[parts.len() - 2].parse::<u32>().ok()?;
+    let timestamp = parts[parts.len() - 1].parse::<i64>().ok()?;
+    (pid > 0 && timestamp > 0).then_some(pid)
 }
 
 fn validate_lease_in_transaction(
@@ -6103,7 +6471,7 @@ mod tests {
     fn recovery_lease(database: &mut Database, owner_id: &str) -> super::SupervisorLease {
         let now = super::now_ms().expect("read current time");
         database
-            .acquire_supervisor_lease(owner_id, now, 60_000)
+            .acquire_recovery_supervisor_lease(owner_id, now, 60_000)
             .expect("acquire recovery lease")
             .expect("recovery lease is available")
     }
@@ -6190,7 +6558,7 @@ mod tests {
     fn initialization_is_idempotent_and_uses_wal() {
         let project = temp_project();
         let first = Database::open(&project).expect("initialize database");
-        assert_eq!(first.schema_version().expect("read schema version"), 16);
+        assert_eq!(first.schema_version().expect("read schema version"), 18);
         assert_eq!(
             first
                 .journal_mode()
@@ -6201,7 +6569,7 @@ mod tests {
         drop(first);
 
         let second = Database::open(&project).expect("open database again");
-        assert_eq!(second.schema_version().expect("read schema version"), 16);
+        assert_eq!(second.schema_version().expect("read schema version"), 18);
         drop(second);
         cleanup(&project);
     }
@@ -6228,7 +6596,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema-v5 duration fields");
-        assert_eq!(migrated.schema_version().unwrap(), 16);
+        assert_eq!(migrated.schema_version().unwrap(), 18);
         let columns: (i64, i64) = migrated
             .connection
             .query_row(
@@ -6267,7 +6635,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v6");
-        assert_eq!(migrated.schema_version().unwrap(), 16);
+        assert_eq!(migrated.schema_version().unwrap(), 18);
         assert_eq!(migrated.list_tasks().unwrap()[0].id, task.id);
         assert!(!migrated.project_control_state().unwrap().queue_paused);
         cleanup(&project);
@@ -6292,7 +6660,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v7");
-        assert_eq!(migrated.schema_version().unwrap(), 16);
+        assert_eq!(migrated.schema_version().unwrap(), 18);
         assert_eq!(
             migrated
                 .project_control_state()
@@ -6321,7 +6689,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v8");
-        assert_eq!(migrated.schema_version().unwrap(), 16);
+        assert_eq!(migrated.schema_version().unwrap(), 18);
         assert!(
             migrated
                 .writer_attempts(None)
@@ -6349,7 +6717,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v9");
-        assert_eq!(migrated.schema_version().unwrap(), 16);
+        assert_eq!(migrated.schema_version().unwrap(), 18);
         let dependencies_table_exists: bool = migrated
             .connection
             .query_row(
@@ -6378,7 +6746,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v10");
-        assert_eq!(migrated.schema_version().unwrap(), 16);
+        assert_eq!(migrated.schema_version().unwrap(), 18);
         let contracts_table_exists: bool = migrated
             .connection
             .query_row(
@@ -6736,7 +7104,7 @@ mod tests {
         drop(database);
 
         let mut migrated = Database::open(&project).expect("migrate the v4 approval");
-        assert_eq!(migrated.schema_version().unwrap(), 16);
+        assert_eq!(migrated.schema_version().unwrap(), 18);
         assert_eq!(
             migrated.list_tasks().unwrap()[0].status,
             TaskStatus::Reviewing
@@ -6920,7 +7288,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate existing database");
-        assert_eq!(database.schema_version().expect("read schema version"), 16);
+        assert_eq!(database.schema_version().expect("read schema version"), 18);
         let tasks = database.list_tasks().expect("read preserved tasks");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Existing v1 task");
@@ -7216,7 +7584,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate v2 database");
-        assert_eq!(database.schema_version().expect("read schema version"), 16);
+        assert_eq!(database.schema_version().expect("read schema version"), 18);
         assert!(
             database
                 .has_unresolved_writer_attempts()

@@ -31,7 +31,8 @@ use crate::{
     secrets::{contains_sensitive, redact_sensitive},
     supervisor::{
         VERIFIED_AGY_CRITIC_VERSION, VERIFIED_AGY_WRITE_VERSION, WriterContinuation,
-        continue_writer_attempt, run_critic_review, run_writer_attempt, validate_project_scope,
+        continue_writer_attempt_with_limit, run_critic_review, run_writer_attempt_with_limit,
+        validate_project_scope,
     },
     tmux::{TmuxClient, TmuxProbe},
     worktree,
@@ -1921,7 +1922,7 @@ fn ensure_execution_root_current(
     let current = worktree::execution_project(&primary_project, database, task_id)?;
     if current.root != execution_project.root {
         bail!(
-            "Task #{task_id} execution worktree changed before the operation acquired its supervisor lease; retry after inspecting the task worktree"
+            "Task #{task_id} execution worktree changed before the Writer attempt was claimed; retry after inspecting the task worktree"
         );
     }
     Ok(())
@@ -2671,51 +2672,31 @@ async fn execute_writer_task(
     let executable = probe
         .executable
         .context("Antigravity executable path is unavailable")?;
-    let now = now_ms()?;
-    let operation = if continuation.is_some() {
-        "continue"
+    ensure_execution_root_current(project, database, task_id)?;
+    if let Some(continuation) = continuation {
+        continue_writer_attempt_with_limit(
+            project,
+            database,
+            task_id,
+            executable,
+            &version,
+            WRITER_TIMEOUT,
+            continuation,
+            config.max_concurrent_writers,
+        )
+        .await
     } else {
-        "run"
-    };
-    let owner_id = format!("talos-task-{operation}-{}-{now}", std::process::id());
-    let lease_duration_ms = i64::try_from(SUPERVISOR_LEASE.as_millis())
-        .context("Supervisor lease duration is out of range")?;
-    let lease = database
-        .acquire_supervisor_lease(&owner_id, now, lease_duration_ms)?
-        .context("Another TALOS supervisor currently owns the project lease")?;
-
-    let execution = async {
-        ensure_execution_root_current(project, database, task_id)?;
-        database.mark_task_worktree_writer_routed(task_id)?;
-        if let Some(continuation) = continuation {
-            continue_writer_attempt(
-                project,
-                database,
-                task_id,
-                executable,
-                &version,
-                WRITER_TIMEOUT,
-                continuation,
-            )
-            .await
-        } else {
-            run_writer_attempt(
-                project,
-                database,
-                task_id,
-                executable,
-                &version,
-                WRITER_TIMEOUT,
-            )
-            .await
-        }
+        run_writer_attempt_with_limit(
+            project,
+            database,
+            task_id,
+            executable,
+            &version,
+            WRITER_TIMEOUT,
+            config.max_concurrent_writers,
+        )
+        .await
     }
-    .await;
-    let lease_released = database.release_supervisor_lease(&lease)?;
-    if !lease_released {
-        bail!("TALOS lost its supervisor lease while running the Writer");
-    }
-    execution
 }
 
 fn print_critic_report(
@@ -3231,7 +3212,29 @@ fn recover_writer_attempts(json_output: bool, database: &mut Database) -> Result
         .context("Supervisor lease duration is out of range")?;
     let lease = acquire_recovery_lease(database, &owner_id, now, lease_duration_ms)?;
 
-    let quarantine_result = database.quarantine_unfinished_writer_attempts(&lease);
+    let quarantine_result = (|| {
+        let active_writer_leases = database.active_writer_execution_leases()?;
+        #[cfg(unix)]
+        for writer_lease in &active_writer_leases {
+            let owner_process_id = writer_lease.owner_process_id.context(
+                "An active Writer lease has no owner PID; recovery cannot prove that it stopped",
+            )?;
+            if process_id_is_alive(owner_process_id)? {
+                bail!(
+                    "Writer attempt #{} is owned by live TALOS process {}; recovery will not quarantine it",
+                    writer_lease.attempt_id,
+                    owner_process_id
+                );
+            }
+        }
+        #[cfg(not(unix))]
+        if !active_writer_leases.is_empty() {
+            bail!(
+                "This platform cannot verify active Writer owner processes; recovery remains fail-closed"
+            );
+        }
+        database.quarantine_unfinished_writer_attempts(&lease)
+    })();
     let lease_released = database.release_supervisor_lease(&lease)?;
     if !lease_released {
         bail!("TALOS lost its supervisor lease during Writer recovery");
@@ -3298,7 +3301,7 @@ fn recover_writer_attempts(json_output: bool, database: &mut Database) -> Result
             );
         }
         println!(
-            "Process identity is lifecycle evidence only and does not establish a Writer outcome. An unresolved Writer may still be running or may have changed project files. TALOS did not inspect or signal processes, resume a conversation, or retry an attempt. Inspect process and project state before deciding how to proceed."
+            "Owner PID liveness was checked before quarantine, but process identity remains lifecycle evidence only and does not establish a Writer outcome. An unresolved Writer may still have changed project files. TALOS did not signal processes, resume a conversation, or retry an attempt. Inspect process and project state before deciding how to proceed."
         );
     }
     Ok(())
@@ -3310,7 +3313,7 @@ fn acquire_recovery_lease(
     now: i64,
     duration_ms: i64,
 ) -> Result<crate::db::SupervisorLease> {
-    if let Some(lease) = database.acquire_supervisor_lease(owner_id, now, duration_ms)? {
+    if let Some(lease) = database.acquire_recovery_supervisor_lease(owner_id, now, duration_ms)? {
         return Ok(lease);
     }
 
@@ -3330,7 +3333,7 @@ fn acquire_recovery_lease(
             bail!("The supervisor lease changed while checking its owner; retry recovery");
         }
         database
-            .acquire_supervisor_lease(owner_id, now, duration_ms)?
+            .acquire_recovery_supervisor_lease(owner_id, now, duration_ms)?
             .context("Another TALOS supervisor acquired the project lease during recovery")
     }
 
@@ -3764,22 +3767,22 @@ mod tests {
     }
 
     #[test]
-    fn recovery_requires_the_supervisor_lease() {
+    fn recovery_refuses_a_live_writer_owner_and_blocks_supervisor_operations() {
         let project = temp_project();
         let mut database = Database::open(&project).expect("initialize database");
         let task = database
             .add_task("Do not recover under another owner", "")
             .expect("add task");
-        let attempt = database
+        let _attempt = database
             .begin_writer_attempt(task.id, &"56".repeat(32))
             .expect("begin Writer attempt");
         let now = now_ms().expect("read current time");
         let lease_duration_ms = i64::try_from(SUPERVISOR_LEASE.as_millis())
             .expect("lease duration fits in SQLite integer");
-        let held_lease = database
+        let blocked_lease = database
             .acquire_supervisor_lease("another-supervisor", now, lease_duration_ms)
-            .expect("acquire competing lease")
-            .expect("competing owner gets lease");
+            .expect("inspect competing lease");
+        assert!(blocked_lease.is_none());
 
         assert!(recover_writer_attempts(false, &mut database).is_err());
         assert_eq!(
@@ -3794,21 +3797,6 @@ mod tests {
             TaskStatus::Implementing
         );
 
-        assert!(
-            database
-                .release_supervisor_lease(&held_lease)
-                .expect("release competing lease")
-        );
-        recover_writer_attempts(false, &mut database).expect("recover after lease release");
-        let recovered = database
-            .writer_attempts(Some(task.id))
-            .expect("read quarantined attempt");
-        assert_eq!(recovered[0].id, attempt.id);
-        assert_eq!(recovered[0].state, "unknown");
-        assert_eq!(
-            database.list_tasks().expect("read recovered task")[0].status,
-            TaskStatus::Blocked
-        );
         fs::remove_dir_all(&project.root).expect("remove temporary project");
     }
 
@@ -3848,7 +3836,7 @@ mod tests {
         let lease_duration_ms = i64::try_from(SUPERVISOR_LEASE.as_millis())
             .expect("lease duration fits in SQLite integer");
         let lease = database
-            .acquire_supervisor_lease(owner, now, lease_duration_ms)
+            .acquire_recovery_supervisor_lease(owner, now, lease_duration_ms)
             .expect("acquire preparation lease")
             .expect("preparation lease is available");
         database

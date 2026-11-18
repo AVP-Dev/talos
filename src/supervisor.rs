@@ -148,6 +148,29 @@ pub async fn run_writer_attempt(
         agy_version,
         timeout,
         None,
+        1,
+    )
+    .await
+}
+
+pub async fn run_writer_attempt_with_limit(
+    project: &Project,
+    database: &mut Database,
+    task_id: i64,
+    executable: PathBuf,
+    agy_version: &str,
+    timeout: Duration,
+    max_concurrent_writers: usize,
+) -> Result<WriterExecutionReport> {
+    run_writer_attempt_inner(
+        project,
+        database,
+        task_id,
+        executable,
+        agy_version,
+        timeout,
+        None,
+        max_concurrent_writers,
     )
     .await
 }
@@ -169,6 +192,30 @@ pub async fn continue_writer_attempt(
         agy_version,
         timeout,
         Some(continuation),
+        1,
+    )
+    .await
+}
+
+pub async fn continue_writer_attempt_with_limit(
+    project: &Project,
+    database: &mut Database,
+    task_id: i64,
+    executable: PathBuf,
+    agy_version: &str,
+    timeout: Duration,
+    continuation: WriterContinuation,
+    max_concurrent_writers: usize,
+) -> Result<WriterExecutionReport> {
+    run_writer_attempt_inner(
+        project,
+        database,
+        task_id,
+        executable,
+        agy_version,
+        timeout,
+        Some(continuation),
+        max_concurrent_writers,
     )
     .await
 }
@@ -337,16 +384,15 @@ async fn run_writer_attempt_inner(
     agy_version: &str,
     timeout: Duration,
     continuation: Option<WriterContinuation>,
+    max_concurrent_writers: usize,
 ) -> Result<WriterExecutionReport> {
     if agy_version != VERIFIED_AGY_WRITE_VERSION {
         bail!(
             "Safe unattended writes were verified for Antigravity {VERIFIED_AGY_WRITE_VERSION}; installed version {agy_version} requires a new disposable-project boundary probe"
         );
     }
-    if database.has_unresolved_writer_attempts()? {
-        bail!(
-            "An unresolved Writer attempt exists. TALOS will not start another task until the attempt is reconciled."
-        );
+    if !(1..=3).contains(&max_concurrent_writers) {
+        bail!("max_concurrent_writers must be between 1 and 3");
     }
     let task = database
         .get_task(task_id)?
@@ -417,15 +463,24 @@ async fn run_writer_attempt_inner(
     };
     let prompt_sha256 = encode_lower_hex(&Sha256::digest(prompt.as_bytes()));
     let attempt = if let Some(continuation) = &continuation {
-        database.begin_writer_continuation(
+        database.begin_writer_continuation_for_root(
             task.id,
             &prompt_sha256,
             continuation.source_attempt_id,
             &continuation.conversation_id,
             continuation.project_inspected_attested,
+            std::process::id(),
+            max_concurrent_writers,
+            project.root.as_path(),
         )?
     } else {
-        database.begin_writer_attempt(task.id, &prompt_sha256)?
+        database.begin_writer_attempt_for_root(
+            task.id,
+            &prompt_sha256,
+            std::process::id(),
+            max_concurrent_writers,
+            project.root.as_path(),
+        )?
     };
     if let Some(base_revision) = initial_base_revision {
         database.record_writer_base_revision(attempt.id, &base_revision)?;
