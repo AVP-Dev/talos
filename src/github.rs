@@ -563,10 +563,9 @@ fn parse_github_remote_identity(url: &str) -> Option<String> {
         ("github.com", path)
     } else if let Some(rest) = url.strip_prefix("ssh://git@github.com/") {
         ("github.com", rest)
-    } else if let Some(rest) = url.strip_prefix("ssh://github.com/") {
-        ("github.com", rest)
     } else {
-        return None;
+        let rest = url.strip_prefix("ssh://github.com/")?;
+        ("github.com", rest)
     };
     if host != "github.com"
         || path.contains(['?', '#', '\\'])
