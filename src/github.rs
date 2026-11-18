@@ -400,14 +400,7 @@ pub async fn find_matching_open_pull_request(
     {
         return PullRequestInspection::OtherOrAmbiguous;
     }
-    let prefix = format!("https://github.com/{repository}/pull/");
-    let Some(suffix) = result.url.strip_prefix(&prefix) else {
-        return PullRequestInspection::OtherOrAmbiguous;
-    };
-    if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
-        return PullRequestInspection::OtherOrAmbiguous;
-    }
-    let Ok(number) = suffix.parse::<u32>() else {
+    let Some(number) = parse_repository_pull_request_url(&result.url, repository) else {
         return PullRequestInspection::OtherOrAmbiguous;
     };
     if number == result.number && number > 0 {
@@ -429,7 +422,13 @@ pub async fn push_process_result(
     let destination = format!("{head_commit}:refs/heads/{branch}");
     match run_bounded_command(
         "git",
-        &["push", "--porcelain", remote, &destination],
+        &[
+            "push",
+            "--porcelain",
+            "--no-follow-tags",
+            remote,
+            &destination,
+        ],
         Some(project_root),
         NETWORK_WRITE_TIMEOUT,
         true,
@@ -575,21 +574,30 @@ fn parse_ls_remote(stdout: &[u8], expected_ref: &str) -> Result<Option<String>> 
 
 fn parse_pull_request_url(stdout: &[u8], repository: &str) -> Option<(u32, String)> {
     let output = std::str::from_utf8(stdout).ok()?;
-    let prefix = format!("https://github.com/{repository}/pull/");
     for token in output.split_whitespace() {
         let url = token.trim_matches(|character: char| "()[]<>.,;\"'".contains(character));
-        let Some(suffix) = url.strip_prefix(&prefix) else {
-            continue;
-        };
-        if suffix.is_empty() || !suffix.bytes().all(|byte| byte.is_ascii_digit()) {
-            continue;
-        }
-        let number = suffix.parse().ok()?;
-        if number > 0 {
+        if let Some(number) = parse_repository_pull_request_url(url, repository) {
             return Some((number, url.to_owned()));
         }
     }
     None
+}
+
+fn parse_repository_pull_request_url(url: &str, repository: &str) -> Option<u32> {
+    let rest = url.strip_prefix("https://")?;
+    let (host, path) = rest.split_once('/')?;
+    if !host.eq_ignore_ascii_case("github.com") {
+        return None;
+    }
+    let (url_repository, number) = path.split_once("/pull/")?;
+    if !url_repository.eq_ignore_ascii_case(repository)
+        || number.is_empty()
+        || !number.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    let number = number.parse::<u32>().ok()?;
+    (number > 0).then_some(number)
 }
 
 async fn capture_bounded<R: AsyncRead + Unpin>(reader: Option<R>) -> io::Result<(Vec<u8>, bool)> {
