@@ -1,10 +1,20 @@
 use std::{
     env,
+    io::{self, Read},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Output, Stdio},
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    thread,
+    time::{Duration, Instant},
 };
 
 use serde::Serialize;
+
+const MAX_PROBE_OUTPUT_BYTES: usize = 64 * 1024;
+const PROBE_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Clone, Copy, Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -112,16 +122,14 @@ impl AgyProbe {
             }
         };
 
-        let help = format!(
-            "{}\n{}",
-            String::from_utf8_lossy(&help_output.stdout),
-            String::from_utf8_lossy(&help_output.stderr)
-        );
         Self {
             status: ProbeStatus::Available,
             executable: Some(executable),
             version,
-            capabilities: parse_capabilities(&help),
+            capabilities: parse_capabilities_streams(
+                &help_output.stdout,
+                &help_output.stderr,
+            ),
             note: Some(
                 "Advertised CLI flags are based on local help output. Native subagent invocation remains not tested until the configured agent roster and a harmless live delegation are verified. This probe does not evaluate session-specific file permissions; explicit writes are enabled only for the Agy version covered by TALOS's disposable-project boundary probe.".to_owned(),
             ),
@@ -130,25 +138,44 @@ impl AgyProbe {
 }
 
 fn parse_capabilities(help: &str) -> AgyCapabilities {
-    let help = help.to_ascii_lowercase();
+    parse_capabilities_streams(help.as_bytes(), &[])
+}
+
+fn parse_capabilities_streams(stdout: &[u8], stderr: &[u8]) -> AgyCapabilities {
     AgyCapabilities {
-        headless_print: state_for(help.contains("--print") || help.contains("-p ")),
+        headless_print: state_for(
+            probe_output_contains(stdout, stderr, "--print")
+                || probe_output_contains(stdout, stderr, "-p "),
+        ),
         structured_json_output: state_for(
-            help.contains("--output-format") && help.contains("json"),
+            probe_output_contains(stdout, stderr, "--output-format")
+                && probe_output_contains(stdout, stderr, "json"),
         ),
         public_session_resume: state_for(
-            help.contains("--conversation") || help.contains("--continue"),
+            probe_output_contains(stdout, stderr, "--conversation")
+                || probe_output_contains(stdout, stderr, "--continue"),
         ),
-        terminal_sandbox: state_for(help.contains("--sandbox")),
-        auto_mode: state_for(help.contains("--mode") && help.contains("auto")),
+        terminal_sandbox: state_for(probe_output_contains(stdout, stderr, "--sandbox")),
+        auto_mode: state_for(
+            probe_output_contains(stdout, stderr, "--mode")
+                && probe_output_contains(stdout, stderr, "auto"),
+        ),
         filesystem_write_scope: CapabilityState::NotTested,
         safe_unattended_write: CapabilityState::NotTested,
-        native_subagents: if help.contains("invoke_subagent") {
+        native_subagents: if probe_output_contains(stdout, stderr, "invoke_subagent") {
             CapabilityState::Advertised
         } else {
             CapabilityState::NotTested
         },
     }
+}
+
+fn probe_output_contains(stdout: &[u8], stderr: &[u8], needle: &str) -> bool {
+    [stdout, stderr].into_iter().any(|output| {
+        output
+            .windows(needle.len())
+            .any(|window| window.eq_ignore_ascii_case(needle.as_bytes()))
+    })
 }
 
 fn state_for(advertised: bool) -> CapabilityState {
@@ -182,29 +209,143 @@ fn failed_probe(executable: PathBuf, message: &str) -> AgyProbe {
     }
 }
 
-fn run_probe(
-    executable: &Path,
-    argument: &str,
-    project_root: &Path,
-) -> std::io::Result<std::process::Output> {
-    Command::new(executable)
+fn run_probe(executable: &Path, argument: &str, project_root: &Path) -> io::Result<Output> {
+    let mut child = Command::new(executable)
         .arg(argument)
         .current_dir(project_root)
-        .output()
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let Some(stdout) = child.stdout.take() else {
+        stop_probe_child(&mut child);
+        return Err(io::Error::other("Agy probe stdout was not piped"));
+    };
+    let Some(stderr) = child.stderr.take() else {
+        stop_probe_child(&mut child);
+        return Err(io::Error::other("Agy probe stderr was not piped"));
+    };
+
+    let stop_capture = Arc::new(AtomicBool::new(false));
+    let output_exceeded = Arc::new(AtomicBool::new(false));
+    let stdout_reader = spawn_probe_capture(
+        stdout,
+        Arc::clone(&stop_capture),
+        Arc::clone(&output_exceeded),
+    );
+    let stderr_reader = spawn_probe_capture(
+        stderr,
+        Arc::clone(&stop_capture),
+        Arc::clone(&output_exceeded),
+    );
+    let started = Instant::now();
+    let status = loop {
+        if stop_capture.load(Ordering::Acquire) {
+            stop_probe_child(&mut child);
+            let stdout_result = join_probe_capture(stdout_reader);
+            let stderr_result = join_probe_capture(stderr_reader);
+            stdout_result?;
+            stderr_result?;
+            if output_exceeded.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("Agy probe output exceeds the {MAX_PROBE_OUTPUT_BYTES}-byte limit"),
+                ));
+            }
+            return Err(io::Error::other("Cannot read Agy probe output"));
+        }
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < PROBE_TIMEOUT => {
+                thread::sleep(Duration::from_millis(10));
+            }
+            Ok(None) => {
+                stop_probe_child(&mut child);
+                let _ = join_probe_capture(stdout_reader);
+                let _ = join_probe_capture(stderr_reader);
+                return Err(io::Error::new(
+                    io::ErrorKind::TimedOut,
+                    "Agy probe exceeded its time limit",
+                ));
+            }
+            Err(error) => {
+                stop_probe_child(&mut child);
+                let _ = join_probe_capture(stdout_reader);
+                let _ = join_probe_capture(stderr_reader);
+                return Err(error);
+            }
+        }
+    };
+    let stdout_result = join_probe_capture(stdout_reader);
+    let stderr_result = join_probe_capture(stderr_reader);
+    let stdout = stdout_result?;
+    let stderr = stderr_result?;
+    if output_exceeded.load(Ordering::Acquire) {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("Agy probe output exceeds the {MAX_PROBE_OUTPUT_BYTES}-byte limit"),
+        ));
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
+}
+
+fn spawn_probe_capture<R>(
+    reader: R,
+    stop_capture: Arc<AtomicBool>,
+    output_exceeded: Arc<AtomicBool>,
+) -> thread::JoinHandle<io::Result<Vec<u8>>>
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut reader = reader;
+        let mut captured = Vec::with_capacity(MAX_PROBE_OUTPUT_BYTES);
+        let mut buffer = [0_u8; 8 * 1024];
+        loop {
+            let bytes_read = match reader.read(&mut buffer) {
+                Ok(bytes_read) => bytes_read,
+                Err(error) => {
+                    stop_capture.store(true, Ordering::Release);
+                    return Err(error);
+                }
+            };
+            if bytes_read == 0 {
+                return Ok(captured);
+            }
+            if bytes_read > MAX_PROBE_OUTPUT_BYTES.saturating_sub(captured.len()) {
+                output_exceeded.store(true, Ordering::Release);
+                stop_capture.store(true, Ordering::Release);
+                return Ok(captured);
+            }
+            captured.extend_from_slice(&buffer[..bytes_read]);
+        }
+    })
+}
+
+fn join_probe_capture(reader: thread::JoinHandle<io::Result<Vec<u8>>>) -> io::Result<Vec<u8>> {
+    reader
+        .join()
+        .map_err(|_| io::Error::other("Agy probe output reader stopped unexpectedly"))?
+}
+
+fn stop_probe_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 fn first_line(stdout: &[u8], stderr: &[u8]) -> Option<String> {
-    [stdout, stderr]
-        .into_iter()
-        .flat_map(|bytes| {
-            String::from_utf8_lossy(bytes)
-                .lines()
-                .map(str::to_owned)
-                .collect::<Vec<_>>()
-        })
-        .map(|line| line.trim().to_owned())
-        .find(|line| !line.is_empty())
-        .map(|line| line.chars().take(160).collect())
+    for bytes in [stdout, stderr] {
+        if let Some(line) = String::from_utf8_lossy(bytes)
+            .lines()
+            .find(|line| !line.trim().is_empty())
+        {
+            return Some(line.trim().chars().take(160).collect());
+        }
+    }
+    None
 }
 
 fn find_executable(name: &str) -> Option<PathBuf> {
