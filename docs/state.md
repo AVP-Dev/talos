@@ -355,7 +355,8 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - Set `rust-version = "1.94"` in `Cargo.toml`; the installed compiler is Rust 1.94.0. An exact `rust-toolchain.toml` pin was removed because rustup tried to sync into the sandbox-protected `~/.rustup` directory. Cargo works with the existing installed toolchain.
 - The macOS package script records the inputs needed to compare builds. One native ARM64 artifact now exists, but byte-for-byte reproducibility has not been checked. The binary was not run, and Cargo install/update/uninstall behavior was not exercised. Linux artifacts wait for T6.5/T9.3 acceptance.
 - Script syntax, formatting, Clippy, `cargo check`, and `git diff --check` passed. Automated tests and Linux-native checks were not run.
-- Packaging the new T6.6 commit first exited with status 141 before compilation: `awk` stopped reading `rustc -vV` early under `pipefail`. The host extraction now reads the full output; the fixed script has not yet been rerun.
+- The first packaging attempt after T6.6 exited with status 141 before compilation because `awk` stopped reading `rustc -vV` under `pipefail`; the committed fix and successful rerun are recorded below.
+- Fixed the host-extraction pipeline and committed it locally as `fb2b4d3` (`fix: handle rustc host output under pipefail`). The package script then completed from commit `fb2b4d323c2f` and created `dist/talos-v0.1.0-aarch64-apple-darwin-fb2b4d323c2f/` (4.6 MiB binary). `shasum -a 256 -c SHA256SUMS` passed for `talos`, `README.md`, and `BUILD-INFO.txt`. The binary was not run; the artifact is unsigned and not notarized.
 
 ## R6.6 progress — compact task handoff
 
@@ -367,7 +368,7 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 
 ## Next action
 
-Commit the package script's pipefail fix locally, then regenerate the ARM64 macOS artifact from the T6.6 source so it includes `task handoff`. Continue remaining R9.3 installation/package preparation. Keep behavior/migration tests, fault injection, install/uninstall acceptance, byte-for-byte reproducibility, GitHub live acceptance, and Linux-native acceptance pending. R8 code is locally implemented; live CLI and remote acceptance await a user-provided repository. T6.6 is committed as `8bd5b49`; T8.2 commits are `efaaa75` and `8728ce4`; T8.3 is `877ae10`; T8.4 is `6c6ba78`; previous macOS artifact prep is `9fafb4c`/`ea73675`. Do not create a repository, add a remote, or invoke GitHub operations. Skip Linux connection/setup and defer Linux-native checks/artifacts until the server is available. Keep all work local on `master`.
+Continue remaining R9.3 installation preparation and review R9.5 release reproducibility requirements. Current source/artifact commit is `fb2b4d3`; T6.6 is `8bd5b49`; T8.2 commits are `efaaa75` and `8728ce4`; T8.3 is `877ae10`; T8.4 is `6c6ba78`; earlier macOS artifact prep is `9fafb4c`/`ea73675`. Install/uninstall acceptance, byte-for-byte reproducibility, binary smoke, behavior/migration tests, fault injection, GitHub live acceptance, and Linux-native acceptance remain pending. R8 code is locally implemented; live CLI and remote acceptance await a user-provided repository. Do not create a repository, add a remote, or invoke GitHub operations. Skip Linux connection/setup and defer Linux-native checks/artifacts until the server is available. Keep all work local on `master`.
 
 ## Session close checklist
 
