@@ -19,9 +19,9 @@ use ratatui::{
     Frame, Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout, Rect},
-    style::{Color, Modifier, Style},
+    style::{Color, Modifier, Style, Stylize},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap},
 };
 use std::os::unix::fs::OpenOptionsExt;
 use unicode_segmentation::UnicodeSegmentation;
@@ -36,7 +36,7 @@ use crate::{
     config::{OrchestrationMode, ProjectConfig},
     db::{
         COCKPIT_CANCELLED_REASON, CriticReviewRecord, Database, QueueSummary, RecentTask,
-        StopRequestOutcome, TaskEvent, TaskRecord, TaskStatus, TaskWorktreeRecord,
+        StopRequestOutcome, TaskEvent, TaskRecord, TaskStatus,
     },
     project::{DiscoveryMethod, Project},
     tmux::{TmuxClient, project_session_name},
@@ -44,29 +44,34 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActiveTab {
-    Feed = 0,
+    Work = 0,
     Dialogue = 1,
     Diff = 2,
-    Audit = 3,
+    Logs = 3,
+    History = 4,
 }
 
 impl ActiveTab {
+    const ALL: [Self; 5] = [
+        Self::Work,
+        Self::Dialogue,
+        Self::Diff,
+        Self::Logs,
+        Self::History,
+    ];
+
     pub fn title(self) -> &'static str {
         match self {
-            Self::Feed => " 1: Unified Feed ",
-            Self::Dialogue => " 2: Dialogue & Review ",
-            Self::Diff => " 3: Git Diff ",
-            Self::Audit => " 4: Audit & Checks ",
+            Self::Work => "1 Work",
+            Self::Dialogue => "2 Review",
+            Self::Diff => "3 Changes",
+            Self::Logs => "4 Logs",
+            Self::History => "5 History",
         }
     }
 
     pub fn next(self) -> Self {
-        match self {
-            Self::Feed => Self::Dialogue,
-            Self::Dialogue => Self::Diff,
-            Self::Diff => Self::Audit,
-            Self::Audit => Self::Feed,
-        }
+        Self::ALL[(self as usize + 1) % Self::ALL.len()]
     }
 }
 
@@ -77,10 +82,6 @@ enum Screen {
     Settings,
     WriterModel,
     CriticModel,
-    Review,
-    History,
-    Task,
-    Changes,
     ChooseProject,
 }
 
@@ -90,39 +91,132 @@ struct TaskDraft {
     config: ProjectConfig,
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct SlashCommandItem {
+    pub cmd: &'static str,
+    pub description: &'static str,
+}
+
+pub const PALETTE_COMMANDS: &[SlashCommandItem] = &[
+    SlashCommandItem {
+        cmd: "/cli",
+        description: "Switch CLI adapters: /cli <writer> [critic]",
+    },
+    SlashCommandItem {
+        cmd: "/mode",
+        description: "Set mode: adaptive | pair | team",
+    },
+    SlashCommandItem {
+        cmd: "/task:test",
+        description: "Preset: generate tests for <path>",
+    },
+    SlashCommandItem {
+        cmd: "/task:refactor",
+        description: "Preset: refactor code in <path>",
+    },
+    SlashCommandItem {
+        cmd: "/task:fix",
+        description: "Preset: fix issue in <path> <desc>",
+    },
+    SlashCommandItem {
+        cmd: "/task:bench",
+        description: "Preset: benchmark target <target>",
+    },
+    SlashCommandItem {
+        cmd: "/diff",
+        description: "Open Changes",
+    },
+    SlashCommandItem {
+        cmd: "/work",
+        description: "Open Work",
+    },
+    SlashCommandItem {
+        cmd: "/review",
+        description: "Open Review",
+    },
+    SlashCommandItem {
+        cmd: "/logs",
+        description: "Open Logs",
+    },
+    SlashCommandItem {
+        cmd: "/config",
+        description: "Open Settings",
+    },
+    SlashCommandItem {
+        cmd: "/commit",
+        description: "Commit working tree changes",
+    },
+    SlashCommandItem {
+        cmd: "/history",
+        description: "Open task history",
+    },
+    SlashCommandItem {
+        cmd: "/new",
+        description: "Start new task / reset session",
+    },
+    SlashCommandItem {
+        cmd: "/stop",
+        description: "Request task cancellation",
+    },
+    SlashCommandItem {
+        cmd: "/pause",
+        description: "Pause running supervisor",
+    },
+    SlashCommandItem {
+        cmd: "/resume",
+        description: "Resume paused supervisor",
+    },
+    SlashCommandItem {
+        cmd: "/clear",
+        description: "Clear the input",
+    },
+    SlashCommandItem {
+        cmd: "/help",
+        description: "Show command and keybinding help",
+    },
+    SlashCommandItem {
+        cmd: "/exit",
+        description: "Exit TALOS Cockpit",
+    },
+];
+
 pub struct TuiApp {
     project: Project,
     config: ProjectConfig,
     active_tab: ActiveTab,
     input: String,
     cursor: usize,
+    pub input_history: Vec<String>,
+    pub history_index: Option<usize>,
+    pub saved_draft: String,
+    pub palette_index: usize,
     screen: Screen,
     draft: Option<TaskDraft>,
     settings: Option<ProjectConfig>,
+    task_input: Option<(String, usize)>,
     selection: usize,
     available: Vec<AdapterKind>,
     history: Vec<RecentTask>,
     history_before: Option<i64>,
+    history_selection: usize,
     task_view: Option<i64>,
-    detail_scroll: u16,
     event_baseline: i64,
     log_baseline: u64,
     child: Option<(i64, Child)>,
     run_notice: Option<String>,
     task_status: Option<TaskStatus>,
-    task_details: String,
-    result_diff: String,
+    task_title: String,
+    task_cancelled: bool,
+    verification_status: Option<String>,
+    result_diff: Option<String>,
     status_message: Option<(String, Instant)>,
     scroll_offset: usize,
 
     // Database metrics
     queue: QueueSummary,
     queue_paused: bool,
-    pause_reason: Option<String>,
     supervisor_running: bool,
-    supervisor_owner: Option<String>,
     active_tasks: Vec<TaskRecord>,
-    worktrees: Vec<TaskWorktreeRecord>,
     recent_events: Vec<TaskEvent>,
     latest_review: Option<CriticReviewRecord>,
     verification_checks: Vec<ProjectCheck>,
@@ -131,7 +225,6 @@ pub struct TuiApp {
     pub diff_file_index: usize,
     pub modified_files: Vec<String>,
     dirty_paths: GitStatusPaths,
-    reconnect_notice: Option<String>,
     is_in_tmux: bool,
     pub should_exit: bool,
 }
@@ -173,9 +266,13 @@ impl TuiApp {
 
         let mut app = Self {
             config,
-            active_tab: ActiveTab::Feed,
+            active_tab: ActiveTab::Work,
             input: String::new(),
             cursor: 0,
+            input_history: Vec::new(),
+            history_index: None,
+            saved_draft: String::new(),
+            palette_index: 0,
             screen: if matches!(project.discovery, DiscoveryMethod::Git) {
                 Screen::Main
             } else {
@@ -184,28 +281,28 @@ impl TuiApp {
             project,
             draft: None,
             settings: None,
+            task_input: None,
             selection: 0,
             available,
             history: Vec::new(),
             history_before: None,
+            history_selection: 0,
             task_view: None,
-            detail_scroll: 0,
             event_baseline: 0,
             log_baseline: 0,
             child: None,
             run_notice: None,
             task_status: None,
-            task_details: String::new(),
-            result_diff: String::new(),
+            task_title: String::new(),
+            task_cancelled: false,
+            verification_status: None,
+            result_diff: None,
             status_message: None,
             scroll_offset: 0,
             queue,
             queue_paused: false,
-            pause_reason: None,
             supervisor_running: false,
-            supervisor_owner: None,
             active_tasks: Vec::new(),
-            worktrees: Vec::new(),
             recent_events: Vec::new(),
             latest_review: None,
             verification_checks: Vec::new(),
@@ -214,7 +311,6 @@ impl TuiApp {
             diff_file_index: 0,
             modified_files: Vec::new(),
             dirty_paths,
-            reconnect_notice: None,
             is_in_tmux,
             should_exit: false,
         };
@@ -222,14 +318,6 @@ impl TuiApp {
         if matches!(app.project.discovery, DiscoveryMethod::Git) {
             app.refresh_state()?;
         }
-        if let Some(task) = app.active_tasks.first() {
-            app.reconnect_notice = Some(format!(
-                "Active session reconnected for Task #{} ({})",
-                task.id,
-                task.status.as_str()
-            ));
-        }
-
         Ok(app)
     }
 
@@ -263,56 +351,51 @@ impl TuiApp {
             blocked_or_failed: 0,
         });
 
-        let control = database.project_control_state().ok();
-        if let Some(ctrl) = control {
-            self.queue_paused = ctrl.queue_paused;
-            self.pause_reason = ctrl.pause_reason;
-        }
+        self.queue_paused = database.project_control_state()?.queue_paused;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_millis() as i64);
+        self.supervisor_running = self.child.is_some()
+            || database
+                .current_supervisor_lease()?
+                .is_some_and(|lease| lease.expires_at_ms > now);
 
-        if let Ok(Some(lease)) = database.current_supervisor_lease() {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_millis() as i64)
-                .unwrap_or(0);
-            if lease.expires_at_ms > now {
-                self.supervisor_running = true;
-                self.supervisor_owner = Some(lease.owner_id);
-            } else {
-                self.supervisor_running = false;
-                self.supervisor_owner = None;
-            }
-        } else {
-            self.supervisor_running = false;
-            self.supervisor_owner = None;
-        }
-
-        self.supervisor_running |= self.child.is_some();
         self.active_tasks = database.active_tasks()?;
+        if self.task_view.is_none() {
+            self.task_view = self.active_tasks.first().map(|task| task.id);
+        }
         if let Some(id) = self.task_view {
             let task = database.get_task(id)?;
             self.task_status = task.as_ref().map(|task| task.status.clone());
-            if let Some(task) = task {
-                self.update_task_details(&database, &task)?;
-            }
-        }
-        self.worktrees = database.task_worktrees().unwrap_or_default();
-        self.recent_events = database.recent_events(50)?;
-        self.recent_events
-            .retain(|event| event.id > self.event_baseline);
-
-        if let Some(active) = self.active_tasks.first() {
-            self.latest_review = database.latest_critic_review(active.id).ok().flatten();
-            self.verification_checks = database
-                .task_verification_checks(active.id)
-                .unwrap_or_default();
+            self.task_title = task.map_or_else(String::new, |task| task.title);
+            self.task_cancelled = self.task_status == Some(TaskStatus::Failed)
+                && database
+                    .task_events_page(Some(id), None, 20)?
+                    .events
+                    .iter()
+                    .find(|event| event.event_type == "task.status_changed")
+                    .is_some_and(|event| event.reason == COCKPIT_CANCELLED_REASON);
+            self.latest_review = database.latest_critic_review(id)?;
+            self.verification_status = database
+                .latest_verification_summary(id)?
+                .map(|summary| summary.run.status);
+            self.verification_checks = database.task_verification_checks(id)?;
         } else {
             self.latest_review = None;
             self.verification_checks = self.config.checks.clone();
         }
 
+        if self.active_tab == ActiveTab::Logs {
+            self.recent_events = database.task_events_page(self.task_view, None, 50)?.events;
+            self.recent_events.reverse();
+            if self.task_view.is_none() {
+                self.recent_events
+                    .retain(|event| event.id > self.event_baseline);
+            }
+            self.read_supervisor_logs();
+        }
         self.dirty_paths = git_status_paths(&self.project)?;
-        self.read_supervisor_logs();
-        if self.active_tab == ActiveTab::Diff {
+        if self.active_tab == ActiveTab::Diff && self.result_diff.is_none() {
             self.load_git_diff();
         }
         Ok(())
@@ -509,7 +592,8 @@ impl TuiApp {
                 ));
                 return;
             } else if cmd == "/mode" {
-                self.status_message = Some(("Modes: pair  team".to_string(), Instant::now()));
+                self.status_message =
+                    Some(("Modes: adaptive  pair  team".to_string(), Instant::now()));
                 return;
             }
         }
@@ -540,7 +624,7 @@ impl TuiApp {
             }
 
             if cmd == "/mode" && !input_text.ends_with(' ') {
-                let modes = ["pair", "team"];
+                let modes = ["adaptive", "pair", "team"];
                 let matches: Vec<String> = modes
                     .iter()
                     .filter(|m| m.starts_with(last_token))
@@ -605,11 +689,30 @@ impl TuiApp {
 
     pub fn handle_submit(&mut self) -> Result<()> {
         let text = self.input.trim().to_owned();
-        if self.screen == Screen::Task && text.starts_with('/') {
-            self.execute_slash_command(&text)?;
-            self.clear_input();
-            return Ok(());
+        if self.is_palette_active()
+            && !PALETTE_COMMANDS
+                .iter()
+                .any(|item| item.cmd.eq_ignore_ascii_case(&text))
+        {
+            let matches = self.palette_matches();
+            if let Some(chosen) =
+                matches.get(self.palette_index.min(matches.len().saturating_sub(1)))
+            {
+                self.input = format!("{} ", chosen.cmd);
+                self.cursor = self.input.len();
+                self.palette_index = 0;
+                return Ok(());
+            }
         }
+
+        if !text.is_empty() && self.screen == Screen::Main {
+            if self.input_history.last().map(|s| s.as_str()) != Some(&text) {
+                self.input_history.push(text.clone());
+            }
+            self.history_index = None;
+            self.saved_draft.clear();
+        }
+
         match self.screen {
             Screen::ChooseProject => {
                 if text.is_empty() {
@@ -629,14 +732,33 @@ impl TuiApp {
                 ensure_talos_ignored(&project)?;
                 *self = Self::new(project)?;
             }
-            Screen::Main if !text.is_empty() => {
-                if text.starts_with('/') {
+            Screen::Main => {
+                if self.draft.is_some() && self.active_tab != ActiveTab::Work {
+                    self.select_tab(ActiveTab::Work);
+                } else if self.draft.is_some() {
+                    self.run_draft()?;
+                } else if text.starts_with('/') {
                     self.execute_slash_command(&text)?;
-                } else {
+                    self.clear_input();
+                } else if !text.is_empty() {
                     let first_line = text.lines().next().unwrap_or_default().trim();
                     let end = first_line.floor_char_boundary(first_line.len().min(160));
                     self.prepare_draft(first_line[..end].to_owned(), text);
+                    if self.publication_target().is_none() {
+                        let result = self.run_draft();
+                        self.draft = None;
+                        result?;
+                    }
+                } else if self.active_tab == ActiveTab::History
+                    && let Some(task) = self.history.get(self.history_selection)
+                {
+                    self.task_view = Some(task.task.id);
+                    self.run_notice = None;
+                    self.result_diff = None;
+                    self.select_tab(ActiveTab::Work);
+                    self.refresh_state()?;
                 }
+                return Ok(());
             }
             Screen::WriterModel | Screen::CriticModel => {
                 let settings = self.settings.as_mut().context("Open Settings first")?;
@@ -651,31 +773,18 @@ impl TuiApp {
                     settings.critic_model = model;
                 }
                 self.screen = Screen::Settings;
+                self.restore_task_input();
+                return Ok(());
             }
             Screen::Settings => {
                 let settings = self.settings.as_ref().context("Open Settings first")?;
                 settings.save(&self.project)?;
                 self.config = settings.clone();
                 self.settings = None;
-                if let Some(draft) = &mut self.draft {
-                    draft.config = self.config.clone();
-                    self.screen = Screen::Review;
-                } else {
-                    self.screen = Screen::Main;
-                }
+                self.screen = Screen::Main;
                 self.notice("Settings saved.");
+                return Ok(());
             }
-            Screen::Review => self.run_draft()?,
-            Screen::History => {
-                if let Some(task) = self.history.get(self.selection) {
-                    self.task_view = Some(task.task.id);
-                    self.run_notice = None;
-                    self.detail_scroll = 0;
-                    self.screen = Screen::Task;
-                    self.refresh_state()?;
-                }
-            }
-            _ => {}
         }
         self.clear_input();
         Ok(())
@@ -688,6 +797,37 @@ impl TuiApp {
     fn clear_input(&mut self) {
         self.input.clear();
         self.cursor = 0;
+        self.history_index = None;
+        self.saved_draft.clear();
+        self.palette_index = 0;
+    }
+
+    pub fn palette_matches(&self) -> Vec<&'static SlashCommandItem> {
+        if !self.input.starts_with('/') || self.input.contains(' ') {
+            return Vec::new();
+        }
+        let query = &self.input[1..].to_ascii_lowercase();
+        if query.is_empty() {
+            return PALETTE_COMMANDS.iter().collect();
+        }
+        let mut prefix_matches: Vec<&'static SlashCommandItem> = PALETTE_COMMANDS
+            .iter()
+            .filter(|item| item.cmd[1..].starts_with(query))
+            .collect();
+        let contains_matches: Vec<&'static SlashCommandItem> = PALETTE_COMMANDS
+            .iter()
+            .filter(|item| !item.cmd[1..].starts_with(query) && item.cmd.contains(query))
+            .collect();
+        prefix_matches.extend(contains_matches);
+        prefix_matches
+    }
+
+    pub fn is_palette_active(&self) -> bool {
+        self.screen == Screen::Main
+            && self.history_index.is_none()
+            && self.input.starts_with('/')
+            && !self.input.contains(' ')
+            && !self.palette_matches().is_empty()
     }
 
     fn prepare_draft(&mut self, title: String, criteria: String) {
@@ -696,9 +836,16 @@ impl TuiApp {
             criteria,
             config: self.config.clone(),
         });
-        self.screen = Screen::Review;
-        self.detail_scroll = 0;
+        self.select_tab(ActiveTab::Work);
         self.status_message = None;
+    }
+
+    fn publication_target(&self) -> Option<&str> {
+        self.config
+            .github
+            .as_ref()
+            .filter(|policy| policy.allow_push && policy.allow_pull_request)
+            .map(|policy| policy.repository.as_str())
     }
 
     fn run_draft(&mut self) -> Result<()> {
@@ -706,7 +853,7 @@ impl TuiApp {
         let draft = self.draft.as_ref().context("Create a task first")?;
         anyhow::ensure!(
             draft.config == self.config,
-            "Project settings changed. Open Settings and save to review the new assignments."
+            "Project settings changed. Press Esc, then submit the task again."
         );
         if let Some(blocker) = self.run_blocker(None) {
             anyhow::bail!("{blocker}");
@@ -719,10 +866,14 @@ impl TuiApp {
         let task =
             database.add_task_with_checks(&draft.title, &draft.criteria, &draft.config.checks)?;
         self.draft = None;
+        self.clear_input();
         self.task_view = Some(task.id);
+        self.task_title = task.title;
+        self.task_status = Some(TaskStatus::Queued);
+        self.task_cancelled = false;
+        self.verification_status = None;
+        self.result_diff = None;
         self.run_notice = None;
-        self.detail_scroll = 0;
-        self.screen = Screen::Task;
         self.start_selected_task(task.id)
     }
 
@@ -733,20 +884,20 @@ impl TuiApp {
             );
         }
         if self.queue_paused {
-            return Some("The queue is paused. Press U to resume the queue, then retry.".into());
+            return Some("The queue is paused. Use /resume, then try again.".into());
         }
         let retry_in_progress =
             retry.is_some_and(|id| self.active_tasks.iter().any(|task| task.id == id));
         if !retry_in_progress && !self.dirty_paths.is_empty() {
             return Some(format!(
-                "Project has uncommitted changes. Press D to view them. Commit or stash your own changes, then retry. {}",
+                "Commit or stash your uncommitted changes before running. Alt+3 opens Changes. {}",
                 self.dirty_paths.display_preview()
             ));
         }
         for adapter in [self.config.writer, self.config.critic] {
             if !self.available.contains(&adapter) {
                 return Some(format!(
-                    "{} was not found or failed its capability check. Press S to choose an available CLI, or install it and press R to check again.",
+                    "{} was not found or failed its capability check. Press F2 to choose an available CLI.",
                     adapter.as_str()
                 ));
             }
@@ -762,8 +913,16 @@ impl TuiApp {
             )
     }
 
+    fn restore_task_input(&mut self) {
+        if let Some((text, cursor)) = self.task_input.take() {
+            self.input = text;
+            self.cursor = cursor;
+        }
+    }
+
     fn open_settings(&mut self) {
         self.available = available_adapters(&self.project);
+        self.draft = None;
         self.settings = Some(self.config.clone());
         self.selection = 0;
         self.screen = Screen::Settings;
@@ -787,16 +946,17 @@ impl TuiApp {
         self.draft = None;
         self.task_view = None;
         self.task_status = None;
-        self.task_details.clear();
-        self.result_diff.clear();
+        self.task_title.clear();
+        self.task_cancelled = false;
+        self.verification_status = None;
+        self.result_diff = None;
         self.recent_events.clear();
         self.supervisor_logs.clear();
         self.run_notice = None;
-        self.reconnect_notice = None;
         self.scroll_offset = 0;
-        self.select_tab(ActiveTab::Feed);
+        self.select_tab(ActiveTab::Work);
         self.screen = Screen::Main;
-        self.notice("New session. Describe your next task and press Enter to review.");
+        self.notice("New session.");
         Ok(())
     }
 
@@ -810,10 +970,24 @@ impl TuiApp {
     fn open_history(&mut self, before: Option<i64>) -> Result<()> {
         self.history = Database::open(&self.project)?.recent_tasks(before, 50)?;
         self.history_before = before;
-        self.selection = 0;
-        self.screen = Screen::History;
+        self.history_selection = 0;
+        self.select_tab(ActiveTab::History);
         self.status_message = None;
         Ok(())
+    }
+
+    fn open_changes(&mut self) -> Result<()> {
+        if self.task_status == Some(TaskStatus::Complete) && self.dirty_paths.is_empty() {
+            return self.open_result_changes();
+        }
+        self.show_working_diff();
+        Ok(())
+    }
+
+    fn show_working_diff(&mut self) {
+        self.select_tab(ActiveTab::Diff);
+        self.result_diff = None;
+        self.load_git_diff();
     }
 
     fn open_result_changes(&mut self) -> Result<()> {
@@ -823,10 +997,12 @@ impl TuiApp {
             .task_events_page(Some(id), None, 20)?
             .events
             .into_iter()
-            .find(|event| event.event_type == "task.commit_saved")
-            .context(
-                "A saved commit diff is unavailable. The task result lists the reviewed paths.",
-            )?;
+            .find(|event| event.event_type == "task.commit_saved");
+        let Some(event) = event else {
+            self.select_tab(ActiveTab::Diff);
+            self.result_diff = Some("No saved Git changes for this task.".to_owned());
+            return Ok(());
+        };
         let data: serde_json::Value = serde_json::from_str(&event.data_json)?;
         let revision = |key| {
             data.get(key)
@@ -869,71 +1045,15 @@ impl TuiApp {
             status.success() || bytes.len() > PREVIEW_LIMIT,
             "Git could not read the saved revisions. They may be unavailable in this checkout."
         );
-        self.result_diff = crate::secrets::redact_sensitive(&String::from_utf8_lossy(
+        let mut diff = crate::secrets::redact_sensitive(&String::from_utf8_lossy(
             &bytes[..bytes.len().min(PREVIEW_LIMIT)],
         ));
         if bytes.len() > PREVIEW_LIMIT {
-            self.result_diff
-                .push_str("\n\nPreview ended after 64 KiB. Open Git to inspect the full changes.");
+            diff.push_str("\n\nPreview ended after 64 KiB. Open Git to inspect the full changes.");
         }
-        self.detail_scroll = 0;
-        self.screen = Screen::Changes;
+        self.select_tab(ActiveTab::Diff);
+        self.result_diff = Some(diff);
         self.status_message = None;
-        Ok(())
-    }
-
-    fn update_task_details(&mut self, database: &Database, task: &TaskRecord) -> Result<()> {
-        let report = crate::summary::task_summary_path(&self.project.root, task.id);
-        let events = database.task_events_page(Some(task.id), None, 20)?;
-        let cancelled = task.status == TaskStatus::Failed
-            && events
-                .events
-                .iter()
-                .find(|event| event.event_type == "task.status_changed")
-                .is_some_and(|event| event.reason == COCKPIT_CANCELLED_REASON);
-        let status = if cancelled {
-            "cancelled"
-        } else {
-            task.status.as_str()
-        };
-        let mut details = format!("Task #{} · {status}\n{}\n", task.id, task.title);
-        let review_paths = database
-            .latest_critic_review(task.id)?
-            .and_then(|review| review.changed_paths_json)
-            .and_then(|paths| serde_json::from_str::<Vec<String>>(&paths).ok());
-        let paths = match review_paths {
-            Some(paths) => paths,
-            None => database
-                .task_worktree_integration(task.id)?
-                .map(|integration| integration.changed_paths)
-                .unwrap_or_default(),
-        };
-        if !paths.is_empty() {
-            details.push_str("\nChanged files\n");
-            details.push_str(&paths.join("\n"));
-            details.push('\n');
-        }
-        let report_text = open_runtime_read(&report).and_then(|file| {
-            let mut text = Vec::new();
-            file.take(64 * 1024).read_to_end(&mut text)?;
-            Ok(String::from_utf8_lossy(&text).into_owned())
-        });
-        if let Ok(report_text) = report_text {
-            details.push('\n');
-            details.push_str(&report_text);
-        } else {
-            for event in events.events.iter().take(5).rev() {
-                details.push_str(&format!("\n{}", event.reason));
-            }
-        }
-        if self.screen == Screen::Task {
-            let logs = recent_log_lines(&self.task_log(task.id), 0);
-            if !logs.is_empty() {
-                details.push_str("\n\nRun details\n");
-                details.push_str(&logs.join("\n"));
-            }
-        }
-        self.task_details = details;
         Ok(())
     }
 
@@ -950,7 +1070,7 @@ impl TuiApp {
         match cmd.as_str() {
             "/help" | "/помощь" | "/справка" => {
                 self.status_message = Some((
-                    "Commands: /config, /new, /history, /cli <writer> <critic>, /task:test <file>, /task:refactor <file>, /task:fix <path> <issue>, /task:bench <path>, /stop, /pause, /resume, /run, /commit <msg>, /feed, /diff, /dialogue, /audit, /writer, /critic, /model, /mode, /exit".to_string(),
+                    "Commands: /config, /new, /history, /cli <writer> <critic>, /task:test <file>, /task:refactor <file>, /task:fix <path> <issue>, /task:bench <path>, /stop, /pause, /resume, /run, /commit <msg>, /work, /diff, /working-diff, /review, /logs, /writer, /critic, /model, /mode, /exit".to_string(),
                     Instant::now(),
                 ));
             }
@@ -1015,8 +1135,8 @@ impl TuiApp {
             "/config" | "/settings" => self.open_settings(),
             "/new" | "/session" => self.new_session()?,
             "/history" => self.open_history(None)?,
-            "/feed" | "/фид" | "/лента" | "/overview" | "/обзор" => {
-                self.select_tab(ActiveTab::Feed);
+            "/work" | "/feed" | "/фид" | "/лента" | "/overview" | "/обзор" => {
+                self.select_tab(ActiveTab::Work);
             }
             "/cli" | "/кли" | "/adapter" | "/адаптер" => {
                 let tokens: Vec<&str> = arg.split_whitespace().collect();
@@ -1092,11 +1212,16 @@ impl TuiApp {
                 self.select_tab(ActiveTab::Dialogue);
             }
             "/diff" | "/дифф" => {
-                self.select_tab(ActiveTab::Diff);
-                self.load_git_diff();
+                self.open_changes()?;
             }
-            "/audit" | "/review" | "/аудит" | "/ревью" => {
-                self.select_tab(ActiveTab::Audit);
+            "/working-diff" => {
+                self.show_working_diff();
+            }
+            "/review" | "/ревью" => {
+                self.select_tab(ActiveTab::Dialogue);
+            }
+            "/logs" | "/audit" | "/аудит" => {
+                self.select_tab(ActiveTab::Logs);
             }
             "/stop" | "/стоп" => {
                 let mut database = Database::open(&self.project)?;
@@ -1240,19 +1365,26 @@ impl TuiApp {
                 }
             }
             "/mode" => match arg.to_ascii_lowercase().as_str() {
-                "team" => {
+                "adaptive" | "auto" | "адаптивный" | "авто" => {
+                    self.config.orchestration.mode = OrchestrationMode::Adaptive;
+                    self.config.save(&self.project)?;
+                    self.notice("Mode set to Adaptive (smart auto-routing).");
+                }
+                "team" | "команда" => {
                     self.config.orchestration.mode = OrchestrationMode::Team;
                     self.config.save(&self.project)?;
                     self.status_message = Some(("Mode set to TEAM.".to_string(), Instant::now()));
                 }
-                "pair" => {
+                "pair" | "пара" => {
                     self.config.orchestration.mode = OrchestrationMode::Pair;
                     self.config.save(&self.project)?;
                     self.status_message = Some(("Mode set to PAIR.".to_string(), Instant::now()));
                 }
                 _ => {
-                    self.status_message =
-                        Some(("Use /mode pair or /mode team.".to_string(), Instant::now()));
+                    self.status_message = Some((
+                        "Use /mode adaptive, /mode pair, or /mode team.".to_string(),
+                        Instant::now(),
+                    ));
                 }
             },
             "/commit" => {
@@ -1364,7 +1496,7 @@ impl TuiApp {
         self.child = Some((id, child));
         self.supervisor_running = true;
         self.run_notice = None;
-        self.notice(format!("Starting task #{id}."));
+        self.status_message = None;
         self.refresh_state()
     }
 
@@ -1394,7 +1526,6 @@ impl TuiApp {
             match cmd.spawn() {
                 Ok(child) => {
                     self.supervisor_running = true;
-                    self.supervisor_owner = Some(format!("pid-{}", child.id()));
                     if self.status_message.is_none() {
                         self.status_message = Some((
                             format!("Background worker spawned (PID: {}).", child.id()),
@@ -1465,15 +1596,15 @@ fn run_recovery_hint(log: &[String], config: &ProjectConfig) -> String {
             "Sign in or configure credentials in the selected agent's own CLI.".to_owned()
         } else {
             format!(
-                "Check the failing role below. Sign in from a shell with {} where applicable.",
+                "Open Logs for the failing role. Sign in from a shell with {} where applicable.",
                 commands.join(" or ")
             )
         };
         format!(
-            "The agent could not authenticate. {actions} Then retry the task or edit it as a new draft. Press F2 to choose another CLI."
+            "The agent could not authenticate. {actions} Then retry the task or edit it as a new task. Press F2 to choose another CLI."
         )
     } else {
-        "Run stopped. See Run details below for the error and the next action.".to_owned()
+        "Run stopped. Open Logs for details.".to_owned()
     }
 }
 
@@ -1542,6 +1673,7 @@ impl TuiApp {
             }
             1 | 3 => {
                 let writer = self.selection == 1;
+                self.task_input = Some((std::mem::take(&mut self.input), self.cursor));
                 self.input = if writer {
                     settings.writer_model.clone()
                 } else {
@@ -1556,10 +1688,17 @@ impl TuiApp {
                 };
             }
             _ => {
-                settings.orchestration.mode = match settings.orchestration.mode {
-                    OrchestrationMode::Pair => OrchestrationMode::Team,
-                    OrchestrationMode::Team => OrchestrationMode::Pair,
-                };
+                let modes = [
+                    OrchestrationMode::Adaptive,
+                    OrchestrationMode::Pair,
+                    OrchestrationMode::Team,
+                ];
+                let index = modes
+                    .iter()
+                    .position(|mode| *mode == settings.orchestration.mode)
+                    .expect("all orchestration modes are listed");
+                settings.orchestration.mode =
+                    modes[(index + if forward { 1 } else { 2 }) % modes.len()];
             }
         }
         Ok(())
@@ -1591,207 +1730,212 @@ impl TuiApp {
             return Ok(());
         }
 
-        let editing = matches!(
-            self.screen,
-            Screen::Main | Screen::ChooseProject | Screen::WriterModel | Screen::CriticModel
-        );
         if key.code == KeyCode::Enter {
             return self.handle_submit();
         }
         if key.code == KeyCode::Esc {
-            if self.screen == Screen::Task && !self.input.is_empty() {
-                self.clear_input();
-                return Ok(());
-            }
-            self.screen = match self.screen {
-                Screen::Main if !self.input.is_empty() => Screen::Main,
-                Screen::Main => {
-                    self.select_tab(ActiveTab::Feed);
-                    Screen::Main
-                }
-                Screen::Settings if self.draft.is_some() => {
-                    self.settings = None;
-                    Screen::Review
-                }
+            match self.screen {
                 Screen::Settings => {
                     self.settings = None;
-                    Screen::Main
-                }
-                Screen::WriterModel | Screen::CriticModel => Screen::Settings,
-                Screen::Review => {
-                    if let Some(draft) = self.draft.take() {
-                        self.input = draft.criteria;
-                        self.cursor = self.input.len();
-                    }
                     self.screen = Screen::Main;
-                    return Ok(());
                 }
-                Screen::Changes => {
-                    self.detail_scroll = 0;
-                    Screen::Task
+                Screen::WriterModel | Screen::CriticModel => {
+                    self.restore_task_input();
+                    self.screen = Screen::Settings;
                 }
-                Screen::ChooseProject => {
-                    self.clear_input();
-                    return Ok(());
-                }
-                _ => Screen::Main,
-            };
-            self.clear_input();
+                Screen::Main if self.draft.take().is_some() => {}
+                Screen::Main if self.input.is_empty() => self.select_tab(ActiveTab::Work),
+                _ => self.clear_input(),
+            }
             self.status_message = None;
             return Ok(());
         }
 
-        if !repeat && self.screen != Screen::ChooseProject {
-            match key.code {
-                KeyCode::F(2) => {
-                    self.clear_input();
-                    self.open_settings();
-                    return Ok(());
+        match self.screen {
+            Screen::Main => self.handle_work_key(key, repeat),
+            Screen::Settings => {
+                match key.code {
+                    KeyCode::Up => self.selection = (self.selection + 4) % 5,
+                    KeyCode::Down | KeyCode::Tab => self.selection = (self.selection + 1) % 5,
+                    KeyCode::Left => self.change_setting(false)?,
+                    KeyCode::Right | KeyCode::Char('e' | 'E') if !repeat => {
+                        self.change_setting(true)?
+                    }
+                    KeyCode::Char('r' | 'R') if !repeat => {
+                        self.available = available_adapters(&self.project);
+                        self.notice("Checked for installed agent CLIs.");
+                    }
+                    _ => {}
                 }
-                KeyCode::F(3) => return self.open_history(None),
-                KeyCode::F(4) => return self.new_session(),
-                _ => {}
+                Ok(())
+            }
+            _ => {
+                self.edit_input(key);
+                Ok(())
             }
         }
+    }
 
-        if self.screen == Screen::Task && (!self.input.is_empty() || key.code == KeyCode::Char('/'))
-        {
-            self.edit_input(key, repeat);
-            return Ok(());
+    fn handle_work_key(&mut self, key: KeyEvent, repeat: bool) -> Result<()> {
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        match key.code {
+            KeyCode::F(2) => self.open_settings(),
+            KeyCode::F(3) => self.open_history(None)?,
+            KeyCode::F(4) => self.new_session()?,
+            KeyCode::F(5) if self.can_retry_task() => self.retry_selected_task()?,
+            KeyCode::F(6)
+                if !self.supervisor_running && self.task_status == Some(TaskStatus::Queued) =>
+            {
+                if let Some(id) = self.task_view {
+                    Database::open(&self.project)?.cancel_queued_task(id)?;
+                    self.run_notice = None;
+                    self.refresh_state()?;
+                }
+            }
+            KeyCode::F(6)
+                if !self.supervisor_running
+                    && matches!(
+                        self.task_status,
+                        Some(TaskStatus::Failed | TaskStatus::Blocked)
+                    )
+                    && !self.task_cancelled =>
+            {
+                if self.input.is_empty()
+                    && let Some(id) = self.task_view
+                    && let Some(task) = Database::open(&self.project)?.get_task(id)?
+                {
+                    self.input = task.acceptance_criteria;
+                    self.cursor = self.input.len();
+                    self.draft = None;
+                    self.select_tab(ActiveTab::Work);
+                }
+            }
+            KeyCode::Char(ch @ '1'..='5') if alt && !repeat => {
+                self.open_tab(ActiveTab::ALL[ch as usize - '1' as usize])?;
+            }
+            KeyCode::BackTab => {
+                let previous =
+                    (self.active_tab as usize + ActiveTab::ALL.len() - 1) % ActiveTab::ALL.len();
+                self.open_tab(ActiveTab::ALL[previous])?;
+            }
+            KeyCode::Tab if self.is_palette_active() => {
+                let matches = self.palette_matches();
+                if !matches.is_empty() {
+                    let idx = self.palette_index.min(matches.len() - 1);
+                    let chosen = matches[idx];
+                    self.input = format!("{} ", chosen.cmd);
+                    self.cursor = self.input.len();
+                    self.palette_index = 0;
+                    self.draft = None;
+                }
+            }
+            KeyCode::Tab if self.input.is_empty() => self.open_tab(self.active_tab.next())?,
+            KeyCode::Tab => {
+                self.complete_input();
+                self.cursor = self.input.len();
+                self.draft = None;
+            }
+            KeyCode::Up if self.is_palette_active() => {
+                self.palette_index = self.palette_index.saturating_sub(1);
+            }
+            KeyCode::Down if self.is_palette_active() => {
+                let len = self.palette_matches().len();
+                if len > 0 {
+                    self.palette_index = (self.palette_index + 1).min(len - 1);
+                }
+            }
+            KeyCode::Up | KeyCode::Down | KeyCode::PageUp | KeyCode::PageDown
+                if self.active_tab == ActiveTab::History =>
+            {
+                match key.code {
+                    KeyCode::Up => {
+                        self.history_selection = self.history_selection.saturating_sub(1)
+                    }
+                    KeyCode::Down => {
+                        self.history_selection =
+                            (self.history_selection + 1).min(self.history.len().saturating_sub(1))
+                    }
+                    KeyCode::PageDown if self.history.len() == 50 => {
+                        self.open_history(self.history.last().map(|entry| entry.task.id))?;
+                    }
+                    KeyCode::PageUp if self.history_before.is_some() => self.open_history(None)?,
+                    _ => {}
+                }
+            }
+            KeyCode::Up
+                if alt && self.active_tab == ActiveTab::Diff && self.result_diff.is_none() =>
+            {
+                self.diff_file_index = self.diff_file_index.saturating_sub(1);
+                self.scroll_offset = 0;
+            }
+            KeyCode::Down
+                if alt && self.active_tab == ActiveTab::Diff && self.result_diff.is_none() =>
+            {
+                self.diff_file_index =
+                    (self.diff_file_index + 1).min(self.modified_files.len().saturating_sub(1));
+                self.scroll_offset = 0;
+            }
+            KeyCode::Up
+                if (self.active_tab == ActiveTab::Work || !self.input.is_empty())
+                    && self.draft.is_none()
+                    && !self.input_history.is_empty() =>
+            {
+                if self.history_index.is_none() {
+                    self.saved_draft = self.input.clone();
+                    let idx = self.input_history.len() - 1;
+                    self.history_index = Some(idx);
+                    self.input = self.input_history[idx].clone();
+                    self.cursor = self.input.len();
+                } else if let Some(idx) = self.history_index
+                    && idx > 0
+                {
+                    let new_idx = idx - 1;
+                    self.history_index = Some(new_idx);
+                    self.input = self.input_history[new_idx].clone();
+                    self.cursor = self.input.len();
+                }
+            }
+            KeyCode::Down if self.history_index.is_some() && self.draft.is_none() => {
+                let next = self.history_index.map_or(0, |index| index + 1);
+                if let Some(entry) = self.input_history.get(next) {
+                    self.history_index = Some(next);
+                    self.input = entry.clone();
+                } else {
+                    self.history_index = None;
+                    self.input = std::mem::take(&mut self.saved_draft);
+                }
+                self.cursor = self.input.len();
+            }
+            KeyCode::Up => self.scroll_tab(false, 1),
+            KeyCode::Down => self.scroll_tab(true, 1),
+            KeyCode::PageUp => self.scroll_tab(false, 5),
+            KeyCode::PageDown => self.scroll_tab(true, 5),
+            KeyCode::Home if self.input.is_empty() => self.scroll_tab(false, usize::MAX),
+            KeyCode::End if self.input.is_empty() => self.scroll_tab(true, usize::MAX),
+            _ => self.edit_input(key),
         }
+        Ok(())
+    }
 
-        match self.screen {
-            Screen::Settings => match key.code {
-                KeyCode::Up => self.selection = (self.selection + 4) % 5,
-                KeyCode::Down | KeyCode::Tab => self.selection = (self.selection + 1) % 5,
-                KeyCode::Left => self.change_setting(false)?,
-                KeyCode::Right | KeyCode::Char('e' | 'E') if !repeat => {
-                    self.change_setting(true)?
-                }
-                KeyCode::Char('r' | 'R') if !repeat => {
-                    self.available = available_adapters(&self.project);
-                    self.notice("Checked for installed agent CLIs.");
-                }
-                _ => {}
-            },
-            Screen::Review => match key.code {
-                KeyCode::Char('s' | 'S') if !repeat => self.open_settings(),
-                KeyCode::Char('d' | 'D') if !repeat => {
-                    self.select_tab(ActiveTab::Diff);
-                    self.load_git_diff();
-                    self.screen = Screen::Main;
-                    self.notice("Review your changes. Press F5 to return to the task draft.");
-                }
-                KeyCode::Char('r' | 'R') if !repeat => {
-                    self.available = available_adapters(&self.project);
-                    self.refresh_state()?;
-                }
-                KeyCode::Char('u' | 'U') if !repeat => self.execute_slash_command("/resume")?,
-                KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
-                KeyCode::Down => self.detail_scroll = self.detail_scroll.saturating_add(1),
-                KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
-                KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(10),
-                KeyCode::Home => self.detail_scroll = 0,
-                KeyCode::End => self.detail_scroll = u16::MAX,
-                _ => {}
-            },
-            Screen::History => match key.code {
-                KeyCode::Up => self.selection = self.selection.saturating_sub(1),
-                KeyCode::Down => {
-                    self.selection = (self.selection + 1).min(self.history.len().saturating_sub(1))
-                }
-                KeyCode::PageDown if !repeat && self.history.len() == 50 => {
-                    self.open_history(self.history.last().map(|entry| entry.task.id))?;
-                }
-                KeyCode::PageUp if !repeat && self.history_before.is_some() => {
-                    self.open_history(None)?
-                }
-                _ => {}
-            },
-            Screen::Changes => match key.code {
-                KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
-                KeyCode::Down => self.detail_scroll = self.detail_scroll.saturating_add(1),
-                KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
-                KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(10),
-                KeyCode::Home => self.detail_scroll = 0,
-                KeyCode::End => self.detail_scroll = u16::MAX,
-                _ => {}
-            },
-            Screen::Task => match key.code {
-                KeyCode::Char('d' | 'D')
-                    if !repeat && self.task_status == Some(TaskStatus::Complete) =>
-                {
-                    self.open_result_changes()?
-                }
-                KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
-                KeyCode::Down => self.detail_scroll = self.detail_scroll.saturating_add(1),
-                KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
-                KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(10),
-                KeyCode::Home => self.detail_scroll = 0,
-                KeyCode::End => self.detail_scroll = u16::MAX,
-                KeyCode::Char('s' | 'S')
-                    if !repeat
-                        && self
-                            .active_tasks
-                            .iter()
-                            .any(|task| Some(task.id) == self.task_view) =>
-                {
-                    self.execute_slash_command("/stop")?
-                }
-                KeyCode::Char('r' | 'R') if !repeat && self.can_retry_task() => {
-                    self.available = available_adapters(&self.project);
-                    self.refresh_state()?;
-                    anyhow::ensure!(
-                        self.can_retry_task(),
-                        "The task status changed. Review its details."
-                    );
-                    if let Some(blocker) = self.run_blocker(self.task_view) {
-                        anyhow::bail!("{blocker}");
-                    }
-                    if let Some(id) = self.task_view {
-                        self.start_selected_task(id)?;
-                    }
-                }
-                KeyCode::Char('e' | 'E')
-                    if !repeat
-                        && !self.supervisor_running
-                        && matches!(
-                            self.task_status,
-                            Some(TaskStatus::Failed | TaskStatus::Blocked)
-                        ) =>
-                {
-                    if let Some(id) = self.task_view
-                        && let Some(task) = Database::open(&self.project)?.get_task(id)?
-                    {
-                        self.prepare_draft(task.title, task.acceptance_criteria);
-                    }
-                }
-                KeyCode::Char('d' | 'D') if !repeat && !self.dirty_paths.is_empty() => {
-                    self.select_tab(ActiveTab::Diff);
-                    self.load_git_diff();
-                    self.screen = Screen::Main;
-                    self.notice(
-                        "Review the changed files. Press F3 to return to the task in History.",
-                    );
-                }
-                KeyCode::Char('u' | 'U') if !repeat && self.queue_paused => {
-                    self.execute_slash_command("/resume")?
-                }
-                KeyCode::Char('c' | 'C')
-                    if !repeat
-                        && !self.supervisor_running
-                        && self.task_status == Some(TaskStatus::Queued) =>
-                {
-                    if let Some(id) = self.task_view {
-                        Database::open(&self.project)?.cancel_queued_task(id)?;
-                        self.run_notice = Some(format!("Task #{id} cancelled."));
-                        self.refresh_state()?;
-                    }
-                }
-                _ => {}
-            },
-            _ if editing => self.edit_input(key, repeat),
-            _ => {}
+    fn open_tab(&mut self, tab: ActiveTab) -> Result<()> {
+        match tab {
+            ActiveTab::Diff => self.open_changes()?,
+            ActiveTab::History => self.open_history(None)?,
+            _ => self.select_tab(tab),
+        }
+        Ok(())
+    }
+
+    fn retry_selected_task(&mut self) -> Result<()> {
+        self.available = available_adapters(&self.project);
+        self.refresh_state()?;
+        anyhow::ensure!(self.can_retry_task(), "The task status changed.");
+        if let Some(blocker) = self.run_blocker(self.task_view) {
+            anyhow::bail!("{blocker}");
+        }
+        if let Some(id) = self.task_view {
+            self.select_tab(ActiveTab::Work);
+            self.start_selected_task(id)?;
         }
         Ok(())
     }
@@ -1801,10 +1945,9 @@ impl TuiApp {
         self.scroll_offset = 0;
     }
 
-    fn edit_input(&mut self, key: KeyEvent, repeat: bool) {
+    fn edit_input(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
-        let main = self.screen == Screen::Main;
         let previous = self.input[..self.cursor]
             .char_indices()
             .next_back()
@@ -1813,6 +1956,15 @@ impl TuiApp {
             .chars()
             .next()
             .map_or(self.cursor, |ch| self.cursor + ch.len_utf8());
+        if matches!(
+            key.code,
+            KeyCode::Backspace | KeyCode::Delete | KeyCode::Char(_)
+        ) && self.screen == Screen::Main
+        {
+            self.draft = None;
+            self.status_message = None;
+            self.history_index = None;
+        }
         match key.code {
             KeyCode::Backspace | KeyCode::Char('w')
                 if alt || (key.code == KeyCode::Char('w') && ctrl) =>
@@ -1834,51 +1986,8 @@ impl TuiApp {
             }
             KeyCode::Left => self.cursor = previous,
             KeyCode::Right => self.cursor = next,
-            KeyCode::Home if !main || !self.input.is_empty() => self.cursor = 0,
-            KeyCode::End if !main || !self.input.is_empty() => self.cursor = self.input.len(),
-            KeyCode::F(5) if main && self.draft.is_some() => self.screen = Screen::Review,
-            KeyCode::Tab if main && self.input.is_empty() && !repeat => {
-                self.select_tab(self.active_tab.next());
-                if self.active_tab == ActiveTab::Diff {
-                    self.load_git_diff();
-                }
-            }
-            KeyCode::Tab if main => {
-                self.complete_input();
-                self.cursor = self.input.len();
-            }
-            KeyCode::Char(ch @ '1'..='4')
-                if main && self.input.is_empty() && !repeat && !alt && !ctrl =>
-            {
-                self.select_tab(
-                    [
-                        ActiveTab::Feed,
-                        ActiveTab::Dialogue,
-                        ActiveTab::Diff,
-                        ActiveTab::Audit,
-                    ][ch as usize - '1' as usize],
-                );
-                if self.active_tab == ActiveTab::Diff {
-                    self.load_git_diff();
-                }
-            }
-            KeyCode::Up if main && alt && self.active_tab == ActiveTab::Diff => {
-                self.diff_file_index = self.diff_file_index.saturating_sub(1);
-                self.scroll_offset = 0;
-                self.load_git_diff();
-            }
-            KeyCode::Down if main && alt && self.active_tab == ActiveTab::Diff => {
-                self.diff_file_index =
-                    (self.diff_file_index + 1).min(self.modified_files.len().saturating_sub(1));
-                self.scroll_offset = 0;
-                self.load_git_diff();
-            }
-            KeyCode::Up if main => self.scroll_tab(false, 1),
-            KeyCode::Down if main => self.scroll_tab(true, 1),
-            KeyCode::PageUp if main => self.scroll_tab(false, 5),
-            KeyCode::PageDown if main => self.scroll_tab(true, 5),
-            KeyCode::Home if main => self.scroll_tab(false, usize::MAX),
-            KeyCode::End if main => self.scroll_tab(true, usize::MAX),
+            KeyCode::Home => self.cursor = 0,
+            KeyCode::End => self.cursor = self.input.len(),
             KeyCode::Char(ch) if !ctrl && !alt && !ch.is_control() && self.input.len() < 8_000 => {
                 self.input.insert(self.cursor, ch);
                 self.cursor += ch.len_utf8();
@@ -1888,7 +1997,7 @@ impl TuiApp {
     }
 
     fn scroll_tab(&mut self, forward: bool, rows: usize) {
-        self.scroll_offset = if forward == (self.active_tab != ActiveTab::Feed) {
+        self.scroll_offset = if forward == (self.active_tab != ActiveTab::Logs) {
             self.scroll_offset.saturating_add(rows)
         } else {
             self.scroll_offset.saturating_sub(rows)
@@ -1914,6 +2023,11 @@ impl TuiApp {
         } else {
             &single_line
         };
+        if self.screen == Screen::Main && !text.is_empty() {
+            self.draft = None;
+            self.status_message = None;
+            self.history_index = None;
+        }
         self.input.insert_str(self.cursor, text);
         self.cursor += text.len();
     }
@@ -1983,14 +2097,13 @@ fn ui(frame: &mut Frame, app: &mut TuiApp) {
         return;
     }
 
-    let header = Paragraph::new(header_line(app)).wrap(Wrap { trim: true });
-    let header_rows = measure_rows(&header, size.width.saturating_sub(2), 4) + 2;
-    let alerts = alert_paragraph(app);
-    let alert_rows = if !app.dirty_paths.is_empty() || app.reconnect_notice.is_some() {
-        measure_rows(&alerts, size.width, 6) + 1
-    } else {
-        0
-    };
+    let project = app
+        .project
+        .root
+        .file_name()
+        .unwrap_or(app.project.root.as_os_str());
+    let title = format!("TALOS · {}   F2 Settings", project.to_string_lossy());
+    let input = InputView::new(app, size);
     let notice = app
         .status_message
         .as_ref()
@@ -1998,57 +2111,118 @@ fn ui(frame: &mut Frame, app: &mut TuiApp) {
     let notice_rows = notice.as_ref().map_or(0, |paragraph| {
         measure_rows(paragraph, size.width, (size.height / 4).max(2))
     });
-    let input = InputView::new(app, size);
     let chunks = Layout::vertical([
-        Constraint::Length(header_rows),
-        Constraint::Length(alert_rows),
-        Constraint::Length(3),
-        Constraint::Min(4),
-        Constraint::Length(input.height),
+        Constraint::Length(1),
+        Constraint::Length(2),
+        Constraint::Min(2),
         Constraint::Length(notice_rows),
+        Constraint::Length(input.height),
     ])
     .split(size);
 
     frame.render_widget(
-        header.block(Block::bordered().border_style(Style::default().fg(Color::Cyan))),
+        Paragraph::new(safe_display(&title)).style(Style::default().bold()),
         chunks[0],
     );
-    if alert_rows != 0 {
-        frame.render_widget(
-            alerts.block(
-                Block::default()
-                    .borders(Borders::BOTTOM)
-                    .border_style(Style::default().fg(Color::DarkGray)),
-            ),
-            chunks[1],
-        );
-    }
-    render_tabs(frame, app, chunks[2]);
+    render_tabs(frame, app, chunks[1]);
     match app.active_tab {
-        ActiveTab::Feed => render_feed_tab(frame, app, chunks[3]),
-        ActiveTab::Dialogue => render_dialogue_tab(frame, app, chunks[3]),
-        ActiveTab::Diff => render_diff_tab(frame, app, chunks[3]),
-        ActiveTab::Audit => render_audit_tab(frame, app, chunks[3]),
+        ActiveTab::Work => render_work_tab(frame, app, chunks[2]),
+        ActiveTab::Dialogue => render_dialogue_tab(frame, app, chunks[2]),
+        ActiveTab::Diff => render_diff_tab(frame, app, chunks[2]),
+        ActiveTab::Logs => render_unified_feed(frame, app, chunks[2]),
+        ActiveTab::History => render_history_tab(frame, app, chunks[2]),
+    }
+    if let Some(notice) = notice {
+        frame.render_widget(notice, chunks[3]);
     }
     input.render(frame, chunks[4]);
-    if let Some(notice) = notice {
-        frame.render_widget(notice, chunks[5]);
+    if app.is_palette_active() {
+        render_command_palette(frame, app, chunks[4]);
     }
+}
+
+fn render_command_palette(frame: &mut Frame, app: &mut TuiApp, input_area: Rect) {
+    let matches = app.palette_matches();
+    if matches.is_empty() {
+        return;
+    }
+    let max_visible = 6.min(matches.len());
+    let popup_height = (max_visible + 2) as u16;
+    let popup_width = input_area.width.saturating_sub(4).min(76);
+    let popup_y = input_area.y.saturating_sub(popup_height);
+    let popup_area = Rect {
+        x: input_area.x + 2,
+        y: popup_y,
+        width: popup_width,
+        height: popup_height,
+    };
+
+    frame.render_widget(Clear, popup_area);
+
+    let selected = app.palette_index.min(matches.len().saturating_sub(1));
+    let start_idx = if selected >= max_visible {
+        selected + 1 - max_visible
+    } else {
+        0
+    };
+    let end_idx = (start_idx + max_visible).min(matches.len());
+
+    let items: Vec<ListItem> = matches[start_idx..end_idx]
+        .iter()
+        .enumerate()
+        .map(|(rel_idx, item)| {
+            let actual_idx = start_idx + rel_idx;
+            let is_selected = actual_idx == selected;
+            let (cmd_style, desc_style, bg_style) = if is_selected {
+                (
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                    Style::default().fg(Color::White),
+                    Style::default().bg(Color::Rgb(30, 45, 70)),
+                )
+            } else {
+                (
+                    Style::default().fg(Color::Cyan),
+                    Style::default().fg(Color::DarkGray),
+                    Style::default(),
+                )
+            };
+            let prefix = if is_selected { " ▶ " } else { "   " };
+            let line = Line::from(vec![
+                Span::styled(prefix, cmd_style),
+                Span::styled(format!("{:<16}", item.cmd), cmd_style),
+                Span::styled(item.description, desc_style),
+            ]);
+            ListItem::new(line).style(bg_style)
+        })
+        .collect();
+
+    let block = Block::bordered()
+        .title(" Slash Commands (↑/↓ to navigate, Tab/Enter to choose) ")
+        .title_style(
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )
+        .border_style(Style::default().fg(Color::Yellow));
+
+    frame.render_widget(List::new(items).block(block), popup_area);
 }
 
 fn render_workflow(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     let editing = matches!(
         app.screen,
-        Screen::ChooseProject | Screen::WriterModel | Screen::CriticModel | Screen::Task
+        Screen::ChooseProject | Screen::WriterModel | Screen::CriticModel
     );
     let input = editing.then(|| InputView::new(app, area));
     let (title, body, actions) = match app.screen {
         Screen::ChooseProject => (
-            "Choose project",
+            "Work",
             "Enter the path to an existing Git project. If you have just installed TALOS, you can also open a terminal inside your project and run talos there.".into(),
             "Enter  Open project   Esc  Clear path".to_owned(),
         ),
-        Screen::Settings => {
+        Screen::Settings | Screen::WriterModel | Screen::CriticModel => {
             let config = app.settings.as_ref().unwrap_or(&app.config);
             let writer = adapter_label(config.writer, &app.available);
             let critic = adapter_label(config.critic, &app.available);
@@ -2058,6 +2232,7 @@ fn render_workflow(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
                 format!("Reviews changes    {critic}"),
                 format!("Reviewer model     {}", config.critic_model.as_deref().unwrap_or("CLI default")),
                 format!("Mode               {}", match config.orchestration.mode {
+                    OrchestrationMode::Adaptive => "Adaptive · select Pair or Team for each task",
                     OrchestrationMode::Pair => "Pair · write, review, verify",
                     OrchestrationMode::Team => "Team · parallel writers and review",
                 }),
@@ -2076,90 +2251,24 @@ fn render_workflow(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
             } else {
                 body.push_str(&format!("\n\nFound locally: {discovered}\nSign in or configure credentials in the agent's own CLI if required."));
             }
-            ("Settings", body, "↑ ↓  Select   ← →  Change / edit   Enter  Save   R  Check again   Esc  Back".to_owned())
-        }
-        Screen::WriterModel | Screen::CriticModel => (
-            if app.screen == Screen::WriterModel { "Writer model" } else { "Reviewer model" },
-            "Enter a model name supported by this CLI. Leave the field empty to use the CLI default.".into(),
-            "Enter  Apply   Esc  Back".to_owned(),
-        ),
-        Screen::Review => {
-            let Some(draft) = &app.draft else { return; };
-            let config = &draft.config;
-            let checks = if config.checks.is_empty() {
-                "No project checks configured".to_owned()
+            body.push_str("\n\nProject checks");
+            if config.checks.is_empty() {
+                body.push_str("\nNo checks configured.");
             } else {
-                config.checks.iter().map(|check| format!("{} · {}", check.id, check.argv.join(" ")))
-                    .collect::<Vec<_>>().join("\n")
-            };
-            let mut body = format!(
-                "Writes code   {} ({})\nReviews       {} ({})\nMode          {}\nChecks        {}\n\n{}",
-                config.writer.as_str(), config.writer_model.as_deref().unwrap_or("CLI default"),
-                config.critic.as_str(), config.critic_model.as_deref().unwrap_or("CLI default"),
-                config.orchestration.mode.as_str(), checks, draft.criteria
-            );
-            if let Some(policy) = &config.github
-                && policy.allow_push && policy.allow_pull_request
-                && config.orchestration.mode == OrchestrationMode::Pair
-            {
-                body = format!("GitHub draft PR enabled for {}.\n\n{body}", policy.repository);
-            }
-            let actions = if let Some(blocker) = app.run_blocker(None) {
-                body = format!("{blocker}\n\n{body}");
-                "Esc  Edit   S  Settings   D  View changes   R  Check again   U  Resume queue"
-            } else {
-                "Enter  Run task   Esc  Edit   S  Settings"
-            };
-            ("Review task", body, actions.to_owned())
-        }
-        Screen::History => {
-            let body = if app.history.is_empty() {
-                "No tasks on this page. Press F4 to start a new task or Page Up for the latest tasks.".to_owned()
-            } else {
-                app.history.iter().enumerate().map(|(index, entry)| {
-                    let task = &entry.task;
-                    let title = task.title.lines().next().unwrap_or_default();
-                    let status = if entry.cancelled { "cancelled" } else { task.status.as_str() };
-                    format!("{} #{} · {status} · {title}", if index == app.selection { ">" } else { " " }, task.id)
-                }).collect::<Vec<_>>().join("\n")
-            };
-            ("History", body, "↑ ↓  Select   Enter  Open result   PgDn  Older   PgUp  Latest   F4  New session   Esc  Back".to_owned())
-        }
-        Screen::Task => {
-            let hint = if app.supervisor_running {
-                if app.active_tasks.iter().any(|task| Some(task.id) == app.task_view) {
-                    "Running   S  Request stop for Writer   ↑ ↓  Scroll   F3  History"
-                } else {
-                    "Starting or another task is running   ↑ ↓  Scroll   F3  History"
+                for check in &config.checks {
+                    body.push_str(&format!("\n{} · {}", check.id, check.argv.join(" ")));
                 }
-            } else if app.task_status == Some(TaskStatus::Queued) {
-                "R  Retry   C  Cancel queued task   F2  Settings   F3  History   F4  New session"
-            } else if app.can_retry_task() {
-                "R  Retry this stage   F2  Settings   F3  History   ↑ ↓  Scroll"
-            } else if matches!(app.task_status, Some(TaskStatus::Failed | TaskStatus::Blocked)) {
-                "E  Edit as new task   F2  Settings   F3  History   F4  New session"
+            }
+            if let Some(repository) = app.publication_target() {
+                body.push_str(&format!("\n\nGitHub draft PR enabled for {repository}."));
+            }
+            let actions = if editing {
+                "Enter  Apply model   Esc  Cancel edit"
             } else {
-                "D  View changes   F4  New session   F3  History   ↑ ↓  Scroll   Esc  Back"
+                "↑ ↓  Select   ← →  Change / edit   Enter  Save   R  Check again   Esc  Back"
             };
-            let hint = if app.queue_paused {
-                format!("{hint}   U  Resume queue")
-            } else if app.task_status != Some(TaskStatus::Complete) && !app.dirty_paths.is_empty() {
-                format!("{hint}   D  View changes")
-            } else {
-                hint.to_owned()
-            };
-            let body = if let Some(note) = &app.run_notice {
-                format!("{note}\n\n{}", app.task_details)
-            } else {
-                app.task_details.clone()
-            };
-            ("Task result", body, hint)
+            ("Settings", body, actions.to_owned())
         }
-        Screen::Changes => (
-            "Saved changes",
-            if app.result_diff.is_empty() { "This result has no Git file changes.".into() } else { app.result_diff.clone() },
-            "↑ ↓  Scroll changes   Esc  Back to result   F4  New session".to_owned(),
-        ),
         Screen::Main => unreachable!(),
     };
     let project = app.project.root.display();
@@ -2192,11 +2301,7 @@ fn render_workflow(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     let paragraph = Paragraph::new(body.as_str()).wrap(Wrap { trim: false });
     let max_scroll = wrapped_scroll_limit(&paragraph, inner).min(u16::MAX as usize) as u16;
     let scroll = match app.screen {
-        Screen::Task | Screen::Review | Screen::Changes => {
-            app.detail_scroll = app.detail_scroll.min(max_scroll);
-            app.detail_scroll
-        }
-        Screen::Settings | Screen::History => {
+        Screen::Settings | Screen::WriterModel | Screen::CriticModel => {
             let lines = body
                 .lines()
                 .take(app.selection.saturating_add(1))
@@ -2236,460 +2341,138 @@ fn safe_display(text: &str) -> String {
         .collect()
 }
 
-fn header_line(app: &TuiApp) -> Line<'static> {
-    let mode_str = match app.config.orchestration.mode {
-        OrchestrationMode::Pair => "PAIR",
-        OrchestrationMode::Team => "TEAM",
-    };
-
-    let status_span = if app.queue_paused {
-        Span::styled(
-            " [⏸ PAUSED] ",
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else if app.supervisor_running {
-        Span::styled(
-            " [● RUNNING] ",
-            Style::default()
-                .fg(Color::Green)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled(
-            " [○ IDLE] ",
-            Style::default()
-                .fg(Color::DarkGray)
-                .add_modifier(Modifier::BOLD),
-        )
-    };
-
-    let tmux_span = if app.is_in_tmux {
-        Span::styled(
-            " [tmux: attached] ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        )
-    } else {
-        Span::styled(" [tmux: direct] ", Style::default().fg(Color::DarkGray))
-    };
-
-    let project_name = app
-        .project
-        .root
-        .file_name()
-        .map(|n| n.to_string_lossy())
-        .unwrap_or_default();
-
-    Line::from(vec![
-        Span::styled(
-            "TALOS",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" | Project: "),
-        Span::styled(
-            project_name.to_string(),
-            Style::default()
-                .fg(Color::White)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" | Mode: "),
-        Span::styled(
-            mode_str,
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" | Queue: "),
-        Span::styled(
-            format!(
-                "{} active, {} queued, {} complete",
-                app.queue.active, app.queue.queued, app.queue.complete
-            ),
-            Style::default().fg(Color::White),
-        ),
-        status_span,
-        tmux_span,
-    ])
-}
-
-fn alert_paragraph(app: &TuiApp) -> Paragraph<'static> {
-    let mut alert_spans = Vec::new();
-
-    if let Some(ref notice) = app.reconnect_notice {
-        alert_spans.push(Span::styled(
-            format!(" 🔄 {notice} "),
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    if !app.dirty_paths.is_empty() {
-        alert_spans.push(Span::styled(
-            format!(
-                " {} uncommitted path(s). Press 3 to view changes before running a task. ",
-                app.dirty_paths.total_count
-            ),
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ));
-    }
-
-    Paragraph::new(Line::from(alert_spans)).wrap(Wrap { trim: true })
-}
-
 fn render_tabs(frame: &mut Frame, app: &TuiApp, area: Rect) {
-    let titles = if area.width < 42 {
-        ["1 Feed", "2 Rev", "3 Diff", "4 Test"]
-    } else if area.width < 81 {
-        ["1 Feed", "2 Review", "3 Diff", "4 Checks"]
+    let titles = if area.width < 49 {
+        ["1 Work", "2 Rev", "3 Diff", "4 Log", "5 Hist"]
     } else {
-        [
-            ActiveTab::Feed.title(),
-            ActiveTab::Dialogue.title(),
-            ActiveTab::Diff.title(),
-            ActiveTab::Audit.title(),
-        ]
+        ActiveTab::ALL.map(ActiveTab::title)
     };
-
     let tabs = Tabs::new(titles)
         .select(app.active_tab as usize)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(Style::default().fg(Color::DarkGray)),
-        )
-        .style(Style::default().fg(Color::DarkGray))
-        .highlight_style(
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        );
-
+        .padding("", "")
+        .divider("  ")
+        .highlight_style(Style::default().fg(Color::Cyan).bold());
     frame.render_widget(tabs, area);
 }
 
-fn render_feed_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
-    if area.width >= 100 {
-        // Horizontal split: Left Cockpit Sidebar (34 cols), Right Unified Feed
-        let chunks = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(34), Constraint::Min(40)])
-            .split(area);
-
-        render_cockpit_sidebar(frame, app, chunks[0]);
-        render_unified_feed(frame, app, chunks[1]);
-    } else if area.height < 12 {
-        render_unified_feed(frame, app, area);
-    } else {
-        // Narrow vertical split: Top Compact Cockpit (7 rows), Bottom Unified Feed
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Length(7), Constraint::Min(8)])
-            .split(area);
-
-        render_cockpit_compact(frame, app, chunks[0]);
-        render_unified_feed(frame, app, chunks[1]);
-    }
-}
-
-fn render_cockpit_sidebar(frame: &mut Frame, app: &TuiApp, area: Rect) {
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(8), // Agents & Model
-            Constraint::Length(7), // Active Task
-            Constraint::Min(6),    // Queue & Repository
-        ])
-        .split(area);
-
-    let active_task = app.active_tasks.first();
-
-    // 1. Agents & Model Block
-    let writer_profile = app.config.writer.as_str();
-    let critic_profile = app.config.critic.as_str();
-    let writer_model_str = app.config.writer_model.as_deref().unwrap_or("default");
-    let critic_model_str = app.config.critic_model.as_deref().unwrap_or("default");
-    let (mode_str, mode_color) = match app.config.orchestration.mode {
-        OrchestrationMode::Pair => ("PAIR", Color::Cyan),
-        OrchestrationMode::Team => ("TEAM", Color::Magenta),
-    };
-
-    let agent_lines = vec![
-        Line::from(vec![
-            Span::styled("Writes: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                writer_profile,
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" ({})", writer_model_str),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Reviews: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                critic_profile,
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                format!(" ({})", critic_model_str),
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Mode:   ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                mode_str,
-                Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(
-                if app.config.orchestration.mode == OrchestrationMode::Team {
-                    format!(
-                        " (max {} workers)",
-                        app.config.orchestration.max_writer_workers
-                    )
-                } else {
-                    String::new()
-                },
-                Style::default().fg(Color::DarkGray),
-            ),
-        ]),
-        Line::from(Span::styled(
-            "F2 Settings · F4 New session",
-            Style::default().fg(Color::DarkGray),
-        )),
-    ];
-
-    let agent_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" 🤖 AI Agents ")
-        .border_style(Style::default().fg(Color::Yellow));
-
-    frame.render_widget(Paragraph::new(agent_lines).block(agent_block), chunks[0]);
-
-    // 2. Active Task Block
-    let task_lines = if let Some(task) = active_task {
-        let (status_color, status_icon) = match task.status {
-            TaskStatus::Queued => (Color::DarkGray, "○"),
-            TaskStatus::Planning => (Color::Cyan, "◐"),
-            TaskStatus::Implementing => (Color::Yellow, "●"),
-            TaskStatus::Reviewing => (Color::Magenta, "●"),
-            TaskStatus::Verifying => (Color::Blue, "●"),
-            TaskStatus::Complete => (Color::Green, "✔"),
-            TaskStatus::Blocked | TaskStatus::Failed => (Color::Red, "✖"),
-        };
-
-        vec![
-            Line::from(vec![
-                Span::styled(
-                    format!("#{} ", task.id),
-                    Style::default()
-                        .fg(Color::White)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("{status_icon} {}", task.status.as_str()),
-                    Style::default()
-                        .fg(status_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-            ]),
-            Line::from(Span::styled(
-                safe_display(&task.title).replace('\n', " "),
-                Style::default().fg(Color::White),
-            )),
-            Line::from(vec![
-                Span::styled("Worktrees: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{} active", app.worktrees.len()),
-                    Style::default().fg(Color::Cyan),
-                ),
-            ]),
-        ]
-    } else {
-        vec![
-            Line::from(Span::styled(
-                "○ Idle",
-                Style::default()
-                    .fg(Color::DarkGray)
-                    .add_modifier(Modifier::BOLD),
-            )),
-            Line::from(Span::styled(
-                "Waiting for runnable tasks",
-                Style::default().fg(Color::DarkGray),
-            )),
-            Line::from(vec![
-                Span::styled("Enqueued: ", Style::default().fg(Color::DarkGray)),
-                Span::styled(
-                    format!("{} waiting", app.queue.queued),
-                    Style::default().fg(Color::White),
-                ),
-            ]),
-        ]
-    };
-
-    let task_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" 🎯 Active Task ")
-        .border_style(Style::default().fg(if active_task.is_some() {
-            Color::Cyan
+fn render_work_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
+    let mut lines = Vec::new();
+    let blocker = app.run_blocker(None);
+    if let Some(draft) = &app.draft {
+        lines.push(Line::from("Ready to confirm").style(Style::default().bold()));
+        if let Some(repository) = app.publication_target() {
+            lines.push(Line::from(safe_display(&format!(
+                "This task can open a draft PR in {repository}."
+            ))));
+        }
+        lines.push(Line::from("Enter Confirm · Esc Back"));
+        lines.push(Line::default());
+        lines.extend(
+            safe_display(&draft.criteria)
+                .lines()
+                .map(|line| Line::from(line.to_owned())),
+        );
+    } else if let (Some(status), Some(id)) = (&app.task_status, app.task_view) {
+        let label = if app.task_cancelled {
+            "Cancelled"
         } else {
-            Color::DarkGray
-        }));
-
-    frame.render_widget(
-        Paragraph::new(task_lines)
-            .wrap(Wrap { trim: true })
-            .block(task_block),
-        chunks[1],
-    );
-
-    // 3. Queue & Repository State Block
-    let git_status_line = if app.dirty_paths.is_empty() {
-        Line::from(vec![
-            Span::styled("Git: ", Style::default().fg(Color::DarkGray)),
-            Span::styled("Clean (HEAD)", Style::default().fg(Color::Green)),
-        ])
+            match status {
+                TaskStatus::Queued if app.child.as_ref().is_some_and(|(task, _)| *task == id) => {
+                    "Starting"
+                }
+                TaskStatus::Queued => "Waiting to run",
+                TaskStatus::Planning => "Planning",
+                TaskStatus::Implementing => "Making changes",
+                TaskStatus::Reviewing => "Reviewing changes",
+                TaskStatus::Verifying => "Running checks",
+                TaskStatus::Complete => "Completed",
+                TaskStatus::Blocked => "Blocked",
+                TaskStatus::Failed => "Failed",
+            }
+        };
+        lines.push(Line::from(format!("{label} · Task #{id}")).style(Style::default().bold()));
+        lines.push(Line::from(safe_display(&app.task_title)));
+        if let Some(notice) = &app.run_notice {
+            lines.push(Line::default());
+            lines.push(Line::from(safe_display(notice)));
+        }
+        if *status == TaskStatus::Complete {
+            let checks = match app.verification_status.as_deref() {
+                Some("passed") => "Project checks passed.",
+                _ if app.verification_checks.is_empty() => "No project checks configured.",
+                _ => "Open Review for recorded checks.",
+            };
+            lines.push(Line::from(checks));
+            lines.push(Line::from("Alt+3 View changes"));
+        } else if app.can_retry_task() {
+            lines.push(Line::from(if *status == TaskStatus::Queued {
+                "F5 Retry · F6 Cancel queued task"
+            } else {
+                "F5 Retry this stage"
+            }));
+        } else if !app.supervisor_running
+            && !app.task_cancelled
+            && matches!(status, TaskStatus::Failed | TaskStatus::Blocked)
+        {
+            lines.push(Line::from("F6 Edit as new task · Alt+4 Logs"));
+        } else if app.active_tasks.iter().any(|task| task.id == id) {
+            lines.push(Line::from("/stop Request stop"));
+        }
     } else {
-        Line::from(vec![
-            Span::styled("Git: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("⚠️ {} dirty files", app.dirty_paths.total_count),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ])
-    };
+        let status = if blocker.is_some() {
+            "Blocked"
+        } else {
+            "Ready"
+        };
+        lines.push(Line::from(status).style(Style::default().bold()));
+        lines.push(Line::from("Describe a change to make in this project."));
+    }
 
-    let queue_lines = vec![
-        Line::from(vec![
-            Span::styled("Active:   ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}", app.queue.active),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(" | Queued: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}", app.queue.queued),
-                Style::default().fg(Color::White),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Complete: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}", app.queue.complete),
-                Style::default().fg(Color::Green),
-            ),
-            Span::styled(" | Failed: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{}", app.queue.blocked_or_failed),
-                Style::default().fg(if app.queue.blocked_or_failed > 0 {
-                    Color::Red
-                } else {
-                    Color::DarkGray
-                }),
-            ),
-        ]),
-        git_status_line,
-        Line::from(vec![
-            Span::styled("Checks:   ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                format!("{} configured", app.config.checks.len()),
-                Style::default().fg(Color::White),
-            ),
-        ]),
-    ];
+    if let Some(blocker) = blocker
+        && !app.supervisor_running
+        && app.active_tasks.is_empty()
+        && app.status_message.is_none()
+    {
+        lines.push(Line::default());
+        lines.push(Line::from(safe_display(&blocker)));
+    }
 
-    let queue_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" 📊 Repository & Queue ")
-        .border_style(Style::default().fg(Color::DarkGray));
-
-    frame.render_widget(Paragraph::new(queue_lines).block(queue_block), chunks[2]);
+    render_reader(
+        frame,
+        Paragraph::new(lines),
+        Block::bordered(),
+        area,
+        &mut app.scroll_offset,
+    );
 }
 
-fn render_cockpit_compact(frame: &mut Frame, app: &TuiApp, area: Rect) {
-    let mode_str = match app.config.orchestration.mode {
-        OrchestrationMode::Pair => "PAIR",
-        OrchestrationMode::Team => "TEAM",
-    };
-
-    let active_task_summary = if let Some(task) = app.active_tasks.first() {
-        format!("#{} {} (● {})", task.id, task.title, task.status.as_str())
-    } else {
-        "Idle (No active task)".to_string()
-    };
-
-    let lines = vec![
-        Line::from(vec![
-            Span::styled("Mode: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                mode_str,
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" | Writer: "),
-            Span::styled(
-                app.config.writer.as_str(),
-                Style::default()
-                    .fg(Color::Yellow)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" | Critic: "),
-            Span::styled(
-                app.config.critic.as_str(),
-                Style::default()
-                    .fg(Color::Magenta)
-                    .add_modifier(Modifier::BOLD),
-            ),
-        ]),
-        Line::from(vec![
-            Span::styled("Active: ", Style::default().fg(Color::DarkGray)),
-            Span::styled(
-                active_task_summary,
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" | Worktrees: "),
-            Span::styled(
-                format!("{}", app.worktrees.len()),
-                Style::default().fg(Color::Cyan),
-            ),
-        ]),
-        Line::from(vec![Span::styled(
-            format!(
-                "Queue: {} active, {} queued, {} complete | Git: {} dirty files",
-                app.queue.active, app.queue.queued, app.queue.complete, app.dirty_paths.total_count
-            ),
-            Style::default().fg(Color::Gray),
-        )]),
-    ];
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" 🎛 Cockpit Summary ")
-        .border_style(Style::default().fg(Color::DarkGray));
-
-    frame.render_widget(
-        Paragraph::new(lines).wrap(Wrap { trim: true }).block(block),
+fn render_history_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let block = Block::bordered().title(" Enter Open · ↑↓ Select · PgUp/PgDn Pages ");
+    if app.history.is_empty() {
+        frame.render_widget(Paragraph::new("No tasks yet.").block(block), area);
+        return;
+    }
+    let mut state =
+        ratatui::widgets::ListState::default().with_selected(Some(app.history_selection));
+    let items = app.history.iter().map(|entry| {
+        let task = &entry.task;
+        let status = if entry.cancelled {
+            "cancelled"
+        } else {
+            task.status.as_str()
+        };
+        ListItem::new(safe_display(&format!(
+            "#{} · {status} · {}",
+            task.id, task.title
+        )))
+    });
+    frame.render_stateful_widget(
+        List::new(items)
+            .block(block)
+            .highlight_symbol("› ")
+            .highlight_style(Style::default().fg(Color::Cyan).bold()),
         area,
+        &mut state,
     );
 }
 
@@ -2850,9 +2633,9 @@ fn render_unified_feed(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     app.scroll_offset = app.scroll_offset.min(max_scroll);
     let start = (max_scroll - app.scroll_offset) as u16;
     let title = if app.scroll_offset > 0 {
-        " Live Unified Feed · End to follow "
+        " Logs · End to follow "
     } else {
-        " ⚡ Live Unified Feed (Auto-scroll active) "
+        " Logs · Following "
     };
     frame.render_widget(feed.block(block.title(title)).scroll((start, 0)), area);
 }
@@ -2934,9 +2717,24 @@ fn render_dialogue_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
         )));
     }
 
+    if let Some(id) = app.task_view {
+        lines.push(Line::default());
+        let checks = app
+            .verification_status
+            .as_deref()
+            .unwrap_or("No run recorded");
+        lines.push(Line::from(format!("Project checks · {checks}")));
+        let report = crate::summary::task_summary_path(&app.project.root, id);
+        if report.is_file() {
+            lines.push(Line::from(safe_display(&format!(
+                "Saved report · .talos/reports/task-{id}.md"
+            ))));
+        }
+    }
+
     let block = Block::default()
         .borders(Borders::ALL)
-        .title(" 💬 Peer Review & Decision Log ")
+        .title(" Review ")
         .border_style(Style::default().fg(Color::Magenta));
 
     render_reader(
@@ -2949,6 +2747,16 @@ fn render_dialogue_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
 }
 
 fn render_diff_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
+    if let Some(diff) = &app.result_diff {
+        render_reader(
+            frame,
+            Paragraph::new(diff.as_str()),
+            Block::bordered().title(" Saved changes "),
+            area,
+            &mut app.scroll_offset,
+        );
+        return;
+    }
     if !app.modified_files.is_empty() {
         let files_height = (app.modified_files.len() as u16 + 2).min(7);
         let chunks = Layout::default()
@@ -2982,7 +2790,7 @@ fn render_diff_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
 
         let files_block = Block::default()
             .borders(Borders::ALL)
-            .title(" Changed files · Alt+↑/↓ select · F5 back to task draft ")
+            .title(" Changed files · Alt+↑/↓ Select ")
             .border_style(Style::default().fg(Color::Yellow));
 
         frame.render_widget(List::new(file_items).block(files_block), chunks[0]);
@@ -3047,56 +2855,6 @@ fn render_diff_view(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     );
 }
 
-fn render_audit_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
-    let mut lines = Vec::new();
-
-    lines.push(Line::from(Span::styled(
-        "=== Automated Verification Checks & Test Gate ===",
-        Style::default()
-            .fg(Color::Cyan)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(Span::raw("")));
-
-    if app.verification_checks.is_empty() {
-        lines.push(Line::from(Span::styled(
-            "No automated verification checks configured for this project.",
-            Style::default().fg(Color::DarkGray),
-        )));
-        lines.push(Line::from(Span::styled("In a shell, configure checks with talos config set checks '[{\"id\":\"test\",\"argv\":[\"cargo\",\"test\"],\"version_argv\":[\"cargo\",\"--version\"],\"working_directory\":\".\"}]'", Style::default().fg(Color::DarkGray))));
-    } else {
-        for (i, check) in app.verification_checks.iter().enumerate() {
-            lines.push(Line::from(vec![
-                Span::styled(
-                    format!("Check #{}: ", i + 1),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    &check.id,
-                    Style::default()
-                        .fg(Color::Yellow)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::raw(" -> Command: "),
-                Span::styled(check.argv.join(" "), Style::default().fg(Color::White)),
-            ]));
-        }
-    }
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" 🧪 Verification Suite & Test Gate ")
-        .border_style(Style::default().fg(Color::Cyan));
-
-    render_reader(
-        frame,
-        Paragraph::new(lines),
-        block,
-        area,
-        &mut app.scroll_offset,
-    );
-}
-
 struct InputView {
     lines: Vec<Line<'static>>,
     cursor: (usize, usize),
@@ -3111,21 +2869,13 @@ impl InputView {
         let (short_title, controls) = match app.screen {
             Screen::ChooseProject => (" Project folder ", ""),
             Screen::WriterModel | Screen::CriticModel => (" Model name ", ""),
-            Screen::Task => (
-                " Command ",
-                " /new New session · /config Settings · /history History ",
-            ),
-            _ if !app.available.contains(&app.config.writer)
-                || !app.available.contains(&app.config.critic) =>
-            {
-                (
-                    " Describe task ",
-                    " /config Set up agents · F2 Settings · F3 History ",
-                )
+            Screen::Main if app.draft.is_some() => (" Task ", " Enter Confirm · Esc Back "),
+            Screen::Main if app.active_tab == ActiveTab::History && app.input.is_empty() => {
+                (" Describe a task ", " Enter Open task · Tab Switch view ")
             }
             _ => (
-                " Describe task ",
-                " Describe task · Enter Review · /config Settings · /new New session · F3 History · Esc Clear ",
+                " Describe a task ",
+                " Enter Run · Tab Switch view · Esc Clear ",
             ),
         };
         let width = area.width.saturating_sub(2).max(1);
@@ -3294,7 +3044,7 @@ mod tests {
     }
 
     #[test]
-    fn guided_cockpit_reviews_before_enqueuing_and_resets_the_session() {
+    fn cockpit_preserves_blocked_input_and_enqueues_only_the_submitted_task() {
         let project = test_tui_project();
         let git = |args: &[&str]| {
             let output = std::process::Command::new("git")
@@ -3336,15 +3086,15 @@ mod tests {
         assert_eq!(app.config.writer, AdapterKind::Codex);
         assert_eq!(app.config.critic, AdapterKind::Claude);
 
-        app.paste("Проверка проекта\nKeep the change small.");
-        app.handle_submit().expect("prepare draft");
-        assert_eq!(app.screen, Screen::Review);
+        let prompt = "Проверка проекта\nKeep the change small.";
+        app.paste(prompt);
+        assert_eq!(app.screen, Screen::Main);
         assert_eq!(database.list_tasks().expect("list tasks").len(), 1);
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(90, 25)).expect("terminal");
         terminal
             .draw(|frame| ui(frame, &mut app))
-            .expect("render Cyrillic draft");
+            .expect("render Cyrillic input");
 
         std::fs::write(project.root.join("local-edit.txt"), "user change").expect("dirty project");
         assert!(
@@ -3353,11 +3103,35 @@ mod tests {
                 .to_string()
                 .contains("uncommitted")
         );
+        assert_eq!(app.input, prompt);
+        assert!(app.draft.is_none());
         assert_eq!(database.list_tasks().expect("list tasks").len(), 1);
         std::fs::remove_file(project.root.join("local-edit.txt")).expect("clean test project");
 
-        app.screen = Screen::Task;
-        app.task_view = Some(old.id);
+        app.handle_submit().expect("submit with one Enter");
+        assert_eq!(app.screen, Screen::Main);
+        assert_eq!(app.active_tab, ActiveTab::Work);
+        assert!(app.input.is_empty());
+        let queued = database.list_tasks().expect("list tasks");
+        assert_eq!(queued.len(), 2);
+        let submitted = queued
+            .iter()
+            .find(|task| task.id != old.id)
+            .expect("new task");
+        assert_eq!(submitted.acceptance_criteria, prompt);
+        assert_eq!(app.task_view, Some(submitted.id));
+        assert_eq!(
+            database
+                .get_task(old.id)
+                .expect("query original")
+                .expect("original")
+                .status,
+            TaskStatus::Queued
+        );
+        // Unit tests run under the test harness executable, which cannot run a TALOS task.
+        if let Some((_, mut child)) = app.child.take() {
+            child.wait().expect("reap test harness child");
+        }
         for key in "/new".chars() {
             app.handle_key(KeyEvent::new(KeyCode::Char(key), KeyModifiers::NONE))
                 .expect("type command");
@@ -3369,7 +3143,32 @@ mod tests {
         assert!(app.task_view.is_none());
         assert_eq!(app.config.writer, AdapterKind::Codex);
         app.open_history(None).expect("open history");
-        assert_eq!(app.history[0].task.id, old.id);
+        assert!(app.history.iter().any(|entry| entry.task.id == old.id));
+
+        app.config.github = Some(crate::config::GithubPolicy {
+            repository: "fixture/example".into(),
+            remote: "origin".into(),
+            base_branch: "main".into(),
+            feature_branch_prefix: "talos/".into(),
+            allow_push: true,
+            allow_pull_request: true,
+        });
+        app.config
+            .save(&project)
+            .expect("save publication settings");
+        app.paste("Prepare a draft PR");
+        app.handle_submit()
+            .expect("request publication confirmation");
+        assert_eq!(app.screen, Screen::Main);
+        assert_eq!(app.active_tab, ActiveTab::Work);
+        assert_eq!(app.publication_target(), Some("fixture/example"));
+        assert!(app.draft.is_some());
+        assert!(app.child.is_none());
+        assert_eq!(database.list_tasks().expect("list tasks").len(), 2);
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("cancel confirmation");
+        assert!(app.draft.is_none());
+        assert_eq!(app.input, "Prepare a draft PR");
         std::fs::remove_dir_all(&project.root).expect("remove test project");
     }
 
@@ -3447,6 +3246,14 @@ mod tests {
             "FIRST-MARKER {} LAST-MARKER",
             "The Live Feed entry wraps inside its own panel. ".repeat(30)
         )];
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(108, 26)).expect("terminal");
+        terminal
+            .draw(|frame| ui(frame, &mut app))
+            .expect("draw work");
+        let work = buffer_text(terminal.backend().buffer());
+        assert!(!work.contains("LAST-MARKER"), "{work}");
+        app.select_tab(ActiveTab::Logs);
         for width in [70, 108] {
             let mut terminal =
                 Terminal::new(ratatui::backend::TestBackend::new(width, 26)).expect("terminal");
@@ -3471,18 +3278,15 @@ mod tests {
     }
 
     #[test]
-    fn wrapped_draft_and_diff_scroll_to_the_end_and_back() {
+    fn wrapped_work_preview_and_diff_scroll_to_the_end_and_back() {
         let project = test_tui_project();
         let mut app = TuiApp::with_adapters(project.clone(), Vec::new()).expect("open cockpit");
         let content = format!("{} КОНЕЦ", "Длинный текст для проверки ".repeat(48));
         app.prepare_draft("Check wrap".into(), content.clone());
         let mut terminal =
             Terminal::new(ratatui::backend::TestBackend::new(48, 24)).expect("terminal");
-        for (screen, tab) in [
-            (Screen::Review, ActiveTab::Feed),
-            (Screen::Main, ActiveTab::Diff),
-        ] {
-            app.screen = screen;
+        for tab in [ActiveTab::Work, ActiveTab::Diff] {
+            app.screen = Screen::Main;
             app.select_tab(tab);
             app.diff_lines = vec![content.clone()];
             app.handle_key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE))
@@ -3491,12 +3295,8 @@ mod tests {
                 .draw(|frame| ui(frame, &mut app))
                 .expect("draw end");
             let buffer = buffer_text(terminal.backend().buffer());
-            assert!(buffer.contains("КОНЕЦ"), "{screen:?}\n{buffer}");
-            if screen == Screen::Review {
-                assert!(app.detail_scroll < u16::MAX);
-            } else {
-                assert!(app.scroll_offset < usize::MAX);
-            }
+            assert!(buffer.contains("КОНЕЦ"), "{tab:?}\n{buffer}");
+            assert!(app.scroll_offset < usize::MAX);
             app.handle_key(KeyEvent::new(KeyCode::Home, KeyModifiers::NONE))
                 .expect("scroll to start");
             terminal
@@ -3519,11 +3319,12 @@ mod tests {
 
     #[test]
     fn active_tab_navigation_and_titles() {
-        assert_eq!(ActiveTab::Feed.title(), " 1: Unified Feed ");
-        assert_eq!(ActiveTab::Feed.next(), ActiveTab::Dialogue);
+        assert_eq!(ActiveTab::Work.title(), "1 Work");
+        assert_eq!(ActiveTab::Work.next(), ActiveTab::Dialogue);
         assert_eq!(ActiveTab::Dialogue.next(), ActiveTab::Diff);
-        assert_eq!(ActiveTab::Diff.next(), ActiveTab::Audit);
-        assert_eq!(ActiveTab::Audit.next(), ActiveTab::Feed);
+        assert_eq!(ActiveTab::Diff.next(), ActiveTab::Logs);
+        assert_eq!(ActiveTab::Logs.next(), ActiveTab::History);
+        assert_eq!(ActiveTab::History.next(), ActiveTab::Work);
     }
 
     #[test]
@@ -3541,11 +3342,11 @@ mod tests {
         // 1. Test /feed and aliases
         app.active_tab = ActiveTab::Diff;
         app.execute_slash_command("/feed").expect("execute /feed");
-        assert_eq!(app.active_tab, ActiveTab::Feed);
+        assert_eq!(app.active_tab, ActiveTab::Work);
 
-        app.active_tab = ActiveTab::Audit;
+        app.active_tab = ActiveTab::Logs;
         app.execute_slash_command("/фид").expect("execute /фид");
-        assert_eq!(app.active_tab, ActiveTab::Feed);
+        assert_eq!(app.active_tab, ActiveTab::Work);
 
         // 2. Test /cli without args shows current status
         app.execute_slash_command("/cli").expect("execute /cli");
@@ -3653,7 +3454,7 @@ mod tests {
             let draft = app.draft.as_ref().expect("draft");
             assert!(draft.title.contains(path));
             assert!(draft.criteria.contains(path));
-            assert_eq!(app.screen, Screen::Review);
+            assert_eq!(app.active_tab, ActiveTab::Work);
         }
         let database = Database::open(&project).expect("open db");
         assert!(database.list_tasks().expect("list tasks").is_empty());
@@ -3689,6 +3490,147 @@ mod tests {
 
         app.diff_file_index = 10;
         assert_eq!(app.selected_modified_file(), None);
+
+        let _ = std::fs::remove_dir_all(&project.root);
+    }
+
+    #[test]
+    fn tui_input_history_navigation_with_arrows() {
+        let project = test_tui_project();
+        let mut app = TuiApp::with_adapters(project.clone(), Vec::new()).expect("create TuiApp");
+        app.screen = Screen::Main;
+
+        // 1. Submit multiple distinct inputs
+        app.input = "/feed".to_string();
+        app.handle_submit().expect("submit first");
+
+        app.input = "/diff".to_string();
+        app.handle_submit().expect("submit second");
+
+        // Consecutive duplicate is ignored
+        app.input = "/diff".to_string();
+        app.handle_submit().expect("submit duplicate");
+
+        assert_eq!(app.input_history.len(), 2);
+        assert_eq!(app.input_history[0], "/feed");
+        assert_eq!(app.input_history[1], "/diff");
+
+        // 2. Start typing an unsaved draft
+        app.input = "draft in progress".to_string();
+        app.cursor = app.input.len();
+
+        // 3. Up arrow recalls previous input (/diff)
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .expect("press Up");
+        assert_eq!(app.input, "/diff");
+        assert_eq!(app.history_index, Some(1));
+        assert_eq!(app.saved_draft, "draft in progress");
+
+        // 4. Up arrow recalls earlier input (/feed)
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .expect("press Up again");
+        assert_eq!(app.input, "/feed");
+        assert_eq!(app.history_index, Some(0));
+
+        // 5. Up at top remains at top
+        app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+            .expect("press Up at top");
+        assert_eq!(app.input, "/feed");
+        assert_eq!(app.history_index, Some(0));
+
+        // 6. Down arrow advances forward to "/diff"
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("press Down");
+        assert_eq!(app.input, "/diff");
+        assert_eq!(app.history_index, Some(1));
+
+        // 7. Down arrow at bottom restores the original unsaved draft
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("press Down to bottom");
+        assert_eq!(app.input, "draft in progress");
+        assert_eq!(app.history_index, None);
+
+        let _ = std::fs::remove_dir_all(&project.root);
+    }
+
+    #[test]
+    fn interactive_slash_command_palette_filtering_and_selection() {
+        let project = test_tui_project();
+        let mut app = TuiApp::with_adapters(project.clone(), Vec::new()).expect("create TuiApp");
+        app.screen = Screen::Main;
+
+        // 1. Initially no palette
+        assert!(!app.is_palette_active());
+        assert!(app.palette_matches().is_empty());
+
+        // 2. Typing '/' activates palette with all commands
+        app.input = "/".to_string();
+        app.cursor = 1;
+        assert!(app.is_palette_active());
+        let all_matches = app.palette_matches();
+        assert_eq!(all_matches.len(), PALETTE_COMMANDS.len());
+
+        // 3. Typing '/m' filters to /mode
+        app.input = "/m".to_string();
+        app.cursor = 2;
+        assert!(app.is_palette_active());
+        let m_matches = app.palette_matches();
+        assert!(m_matches.iter().any(|item| item.cmd == "/mode"));
+
+        // 4. Arrow navigation updates palette_index
+        assert_eq!(app.palette_index, 0);
+        app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
+            .expect("palette Down");
+        // If there's only 1 match (/mode), clamped to 0; if multiple, advances
+        let expected_idx = if m_matches.len() > 1 { 1 } else { 0 };
+        assert_eq!(app.palette_index, expected_idx);
+
+        // 5. Tab on filtered match autocompletes the command with trailing space
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))
+            .expect("palette Tab");
+        assert_eq!(app.input, format!("{} ", m_matches[expected_idx].cmd));
+        assert_eq!(app.palette_index, 0);
+        assert!(!app.is_palette_active()); // space terminates palette
+
+        // 6. Typing '/task:t' filters to /task:test and Enter selects it
+        app.input = "/task:t".to_string();
+        app.cursor = app.input.len();
+        assert!(app.is_palette_active());
+        app.handle_submit().expect("submit palette selection");
+        assert_eq!(app.input, "/task:test ");
+
+        let _ = std::fs::remove_dir_all(&project.root);
+    }
+
+    #[test]
+    fn mode_slash_command_supports_adaptive_and_aliases() {
+        let project = test_tui_project();
+        let mut app = TuiApp::with_adapters(project.clone(), Vec::new()).expect("create TuiApp");
+
+        // Default mode is Adaptive
+        assert_eq!(app.config.orchestration.mode, OrchestrationMode::Adaptive);
+
+        // /mode team
+        app.execute_slash_command("/mode team").expect("set team");
+        assert_eq!(app.config.orchestration.mode, OrchestrationMode::Team);
+
+        // /mode pair
+        app.execute_slash_command("/mode pair").expect("set pair");
+        assert_eq!(app.config.orchestration.mode, OrchestrationMode::Pair);
+
+        // /mode adaptive
+        app.execute_slash_command("/mode adaptive")
+            .expect("set adaptive");
+        assert_eq!(app.config.orchestration.mode, OrchestrationMode::Adaptive);
+
+        // Russian alias: /mode авто
+        app.execute_slash_command("/mode авто").expect("set auto");
+        assert_eq!(app.config.orchestration.mode, OrchestrationMode::Adaptive);
+
+        // Russian alias: /mode команда
+        app.execute_slash_command("/mode команда")
+            .expect("set team ru");
+        assert_eq!(app.config.orchestration.mode, OrchestrationMode::Team);
 
         let _ = std::fs::remove_dir_all(&project.root);
     }

@@ -486,6 +486,7 @@ No schema change for process identity is selected or implemented. The separate s
 
 ## ADR-051 — Guided first run and task sessions
 
+- **Cockpit update:** Work holds the task input, progress and result. Settings holds agent assignments and project checks. Review, Changes, Logs and History are Work tabs. Plain local tasks launch on Enter. Generated presets and tasks with draft PR publishing have inline confirmation. Task dispatch still binds the task ID and settings fingerprint. Failed preflight keeps the input, and a failed launch leaves the queued task available for retry or cancellation.
 - **Decision:** The cockpit shows project readiness, role settings, a reviewable task draft, and task history. Confirmation dispatches only the selected task. A new cockpit session clears the draft and feed, keeps project settings and durable history, and never resumes a previous provider conversation implicitly.
 - **Invariants:** Automatic startup and reports leave tracked project files untouched. Existing dirty paths still block a new run. Queue cancellation and dispatch must remain consistent under concurrent processes. A CLI found locally does not prove authentication. Release automation proposes tap changes only after the release binaries exist.
 - **Failure cases:** Show missing tools, invalid project state, checkout changes, launch failures, and failed checks with an action the operator can take. A failed start keeps the queued task available for an explicit retry or cancellation.

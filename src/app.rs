@@ -33,9 +33,8 @@ use crate::{
     revision::{RevisionSnapshot, clean_base_commit, git_head, git_output_has_any_bytes},
     secrets::{contains_sensitive, redact_sensitive},
     supervisor::{
-        VERIFIED_AGY_CRITIC_VERSION, VERIFIED_AGY_WRITE_VERSION, WriterContinuation,
-        WriterRunOptions, continue_writer_attempt_with_options, run_critic_review,
-        run_writer_attempt_with_options, validate_project_scope,
+        WriterContinuation, WriterRunOptions, continue_writer_attempt_with_options,
+        run_critic_review, run_writer_attempt_with_options, validate_project_scope,
     },
     tmux::{TmuxClient, TmuxProbe},
     worktree,
@@ -3206,6 +3205,136 @@ pub(crate) fn config_fingerprint(config: &ProjectConfig) -> Result<String> {
         .collect())
 }
 
+async fn resolve_adaptive_orchestration_mode(
+    project: &Project,
+    database: &mut Database,
+    task: &TaskRecord,
+    config: &ProjectConfig,
+) -> Result<crate::config::OrchestrationMode> {
+    println!("\n>>> [TALOS Adaptive] Evaluating task scope for auto-orchestration...");
+
+    let child_subtasks = database.team_subtasks_for_parent(task.id)?;
+    if !child_subtasks.is_empty() {
+        println!(">>> [TALOS Adaptive] Existing team subtasks detected -> choosing TEAM mode.");
+        let _ = database.record_task_event(
+            task.id,
+            "talos_adaptive",
+            "task.adaptive_route",
+            "Auto-routed to team mode (subtasks present)",
+            None,
+        );
+        return Ok(crate::config::OrchestrationMode::Team);
+    }
+
+    let title_lower = task.title.to_lowercase();
+    let crit_lower = task.acceptance_criteria.to_lowercase();
+    let is_complex_keyword = title_lower.contains("refactor")
+        || title_lower.contains("architect")
+        || title_lower.contains("team")
+        || title_lower.contains("multi-module")
+        || title_lower.contains("migration")
+        || crit_lower.contains("refactor")
+        || crit_lower.contains("multi-module")
+        || crit_lower.contains("architectural");
+
+    let repo_summary = match git_status_paths(project) {
+        Ok(paths) => paths.display_preview(),
+        Err(_) => "clean repository".to_string(),
+    };
+    let triage_prompt = crate::team::build_task_triage_prompt(task, &repo_summary);
+    let triage_query =
+        if let Ok((writer_exe, _)) = resolve_adapter_executable(config.writer, &project.root) {
+            crate::supervisor::run_agent_query(
+                &project.root,
+                config.writer,
+                writer_exe,
+                config.writer_model.clone(),
+                triage_prompt,
+                false,
+                Duration::from_secs(60),
+            )
+            .await
+        } else {
+            Err(anyhow::anyhow!(
+                "Writer executable unavailable for triage query"
+            ))
+        };
+
+    let chosen_mode = match triage_query {
+        Ok(resp) => match crate::team::parse_task_triage(&resp) {
+            Ok(rec) => {
+                let mode = if rec.complexity == crate::team::TaskComplexity::Complex
+                    || rec.recommended_depth == crate::team::RecommendedDepth::Deep
+                {
+                    crate::config::OrchestrationMode::Team
+                } else {
+                    crate::config::OrchestrationMode::Pair
+                };
+                println!(
+                    ">>> [TALOS Adaptive] Pre-flight triage: {} complexity, {} depth -> choosing {} mode (rationale: {})",
+                    rec.complexity.as_str(),
+                    rec.recommended_depth.as_str(),
+                    mode.as_str().to_uppercase(),
+                    rec.rationale
+                );
+                let _ = database.record_task_event(
+                    task.id,
+                    "talos_adaptive",
+                    "task.adaptive_route",
+                    &format!(
+                        "Auto-routed to {} mode (triage: {}, {})",
+                        mode.as_str(),
+                        rec.complexity.as_str(),
+                        rec.recommended_depth.as_str()
+                    ),
+                    None,
+                );
+                mode
+            }
+            Err(e) => {
+                let mode = if is_complex_keyword {
+                    crate::config::OrchestrationMode::Team
+                } else {
+                    crate::config::OrchestrationMode::Pair
+                };
+                println!(
+                    ">>> [TALOS Adaptive] Note: Triage parse failed ({e:#}); heuristic routed to {} mode.",
+                    mode.as_str().to_uppercase()
+                );
+                let _ = database.record_task_event(
+                    task.id,
+                    "talos_adaptive",
+                    "task.adaptive_route",
+                    &format!("Auto-routed to {} mode (heuristic fallback)", mode.as_str()),
+                    None,
+                );
+                mode
+            }
+        },
+        Err(e) => {
+            let mode = if is_complex_keyword {
+                crate::config::OrchestrationMode::Team
+            } else {
+                crate::config::OrchestrationMode::Pair
+            };
+            println!(
+                ">>> [TALOS Adaptive] Note: Triage query failed ({e:#}); heuristic routed to {} mode.",
+                mode.as_str().to_uppercase()
+            );
+            let _ = database.record_task_event(
+                task.id,
+                "talos_adaptive",
+                "task.adaptive_route",
+                &format!("Auto-routed to {} mode (heuristic fallback)", mode.as_str()),
+                None,
+            );
+            mode
+        }
+    };
+
+    Ok(chosen_mode)
+}
+
 async fn run_one_shot_auto(
     json_output: bool,
     project: &Project,
@@ -3273,21 +3402,30 @@ async fn run_one_shot_auto(
         };
 
         tasks_processed += 1;
+        let effective_mode = match mode {
+            crate::config::OrchestrationMode::Pair => crate::config::OrchestrationMode::Pair,
+            crate::config::OrchestrationMode::Team => crate::config::OrchestrationMode::Team,
+            crate::config::OrchestrationMode::Adaptive => {
+                resolve_adaptive_orchestration_mode(project, database, &task, &config).await?
+            }
+        };
+
         println!(
             "\n=======================================================\n>>> [TALOS Auto ({})] Processing Task #{} ({}): {}\n=======================================================",
-            mode.as_str().to_uppercase(),
+            effective_mode.as_str().to_uppercase(),
             task.id,
             task.status.as_str(),
             task.title
         );
 
-        match mode {
+        match effective_mode {
             crate::config::OrchestrationMode::Pair => {
                 run_pair_task(json_output, project, database, &task, &config).await?;
             }
             crate::config::OrchestrationMode::Team => {
                 run_team_task(json_output, project, database, &task, &config).await?;
             }
+            crate::config::OrchestrationMode::Adaptive => unreachable!(),
         }
         if selected_task.is_some() {
             return Ok(());
@@ -5566,7 +5704,7 @@ fn adapter_capability_reports(
 
 fn adapter_role_status(
     adapter: AdapterKind,
-    role: AgentRole,
+    _role: AgentRole,
     probe: &AgyProbe,
     project_root: &Path,
 ) -> &'static str {
@@ -5577,13 +5715,13 @@ fn adapter_role_status(
         if probe.status.as_str() != "available" {
             return "unavailable";
         }
-        let expected_version = match role {
-            AgentRole::Writer => VERIFIED_AGY_WRITE_VERSION,
-            AgentRole::Critic => VERIFIED_AGY_CRITIC_VERSION,
-        };
-        if probe.version.as_deref() != Some(expected_version)
-            || !has_required_writer_capabilities(probe)
-        {
+        if let Some(version) = probe.version.as_deref() {
+            if !crate::supervisor::is_verified_agy_version(version)
+                || !has_required_writer_capabilities(probe)
+            {
+                return "not_verified";
+            }
+        } else if !has_required_writer_capabilities(probe) {
             return "not_verified";
         }
         return "verified";
@@ -6690,7 +6828,7 @@ mod tests {
         let config = crate::config::ProjectConfig::default();
         assert_eq!(
             config.orchestration.mode,
-            crate::config::OrchestrationMode::Pair
+            crate::config::OrchestrationMode::Adaptive
         );
         assert_eq!(
             config.orchestration.delegation,

@@ -18,6 +18,7 @@ const MAX_CONFIG_BYTES: u64 = 16 * 1024;
 #[serde(rename_all = "snake_case")]
 pub enum OrchestrationMode {
     #[default]
+    Adaptive,
     Pair,
     Team,
 }
@@ -25,6 +26,7 @@ pub enum OrchestrationMode {
 impl OrchestrationMode {
     pub fn as_str(self) -> &'static str {
         match self {
+            Self::Adaptive => "adaptive",
             Self::Pair => "pair",
             Self::Team => "team",
         }
@@ -86,7 +88,7 @@ fn default_max_help_attempts() -> usize {
 impl Default for OrchestrationConfig {
     fn default() -> Self {
         Self {
-            mode: OrchestrationMode::Pair,
+            mode: OrchestrationMode::Adaptive,
             delegation: DelegationMode::Hybrid,
             max_writer_workers: 2,
             max_critic_workers: 1,

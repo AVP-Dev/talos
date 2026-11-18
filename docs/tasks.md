@@ -229,14 +229,15 @@ Dependency: R6–R8.
 | T18.7 | done | Live Feed wraps to its pane width, with visual-row scrolling. Input, drafts, review and diff views adapt to narrower terminals. Verified with automated rendering tests and Agterm with its sidebar open. |
 
 ## R19 — Resilient CLI Discovery, Adaptive Orchestration, Input History, and Slash Command Palette
-**Status:** planned. Decoupling CLI detection from brittle version strings, smart auto-orchestration between Pair and Team, Readline-grade input history, and interactive command popup palette.
+**Status:** complete. Decoupled CLI detection from brittle version strings, smart auto-orchestration between Pair and Team, Readline-grade input history, and interactive command popup palette.
 
 | ID | Status | Task | Exit criteria |
 |---|---|---|---|
-| T19.1 | planned | Resilient Agy CLI detection without brittle version locking | In `src/app.rs:5580`, decouple `adapter_role_status` and cockpit availability from rigid `"1.5.10"` equality. Use `is_verified_agy_version` and executable probing so `agy 1.5.11+` remains available in TUI and `/cli`. |
-| T19.2 | planned | Smart Adaptive Orchestration Mode (`mode: adaptive`) | Add `OrchestrationMode::Adaptive` as default. Pre-flight triage classifies scope: simple/local tasks execute automatically via lightweight Pair mode, complex/multi-file tasks automatically escalate to Team mode. Manual overrides remain available. |
-| T19.3 | planned | TUI Readline input history ($\uparrow / \downarrow$) | Maintain `input_history` buffer in `TuiApp`. Pressing $\uparrow$ scrolls backward through previous prompts/commands, $\downarrow$ scrolls forward, restoring current draft at the bottom. |
-| T19.4 | planned | Interactive Slash Command Palette (`/` popup menu) | Typing `/` in Cockpit input opens a floating palette displaying slash commands (`/cli`, `/mode`, `/task:test`, `/diff`, `/help`, etc.) with real-time prefix filtering and arrow/Tab/Enter selection. |
+| T19.1 | done | Resilient Agy CLI detection without brittle version locking | Decoupled `adapter_role_status` and cockpit availability from rigid `"1.5.10"` equality in `src/app.rs`. Uses `is_verified_agy_version` supporting `1.5.11+` so Agy remains available in TUI and `/cli`. Verified with unit test `resilient_agy_version_tolerance_accepts_updates`. |
+| T19.2 | done | Smart Adaptive Orchestration Mode (`mode: adaptive`) | Added `OrchestrationMode::Adaptive` as intelligent default. Pre-flight triage classifies scope: simple/local tasks execute via lightweight Pair mode, complex/multi-file tasks automatically escalate to Team mode. Manual overrides (`--mode pair`, `--mode team`, `/mode adaptive|pair|team` and Russian aliases) fully supported. Verified with unit test `mode_slash_command_supports_adaptive_and_aliases`. |
+| T19.3 | done | TUI Readline input history ($\uparrow / \downarrow$) | Maintained `input_history` buffer in `TuiApp`. Pressing $\uparrow$ scrolls backward through previous prompts/commands, $\downarrow$ scrolls forward, restoring current draft at the bottom. Duplicate consecutive entries are de-duplicated. Verified with unit test `tui_input_history_navigation_with_arrows`. |
+| T19.4 | done | Interactive Slash Command Palette (`/` popup menu) | Typing `/` in Cockpit input bar opens floating palette overlay displaying slash commands (`/cli`, `/mode`, `/task:test`, `/diff`, `/help`, etc.) with real-time prefix filtering, description metadata, and arrow/Tab/Enter selection. Verified with unit test `interactive_slash_command_palette_filtering_and_selection`. |
+| T19.5 | done | Keep task launch and progress on Work | One Enter launches the submitted local task. Work shows its status and keeps blocked input. Review, Changes, Logs, and History are tabs. Settings is the separate screen. Draft PR publishing and generated presets have inline confirmation. |
 
 ## Required end-to-end scenarios from the original request
 

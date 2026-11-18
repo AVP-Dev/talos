@@ -45,27 +45,23 @@ The installer verifies the downloaded archive’s checksum and defaults to `$HOM
 Use an existing Git repository with a first commit. Install and configure at least one coding CLI separately. In your project, run `talos` or `talos tui`. If you launch from outside a Git project, the cockpit asks for a project path.
 
 1. **Settings.** Open `/config` or press **F2**. Use arrows to select and change the Writer, Critic, model or mode. Save with **Enter**. **R** rechecks local CLI availability after installation. Authenticate in the selected CLI itself when required.
-2. **Draft.** Enter a task with an observable outcome. **Enter** opens the review screen. It shows the assigned roles, selected models, mode and configured check commands. **Esc** returns to editing.
-3. **Run.** On the review screen, **Enter** queues and starts that task. A blocked draft remains available. For uncommitted changes, use **D** to inspect the diff and **F5** to return after reviewing your Git changes.
-4. **Result.** See the task status, saved report and run details. **D** on a completed result opens its saved Git diff when available. `/history` or **F3** opens the task list. Open a queued task to retry or cancel it.
-5. **New session.** Use `/new` or **F4** while idle. It clears the working view and the next run starts fresh agent conversations. Project settings and earlier results remain available.
-
-![TALOS settings with separate controls for the Writer and Critic](media/settings.png)
+2. **Run.** Describe a change and press **Enter**. **Work** shows progress and the result. If the run is blocked, the input stays editable. **Alt+3** opens **Changes** to inspect uncommitted files. Press **Alt+1** to return to **Work**. Projects with draft PR publishing and task presets ask for confirmation in **Work**.
+3. **Inspect.** Use **Review** for the review and verification status, **Changes** for the Git diff, and **Logs** for agent and supervisor output. **Tab** cycles through views when the input is empty. **Alt+1** through **Alt+5** switch directly. Use **Home** for older logs and **End** to follow new output.
+4. **Reopen.** Press **F3** for **History** and **Enter** to open the selected task. The **Work** view shows the retry or cancellation actions available for that task.
+5. **New session.** Use `/new` or **F4** while idle. The next run starts fresh agent conversations, and earlier results remain in **History**.
 
 **Input editing** — use arrow keys, repeated Backspace, multiline paste, **Ctrl+W** or **Alt+Backspace** to delete a word, and **Esc** to clear the input. In the cockpit, `/pause`, `/resume`, `/stop`, `/help` and `/exit` are also available.
 
-**Narrow terminals** — the current source build wraps the Live Feed within its own panel, including when the terminal sidebar is open. Use ↑ and ↓ to scroll, Home for older output, and End to follow new output. Long drafts, diffs and results also wrap. The published v0.1.1 binary predates the pane wrapping fix.
-
 ## Configure project checks
 
-Set checks before you confirm a task so the review screen can show the commands. From a normal shell, for a Rust project:
+Set checks before starting a task. **Settings** shows the configured commands. From a normal shell, for a Rust project:
 
 ```sh
 talos config set checks '[{"id":"test","argv":["cargo","test"],"version_argv":["cargo","--version"],"working_directory":"."}]'
 talos config show
 ```
 
-The check list is project-specific and replaces the current list. Use commands relevant to the target repository, such as `pytest` for Python or `npm test` for Node.js. TALOS accepts allowlisted argv arrays and records results against the approved Git revision. If the review screen says no project checks are configured, the run has no configured project test commands.
+The check list is project-specific and replaces the current list. Use commands relevant to the target repository, such as `pytest` for Python or `npm test` for Node.js. TALOS accepts allowlisted argv arrays and records results against the approved Git revision.
 
 ## Run from a shell
 

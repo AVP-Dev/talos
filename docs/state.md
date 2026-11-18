@@ -4,15 +4,31 @@
 
 ## Current phase
 
-**Current phase is Round 18 closed, ADR-052 accepted by the user, and Round 19 planned for Resilient CLI Discovery, Adaptive Orchestration, Input History, and Slash Command Palette.**
+### Work and Settings cockpit update
 
-Key user-directed requirements recorded in **ADR-052**:
-1. **Resilient CLI Discovery vs. Brittle Version Pinning:** Decouple `Agy` detection in Cockpit (`src/app.rs:5580`) from exact `"1.5.10"` equality. Updating installed CLIs must never cause adapters to vanish from the TUI.
-2. **Smart Adaptive Orchestration (`adaptive`):** Auto-route tasks based on pre-flight triage: lightweight Pair mode for simple/local tasks, escalating to Team mode for multi-file/complex tasks.
-3. **Readline Input History ($\uparrow / \downarrow$):** In-memory prompt history in Cockpit with arrow-key navigation.
-4. **Interactive Slash Command Palette (`/` Popup):** Floating command picker overlay triggering upon `/` with live filtering and autocompletion.
+- T19.5 puts the task input, launch status, and result on Work. Review, Changes, Logs, and History are tabs. F2 opens Settings, including model edits and configured project checks.
+- Enter starts the submitted local task. A preflight blocker keeps the input editable. Draft PR publishing and generated presets ask for confirmation within Work. A queued task survives a launcher error with retry and cancellation controls.
+- On macOS, `./scripts/verify-project.sh` passed `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --locked --all-targets` (177 passed, 2 ignored), `cargo build --locked --release`, and `./scripts/security-scan.sh`.
+- `python3 /tmp/talos-work-terminal-smoke.py ./target/release/talos` passed with fixture Codex and Claude adapters in a disposable Git project. One Enter launched the preserved Cyrillic prompt after clearing a dirty-tree blocker. The earlier queued task stayed queued, the project check passed, technical output appeared in Logs, saved changes opened in Changes, and History reopened the result. Real provider authentication and remote publication were outside this check.
 
-Next action: execute Round 19 tasks (**T19.1 — T19.4**). All 173 tests pass clean (`./scripts/verify-project.sh`).
+### Round 19 closure: Resilient CLI Discovery, Adaptive Orchestration, Input History, and Slash Command Palette
+
+**Current phase is Round 19 closed and verified across all four pillars from ADR-052 (T19.1 — T19.4).**
+
+Key implementations delivered and verified:
+1. **Resilient Agy CLI Discovery (T19.1):** Decoupled `adapter_role_status` and cockpit presence checks in `src/app.rs` from brittle `"1.5.10"` equality. Uses `is_verified_agy_version` which accepts `"1.5.10"`, `"1.5.11"`, and any semver `>= 1.5.0` (including `1.5.11+`), ensuring local updates to installed CLIs never cause them to disappear from Cockpit Settings or `/cli`. Verified with unit test `resilient_agy_version_tolerance_accepts_updates`.
+2. **Smart Adaptive Orchestration Mode (T19.2):** Introduced `OrchestrationMode::Adaptive` as the intelligent default orchestration mode. Pre-flight triage classifies task scope: simple/local/single-file tasks automatically route to lightweight Pair mode (saving token budget and avoiding worktree overhead); complex/multi-file/architectural tasks automatically escalate to full Team mode (Writer Lead decomposition, parallel worktree execution, specialized audits, deliberation). Manual overrides (`--mode pair`, `--mode team`, `/mode adaptive|pair|team` and Russian aliases `/mode авто|команда|пара`) remain fully operational. Verified with unit test `mode_slash_command_supports_adaptive_and_aliases`.
+3. **Readline Input History (T19.3):** Maintained `input_history`, `history_index`, and `saved_draft` in `TuiApp`. Pressing $\uparrow$ scrolls backward through previously submitted prompts and commands, $\downarrow$ scrolls forward, restoring the unsaved draft at the bottom. De-duplicates consecutive identical submissions. Verified with unit test `tui_input_history_navigation_with_arrows`.
+4. **Interactive Slash Command Palette (T19.4):** Typing `/` in the Cockpit input bar opens an interactive floating popup overlay displaying available slash commands (`/cli`, `/mode`, `/task:test`, `/diff`, `/feed`, `/commit`, `/help`, etc.) with real-time prefix and substring filtering, descriptions, arrow navigation ($\uparrow / \downarrow$), and Tab/Enter autocompletion. Verified with unit test `interactive_slash_command_palette_filtering_and_selection`.
+
+Verification on macOS Apple Silicon:
+- `./scripts/verify-project.sh` passed clean across all 5 verification layers:
+  1. `cargo fmt --all -- --check` passed.
+  2. `cargo clippy --locked --all-targets --all-features -- -D warnings` passed (0 warnings).
+  3. `cargo test --locked --all-targets` passed (177 passed, 0 failed, 2 ignored).
+  4. `cargo build --locked --release` passed.
+  5. `./scripts/security-scan.sh` clean.
+- Crate version remains 0.1.1 as specified by the user. Ready for git push and tag update.
 
 Verification on macOS Apple Silicon:
 

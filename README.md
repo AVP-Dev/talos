@@ -19,12 +19,6 @@
 
 ---
 
-<div align="center">
-  <img src="docs/media/cockpit.png" width="960" alt="TALOS Unified Feed, with Writes and Reviews roles, the task queue and the command line in Agterm">
-</div>
-
-<p align="center"><sub>TALOS cockpit in Agterm, shown in Pair mode.</sub></p>
-
 ## Install
 
 **macOS with Homebrew**
@@ -39,18 +33,12 @@ You need Git, a project with a first commit, and at least one configured coding 
 
 ## Run your first task
 
+The steps below describe the current source build.
+
 1. Run `talos` in your project, or enter the project path when prompted.
-2. Check **Writes** and **Reviews**. Open `/config` or press **F2** to assign each role and model. Start in **Pair** mode.
-3. Describe a change and press **Enter** to review the draft. Check the roles and project checks, then press **Enter** again to run that task. If Git changes block the run, **D** opens the diff and **F5** returns to the draft.
-4. Open the result and press **D** to see its saved Git changes. Use `/history` or **F3** to reopen earlier results. Use `/new` or **F4** while idle to start a fresh task with fresh agent conversations and the same project settings.
-
-<details>
-<summary><strong>Watch the cockpit walkthrough</strong></summary>
-<br>
-<img src="docs/media/cockpit-demo.gif" width="960" alt="Native Agterm recording of TALOS role settings, task confirmation, saved Git changes and a new session">
-</details>
-
-The screenshots and animation capture the built TALOS interface in Agterm with a disposable Git project. Deterministic fixture CLIs stand in for Codex and Claude Code, and TALOS runs a real project check. See the [acceptance record](docs/acceptance-scenarios.md) for live provider and platform coverage.
+2. Press **F2** to open **Settings** and check the agents assigned to write and review changes.
+3. Describe a change and press **Enter**. Follow progress in **Work**. If the run is blocked, TALOS shows the reason and keeps your input. Projects configured to open a draft PR ask for confirmation in **Work**.
+4. Use **Changes** for the Git diff, **Review** for the review and checks, and **Logs** for technical details. Press **F3** for **History** or **F4** for a fresh session.
 
 ## Choose a mode
 

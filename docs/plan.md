@@ -314,14 +314,14 @@ Transform TALOS into a genuinely collaborative autonomous engineering team with 
 
 ### R19 — Resilient CLI Discovery, Adaptive Orchestration, Input History, and Slash Command Palette
 
-**Outcome:** Fix brittle version lock-in so CLI updates never hide adapters; provide smart dynamic orchestration between Pair and Team; deliver terminal-grade input history navigation; and provide an interactive slash-command palette.
+**Outcome:** Fix brittle version lock-in so CLI updates never hide adapters; provide smart dynamic orchestration between Pair and Team; deliver terminal-grade input history navigation; and provide an interactive slash-command palette. (Completed and verified)
 
-- **Resilient CLI Discovery:** In `src/app.rs`, decouple `Agy` availability from strict `"1.5.10"` equality using `is_verified_agy_version` and executable presence, ensuring `agy 1.5.11+` remains discoverable and selectable in Cockpit.
-- **Smart Adaptive Orchestration (`adaptive`):** Add `OrchestrationMode::Adaptive` as the intelligent default. Pre-flight triage classifies scope: simple tasks execute automatically via fast Pair mode, while complex tasks escalate to Team mode.
-- **TUI Input History ($\uparrow / \downarrow$):** Maintain Readline command history in Cockpit; navigating with $\uparrow / \downarrow$ scrolls through previous prompts and commands.
+- **Resilient CLI Discovery:** In `src/app.rs`, decoupled `Agy` availability from strict `"1.5.10"` equality using `is_verified_agy_version` and executable presence, ensuring `agy 1.5.11+` remains discoverable and selectable in Cockpit.
+- **Smart Adaptive Orchestration (`adaptive`):** Added `OrchestrationMode::Adaptive` as the intelligent default. Pre-flight triage classifies scope: simple tasks execute automatically via fast Pair mode, while complex tasks escalate to Team mode.
+- **TUI Input History ($\uparrow / \downarrow$):** Maintained Readline command history in Cockpit; navigating with $\uparrow / \downarrow$ scrolls through previous prompts and commands.
 - **Interactive Slash Command Palette (`/` Popup):** Typing `/` in the input bar opens an interactive floating menu with real-time filtering, descriptions, and arrow/Tab/Enter selection.
 
-**Exit criteria:** `agy 1.5.11+` is discoverable in TUI Settings and `/cli`; adaptive mode auto-selects Pair or Team based on complexity; $\uparrow / \downarrow$ scrolls input history; `/` triggers interactive command palette; all tests pass clean.
+**Exit criteria:** `agy 1.5.11+` is discoverable in TUI Settings and `/cli`; adaptive mode auto-selects Pair or Team based on complexity; $\uparrow / \downarrow$ scrolls input history; `/` triggers interactive command palette; all tests pass clean. (All 177 tests passing clean).
 
 ## 6. Dependency order
 

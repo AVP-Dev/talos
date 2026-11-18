@@ -30,7 +30,17 @@ pub const VERIFIED_AGY_WRITE_VERSION: &str = "1.5.10";
 pub const VERIFIED_AGY_CRITIC_VERSION: &str = "1.5.10";
 
 pub fn is_verified_agy_version(v: &str) -> bool {
-    v == "1.5.10" || v == "1.5.11"
+    if v == "1.5.10" || v == "1.5.11" {
+        return true;
+    }
+    let parts: Vec<&str> = v.trim_start_matches('v').split('.').collect();
+    if parts.len() >= 2
+        && let (Ok(major), Ok(minor)) = (parts[0].parse::<u32>(), parts[1].parse::<u32>())
+        && ((major == 1 && minor >= 5) || major > 1)
+    {
+        return true;
+    }
+    false
 }
 const MAX_CRITIC_RESPONSE_BYTES: usize = 64 * 1024;
 const STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
@@ -1741,6 +1751,18 @@ mod tests {
     #[test]
     fn only_the_live_tested_antigravity_version_is_enabled_for_writes() {
         assert_eq!(VERIFIED_AGY_WRITE_VERSION, "1.5.10");
+    }
+
+    #[test]
+    fn resilient_agy_version_tolerance_accepts_updates() {
+        assert!(super::is_verified_agy_version("1.5.10"));
+        assert!(super::is_verified_agy_version("1.5.11"));
+        assert!(super::is_verified_agy_version("1.5.12"));
+        assert!(super::is_verified_agy_version("1.6.0"));
+        assert!(super::is_verified_agy_version("v1.5.11"));
+        assert!(!super::is_verified_agy_version("1.4.9"));
+        assert!(!super::is_verified_agy_version("0.9.0"));
+        assert!(!super::is_verified_agy_version("invalid"));
     }
 
     #[test]
