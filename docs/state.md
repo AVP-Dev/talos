@@ -334,7 +334,7 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 
 - Extended `docs/verification.md` with separate database growth, migration-fault, process-limit, worktree-recovery, GitHub-recovery, CI-storage, backup/restore, and reproducible-build scenarios.
 - No database growth threshold or compaction/retention policy has been selected. Record actual size/memory measurements; keep archival and pruning decisions under F1 rather than claiming bounded long-term database size.
-- Changed `talos stop` polling, Writer review, child-task reports, worktree routing/removal/finalization, and explicit attempt resolution to use primary-key or latest-row queries instead of materializing full histories. The large-history measurement remains pending; no retention or compaction policy is implied.
+- Changed Auto/Semi scheduling to select the first eligible queued task in SQLite instead of loading every task and checking dependencies one by one. Schema v17 adds a non-authoritative `(status, id)` index; its v16→v17 migration has not been runtime-verified. Also changed task-ID lookups, `talos stop` polling, Writer review, child-task reports, worktree routing/removal/finalization, and explicit attempt resolution to use primary-key or latest-row queries instead of materializing full task or history lists. The large-history measurement remains pending; no retention or compaction policy is implied.
 - This is a test plan only. No long-running, fault-injection, or database-growth tests were run.
 
 ## R9.4 closure — documentation alignment

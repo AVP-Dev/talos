@@ -280,7 +280,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
             TaskCommand::Dependencies { task_id } => {
-                if !database.list_tasks()?.iter().any(|task| task.id == task_id) {
+                if database.get_task(task_id)?.is_none() {
                     bail!("Task #{task_id} does not exist");
                 }
                 let dependencies = database.task_dependencies(task_id)?;
@@ -334,11 +334,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
             TaskCommand::Children { parent_task_id } => {
-                if !database
-                    .list_tasks()?
-                    .iter()
-                    .any(|task| task.id == parent_task_id)
-                {
+                if database.get_task(parent_task_id)?.is_none() {
                     bail!("Parent task #{parent_task_id} does not exist");
                 }
                 let children = database.children_for_parent(parent_task_id)?;
@@ -437,7 +433,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 run_task_verification(cli.json, &project, &mut database, task_id).await?;
             }
             TaskCommand::Evidence { task_id } => {
-                if !database.list_tasks()?.iter().any(|task| task.id == task_id) {
+                if database.get_task(task_id)?.is_none() {
                     bail!("Task #{task_id} does not exist");
                 }
                 let history = database.verification_history(task_id)?;
@@ -2049,9 +2045,7 @@ fn print_task_worktree_integration(
 
 fn print_child_task_report(json_output: bool, database: &Database, task_id: i64) -> Result<()> {
     let task = database
-        .list_tasks()?
-        .into_iter()
-        .find(|task| task.id == task_id)
+        .get_task(task_id)?
         .with_context(|| format!("Task #{task_id} does not exist"))?;
     let contract = database
         .child_task_contract(task_id)?
@@ -2326,9 +2320,7 @@ async fn run_task_verification(
     task_id: i64,
 ) -> Result<()> {
     let task = database
-        .list_tasks()?
-        .into_iter()
-        .find(|task| task.id == task_id)
+        .get_task(task_id)?
         .with_context(|| format!("Task #{task_id} does not exist"))?;
     if task.status != crate::db::TaskStatus::Verifying {
         bail!("Task #{task_id} must have an approved Critic review before verification");
@@ -2405,9 +2397,7 @@ async fn run_task_verification(
         revision_id: run.revision_id,
         status: run.status.clone(),
         task_status: database
-            .list_tasks()?
-            .into_iter()
-            .find(|task| task.id == task_id)
+            .get_task(task_id)?
             .map(|task| task.status.as_str().to_owned())
             .context("Task disappeared after verification")?,
         checks,
@@ -2731,21 +2721,17 @@ async fn run_one_shot_auto(
         bail!("`up --auto` requires a Git project so TALOS can report actual changed files");
     }
     validate_project_scope(project)?;
-    let queued_tasks = database
-        .list_tasks()?
-        .into_iter()
-        .filter(|task| task.status == crate::db::TaskStatus::Queued)
-        .collect::<Vec<_>>();
-    let task = database.runnable_queued_tasks()?.into_iter().next();
+    let task = database.first_runnable_queued_task()?;
     let Some(task) = task else {
+        let has_queued_tasks = database.has_queued_tasks()?;
         let waiting_tasks = database.queued_tasks_waiting_on_dependencies()?;
         if json_output {
             print_json(&json!({
                 "mode": "auto",
-                "result": if queued_tasks.is_empty() {
-                    "no_queued_tasks"
-                } else {
+                "result": if has_queued_tasks {
                     "waiting_on_dependencies"
+                } else {
+                    "no_queued_tasks"
                 },
                 "waiting_tasks": waiting_tasks
                     .iter()
@@ -2813,21 +2799,17 @@ async fn run_one_shot_semi(
         bail!("`up --semi` requires a Git project so TALOS can report actual changed files");
     }
     validate_project_scope(project)?;
-    let queued_tasks = database
-        .list_tasks()?
-        .into_iter()
-        .filter(|task| task.status == crate::db::TaskStatus::Queued)
-        .collect::<Vec<_>>();
-    let task = database.runnable_queued_tasks()?.into_iter().next();
+    let task = database.first_runnable_queued_task()?;
     let Some(task) = task else {
+        let has_queued_tasks = database.has_queued_tasks()?;
         let waiting_tasks = database.queued_tasks_waiting_on_dependencies()?;
         if json_output {
             print_json(&json!({
                 "mode": "semi",
-                "result": if queued_tasks.is_empty() {
-                    "no_queued_tasks"
-                } else {
+                "result": if has_queued_tasks {
                     "waiting_on_dependencies"
+                } else {
+                    "no_queued_tasks"
                 },
                 "waiting_tasks": waiting_tasks
                     .iter()

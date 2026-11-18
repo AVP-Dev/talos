@@ -16,7 +16,7 @@ use crate::{
     secrets::contains_sensitive,
 };
 
-const SCHEMA_VERSION: i64 = 16;
+const SCHEMA_VERSION: i64 = 17;
 const MAX_CHILD_TASK_ALLOWED_PATHS: usize = 64;
 const MAX_CHILD_TASK_SCOPE_BYTES: usize = 16 * 1024;
 const MIN_CHILD_TASK_TIMEOUT_MS: i64 = 1_000;
@@ -1690,31 +1690,41 @@ impl Database {
         Ok((dependency_count, dependencies))
     }
 
-    pub fn runnable_queued_tasks(&self) -> Result<Vec<TaskRecord>> {
-        let tasks = self.list_tasks()?;
-        let mut statement = self.connection.prepare(
-            "SELECT EXISTS(
-                 SELECT 1 FROM task_dependencies AS edges
-                 JOIN tasks AS prerequisite ON prerequisite.id = edges.depends_on_task_id
-                 WHERE edges.task_id = ?1 AND (
-                     prerequisite.status <> 'complete'
-                     OR EXISTS(SELECT 1 FROM task_worktree_integrations AS integrations
+    pub fn first_runnable_queued_task(&self) -> Result<Option<TaskRecord>> {
+        self.connection
+            .query_row(
+                "SELECT tasks.id, tasks.title, tasks.acceptance_criteria, tasks.status,
+                        tasks.created_at_ms, tasks.updated_at_ms
+                 FROM tasks
+                 WHERE tasks.status = 'queued'
+                   AND NOT EXISTS (
+                       SELECT 1 FROM task_dependencies AS edges
+                       JOIN tasks AS prerequisite ON prerequisite.id = edges.depends_on_task_id
+                       WHERE edges.task_id = tasks.id AND (
+                           prerequisite.status <> 'complete'
+                           OR EXISTS(
+                               SELECT 1 FROM task_worktree_integrations AS integrations
                                WHERE integrations.task_id = prerequisite.id
-                                 AND integrations.state <> 'integrated')
-                 )
-             )",
-        )?;
-        let mut runnable = Vec::new();
-        for task in tasks {
-            if task.status != TaskStatus::Queued {
-                continue;
-            }
-            let blocked: bool = statement.query_row([task.id], |row| row.get(0))?;
-            if !blocked {
-                runnable.push(task);
-            }
-        }
-        Ok(runnable)
+                                 AND integrations.state <> 'integrated'
+                           )
+                       )
+                   )
+                 ORDER BY tasks.id LIMIT 1",
+                [],
+                map_task_record,
+            )
+            .optional()
+            .context("Cannot select the first runnable queued task")
+    }
+
+    pub fn has_queued_tasks(&self) -> Result<bool> {
+        self.connection
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM tasks WHERE status = 'queued')",
+                [],
+                |row| row.get(0),
+            )
+            .context("Cannot inspect whether queued tasks exist")
     }
 
     pub fn queued_tasks_waiting_on_dependencies(&self) -> Result<Vec<(i64, Vec<i64>)>> {
@@ -4783,6 +4793,15 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             )
             .context("Cannot add immutable GitHub CI evidence")?;
         migrated_version = 16;
+    }
+    if migrated_version == 16 {
+        transaction
+            .execute_batch(
+                "CREATE INDEX tasks_status_id ON tasks(status, id);
+                 PRAGMA user_version = 17;",
+            )
+            .context("Cannot index task queue status")?;
+        migrated_version = 17;
     }
     if migrated_version != SCHEMA_VERSION {
         bail!("Cannot migrate database from unsupported schema version {migrated_version}");

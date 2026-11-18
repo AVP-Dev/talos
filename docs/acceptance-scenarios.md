@@ -1,6 +1,6 @@
 # End-to-End Acceptance Scenarios
 
-T9.1 tracks the original operator workflow. “Prior evidence” refers to a result recorded during an earlier round; it is not a claim that the current schema-v16 tree was re-run. Re-run affected scenarios during final acceptance and record the exact command, outcome, platform, and evidence path. Do not combine unrelated scenarios into one result.
+T9.1 tracks the original operator workflow. “Prior evidence” refers to a result recorded during an earlier round; it is not a claim that the current schema-v17 tree was re-run. Re-run affected scenarios during final acceptance and record the exact command, outcome, platform, and evidence path. Do not combine unrelated scenarios into one result.
 
 | ID | Scenario | Current record | Evidence / remaining work |
 |---|---|---|---|

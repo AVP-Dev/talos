@@ -21,9 +21,7 @@ pub fn create(
     task_id: i64,
 ) -> Result<TaskWorktreeRecord> {
     let task = database
-        .list_tasks()?
-        .into_iter()
-        .find(|task| task.id == task_id)
+        .get_task(task_id)?
         .with_context(|| format!("Task #{task_id} does not exist"))?;
     if task.status != TaskStatus::Queued {
         bail!("A task worktree can only be created for a queued task");
@@ -283,9 +281,7 @@ pub fn remove(
         );
     }
     let task = database
-        .list_tasks()?
-        .into_iter()
-        .find(|task| task.id == task_id)
+        .get_task(task_id)?
         .with_context(|| format!("Task #{task_id} does not exist"))?;
     if task.status != TaskStatus::Queued
         || database.latest_writer_attempt(task_id)?.is_some()

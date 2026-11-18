@@ -190,9 +190,7 @@ pub async fn run_critic_review(
         bail!("An active or unresolved Writer attempt prevents Critic review");
     }
     let task = database
-        .list_tasks()?
-        .into_iter()
-        .find(|task| task.id == task_id)
+        .get_task(task_id)?
         .with_context(|| format!("Task #{task_id} does not exist"))?;
     if task.status != TaskStatus::Reviewing {
         bail!(
@@ -351,9 +349,7 @@ async fn run_writer_attempt_inner(
         );
     }
     let task = database
-        .list_tasks()?
-        .into_iter()
-        .find(|task| task.id == task_id)
+        .get_task(task_id)?
         .with_context(|| format!("Task #{task_id} does not exist"))?;
     let child_contract = database.child_task_contract(task_id)?;
     let effective_timeout = child_contract
