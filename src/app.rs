@@ -1,6 +1,6 @@
 use std::{
     env,
-    io::{self, IsTerminal, Write},
+    io::{self, IsTerminal, Read, Write},
     process::Command as ProcessCommand,
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
@@ -40,6 +40,42 @@ use crate::{
 const WRITER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SUPERVISOR_LEASE: Duration = Duration::from_secs(35 * 60);
 const VERIFICATION_BUDGET: Duration = Duration::from_secs(25 * 60);
+const MAX_CHANGED_PATHS_PREVIEW: usize = 50;
+const MAX_CHANGED_PATH_PREVIEW_BYTES: usize = 256;
+
+struct GitStatusPaths {
+    total_count: usize,
+    preview: Vec<String>,
+    preview_values_truncated: bool,
+}
+
+impl GitStatusPaths {
+    fn is_empty(&self) -> bool {
+        self.total_count == 0
+    }
+
+    fn display_preview(&self) -> String {
+        let mut output = self
+            .preview
+            .iter()
+            .map(|path| redact_sensitive(path))
+            .collect::<Vec<_>>()
+            .join(", ");
+        if self.preview.len() < self.total_count {
+            if !output.is_empty() {
+                output.push_str(", ");
+            }
+            output.push_str(&format!(
+                "and {} more",
+                self.total_count - self.preview.len()
+            ));
+        }
+        if self.preview_values_truncated {
+            output.push_str(" (some path names are shortened)");
+        }
+        format!("{} path(s): {output}", self.total_count)
+    }
+}
 
 #[derive(Serialize)]
 struct StatusReport {
@@ -1061,7 +1097,7 @@ fn create_github_branch_under_lease(
     if !dirty_paths.is_empty() {
         bail!(
             "Cannot create a GitHub feature branch with a dirty primary worktree; inspect or commit these paths first: {}",
-            dirty_paths.join(", ")
+            dirty_paths.display_preview()
         );
     }
     let current_branch = git_command(project, &["branch", "--show-current"])?;
@@ -1206,7 +1242,7 @@ async fn run_github_publish_under_lease(
     if !dirty_paths.is_empty() {
         bail!(
             "GitHub publication requires a clean feature branch; inspect or commit these paths first: {}",
-            dirty_paths.join(", ")
+            dirty_paths.display_preview()
         );
     }
 
@@ -2736,7 +2772,7 @@ fn print_critic_report(
 fn print_writer_report(
     json_output: bool,
     report: &crate::supervisor::WriterExecutionReport,
-    changed_files: Option<&[String]>,
+    changed_files: Option<&GitStatusPaths>,
 ) -> Result<()> {
     let task_status = if report.outcome == crate::db::WriterAttemptOutcome::Succeeded {
         "reviewing"
@@ -2748,7 +2784,12 @@ fn print_writer_report(
         "task_status": task_status,
         "attempt": &report.attempt,
         "writer_response": &report.response,
-        "changed_files": changed_files,
+        "changed_file_count": changed_files.map(|paths| paths.total_count),
+        "changed_files_preview": changed_files.map(|paths| &paths.preview),
+        "changed_files_truncated": changed_files
+            .map(|paths| paths.total_count > paths.preview.len()),
+        "changed_path_values_truncated": changed_files
+            .map(|paths| paths.preview_values_truncated),
         "review_required": true,
         "verification_ran": false,
     });
@@ -2769,9 +2810,18 @@ fn print_writer_report(
             if changed_files.is_empty() {
                 println!("Git reports no changed files.");
             } else {
-                println!("Changed files:");
-                for path in changed_files {
+                println!("Changed files ({} total):", changed_files.total_count);
+                for path in &changed_files.preview {
                     println!("  {}", redact_sensitive(path));
+                }
+                if changed_files.total_count > changed_files.preview.len() {
+                    println!(
+                        "Showing the first {} paths; run `git status --short` for the full list.",
+                        changed_files.preview.len()
+                    );
+                }
+                if changed_files.preview_values_truncated {
+                    println!("Some displayed path names are shortened.");
                 }
             }
         }
@@ -2839,14 +2889,14 @@ async fn run_one_shot_auto(
     if !before.is_empty() {
         bail!(
             "`up --auto` requires a clean Git worktree; inspect or commit these existing paths first: {}",
-            before.join(", ")
+            before.display_preview()
         );
     }
     let execution_before = git_status_paths(&execution_project)?;
     if !execution_before.is_empty() {
         bail!(
             "`up --auto` requires a clean task execution worktree; inspect or commit these existing paths first: {}",
-            execution_before.join(", ")
+            execution_before.display_preview()
         );
     }
 
@@ -2901,14 +2951,14 @@ async fn run_one_shot_semi(
     if !before.is_empty() {
         bail!(
             "`up --semi` requires a clean Git worktree; inspect or commit these existing paths first: {}",
-            before.join(", ")
+            before.display_preview()
         );
     }
     let execution_before = git_status_paths(&execution_project)?;
     if !execution_before.is_empty() {
         bail!(
             "`up --semi` requires a clean task execution worktree; inspect or commit these existing paths first: {}",
-            execution_before.join(", ")
+            execution_before.display_preview()
         );
     }
     request_operator_approval(&format!(
@@ -3022,50 +3072,114 @@ fn git_command(project: &Project, arguments: &[&str]) -> Result<std::process::Ou
         .context("Cannot run Git while checking project runtime exclusions")
 }
 
-fn git_status_paths(project: &Project) -> Result<Vec<String>> {
+fn git_status_paths(project: &Project) -> Result<GitStatusPaths> {
     let mut command = ProcessCommand::new("git");
     command
         .args(["status", "--porcelain=v1", "-z", "--untracked-files=all"])
         .current_dir(&project.root)
         .env("GIT_OPTIONAL_LOCKS", "0")
-        .env("GIT_TERMINAL_PROMPT", "0");
+        .env("GIT_TERMINAL_PROMPT", "0")
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
     for (key, _) in env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("GIT_")) {
         command.env_remove(key);
     }
-    let output = command
-        .output()
+    let mut child = command
+        .spawn()
         .context("Cannot inspect Git changes after the Writer run")?;
-    if !output.status.success() {
+    let Some(mut stdout) = child.stdout.take() else {
+        let _ = child.kill();
+        let _ = child.wait();
+        bail!("Cannot read Git status output");
+    };
+
+    let mut summary = GitStatusPaths {
+        total_count: 0,
+        preview: Vec::with_capacity(MAX_CHANGED_PATHS_PREVIEW),
+        preview_values_truncated: false,
+    };
+    let mut entry = Vec::new();
+    let mut expects_rename_path = false;
+    let mut parse_error = None;
+    let mut chunk = [0_u8; 8 * 1024];
+    loop {
+        let bytes_read = match stdout.read(&mut chunk) {
+            Ok(bytes_read) => bytes_read,
+            Err(error) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(error).context("Cannot read Git status output");
+            }
+        };
+        if bytes_read == 0 {
+            break;
+        }
+        for byte in &chunk[..bytes_read] {
+            if *byte != 0 {
+                if parse_error.is_none() {
+                    entry.push(*byte);
+                }
+                continue;
+            }
+            if let Some(error) = parse_error {
+                entry.clear();
+                parse_error = Some(error);
+                continue;
+            }
+            if entry.is_empty() {
+                continue;
+            }
+            if expects_rename_path {
+                record_git_status_path(&mut summary, &entry);
+                expects_rename_path = false;
+            } else if entry.len() >= 4 && entry[2] == b' ' {
+                let status = &entry[..2];
+                record_git_status_path(&mut summary, &entry[3..]);
+                expects_rename_path = status.contains(&b'R') || status.contains(&b'C');
+            } else {
+                parse_error = Some("Git returned an invalid porcelain status entry");
+            }
+            entry.clear();
+        }
+    }
+    drop(stdout);
+    let status = child
+        .wait()
+        .context("Cannot wait for Git status to finish")?;
+    if !status.success() {
         bail!(
-            "Git status failed while inspecting Writer changes (exit code {})",
-            output.status.code().unwrap_or(-1)
+            "Git status failed while inspecting project changes (exit code {})",
+            status.code().unwrap_or(-1)
         );
     }
-
-    let entries = output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|entry| !entry.is_empty())
-        .collect::<Vec<_>>();
-    let mut paths = Vec::with_capacity(entries.len());
-    let mut index = 0;
-    while index < entries.len() {
-        let entry = entries[index];
-        if entry.len() < 4 || entry[2] != b' ' {
-            bail!("Git returned an invalid porcelain status entry");
-        }
-        paths.push(String::from_utf8_lossy(&entry[3..]).into_owned());
-        let status = &entry[..2];
-        if status.contains(&b'R') || status.contains(&b'C') {
-            index += 1;
-            if index >= entries.len() {
-                bail!("Git returned an incomplete rename status entry");
-            }
-            paths.push(String::from_utf8_lossy(entries[index]).into_owned());
-        }
-        index += 1;
+    if let Some(error) = parse_error {
+        bail!("{error}");
     }
-    Ok(paths)
+    if !entry.is_empty() || expects_rename_path {
+        bail!("Git returned an incomplete rename or status entry");
+    }
+    Ok(summary)
+}
+
+fn record_git_status_path(summary: &mut GitStatusPaths, path: &[u8]) {
+    summary.total_count = summary.total_count.saturating_add(1);
+    if summary.preview.len() < MAX_CHANGED_PATHS_PREVIEW {
+        let path = String::from_utf8_lossy(path);
+        let (path_preview, truncated) = truncate_changed_path(&path);
+        summary.preview_values_truncated |= truncated;
+        summary.preview.push(path_preview);
+    }
+}
+
+fn truncate_changed_path(path: &str) -> (String, bool) {
+    if path.len() <= MAX_CHANGED_PATH_PREVIEW_BYTES {
+        return (path.to_owned(), false);
+    }
+    let mut end = MAX_CHANGED_PATH_PREVIEW_BYTES;
+    while !path.is_char_boundary(end) {
+        end -= 1;
+    }
+    (format!("{}…", &path[..end]), true)
 }
 
 fn recover_writer_attempts(json_output: bool, database: &mut Database) -> Result<()> {

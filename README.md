@@ -54,6 +54,8 @@ talos resume
 
 When `up --auto` or `up --semi` finds no runnable task, it reports the total waiting count and a bounded preview of 25 tasks with up to 10 blocked prerequisites each. Use `talos task list` and `talos task dependencies <ID>` to inspect more.
 
+Writer output reports the changed-path count and shows at most 50 paths, with each displayed name capped at a 256-byte prefix. Use `git status --short` to inspect the full set when paths are omitted or shortened.
+
 `talos attach` creates or reconnects to one persistent tmux shell for the current project. It does not start a worker. Run the existing TALOS commands in that shell, or keep using them directly in the foreground when tmux is unavailable.
 
 `talos pause` durably blocks new Writer attempts and continuations while preserving queued tasks. It does not stop an already-running Writer. Before resuming, TALOS compares the saved Git snapshot with the current project. If the snapshot changed or could not be captured, inspect `git diff` and `git status`, then run `talos resume --reconcile`; tasks already awaiting verification return to Critic review. `talos logs --project` shows the append-only pause and reconciliation history.
