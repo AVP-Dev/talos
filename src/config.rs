@@ -1,7 +1,7 @@
 use std::{fs, path::Path};
 
 use anyhow::{Context, Result, bail};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 
 use crate::{
     checks::{ProjectCheck, validate_project_checks},
@@ -44,6 +44,23 @@ pub struct ProjectConfig {
     pub writer: AdapterKind,
     pub critic: AdapterKind,
     pub checks: Vec<ProjectCheck>,
+    pub github: Option<GithubPolicy>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct GithubPolicy {
+    pub repository: String,
+    #[serde(default = "default_github_remote")]
+    pub remote: String,
+    #[serde(default = "default_github_base_branch")]
+    pub base_branch: String,
+    #[serde(default = "default_github_branch_prefix")]
+    pub feature_branch_prefix: String,
+    #[serde(default)]
+    pub allow_push: bool,
+    #[serde(default)]
+    pub allow_pull_request: bool,
 }
 
 #[derive(Debug, Deserialize)]
@@ -54,6 +71,8 @@ struct FileConfig {
     critic: String,
     #[serde(default)]
     checks: Vec<ProjectCheck>,
+    #[serde(default)]
+    github: Option<GithubPolicy>,
 }
 
 impl Default for ProjectConfig {
@@ -62,6 +81,7 @@ impl Default for ProjectConfig {
             writer: AdapterKind::Agy,
             critic: AdapterKind::Agy,
             checks: Vec::new(),
+            github: None,
         }
     }
 }
@@ -96,17 +116,24 @@ impl ProjectConfig {
             .with_context(|| format!("Cannot read project config {}", path.display()))?;
         let parsed: FileConfig = serde_json::from_slice(&bytes)
             .with_context(|| format!("Project config {} is not valid JSON", path.display()))?;
-        if !matches!(parsed.schema_version, 1 | 2) {
+        if !matches!(parsed.schema_version, 1..=3) {
             bail!(
                 "Project config schema version {} is unsupported",
                 parsed.schema_version
             );
         }
+        if parsed.github.is_some() && parsed.schema_version < 3 {
+            bail!("GitHub publication policy requires project config schema version 3");
+        }
         validate_project_checks(&parsed.checks)?;
+        if let Some(github) = &parsed.github {
+            validate_github_policy(github)?;
+        }
         Ok(Self {
             writer: parse_adapter(&parsed.writer, AgentRole::Writer)?,
             critic: parse_adapter(&parsed.critic, AgentRole::Critic)?,
             checks: parsed.checks,
+            github: parsed.github,
         })
     }
 
@@ -116,6 +143,71 @@ impl ProjectConfig {
             AgentRole::Critic => self.critic,
         }
     }
+}
+
+fn default_github_remote() -> String {
+    "origin".to_owned()
+}
+
+fn default_github_base_branch() -> String {
+    "master".to_owned()
+}
+
+fn default_github_branch_prefix() -> String {
+    "talos/".to_owned()
+}
+
+fn validate_github_policy(policy: &GithubPolicy) -> Result<()> {
+    let Some((owner, repository)) = policy.repository.split_once('/') else {
+        bail!("GitHub policy repository must use owner/repository form");
+    };
+    if owner.is_empty()
+        || owner.len() > 39
+        || !owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || owner.starts_with('-')
+        || owner.ends_with('-')
+        || repository.is_empty()
+        || repository.len() > 100
+        || !repository
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || repository.starts_with('.')
+        || repository.ends_with('.')
+        || repository.contains("..")
+    {
+        bail!("GitHub policy repository name has an invalid owner or repository component");
+    }
+    if policy.remote.is_empty()
+        || policy.remote.len() > 64
+        || !policy
+            .remote
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        || policy.remote.starts_with('-')
+        || policy.remote.starts_with('.')
+        || policy.remote.ends_with('.')
+        || policy.remote.contains("..")
+    {
+        bail!("GitHub policy remote name is invalid");
+    }
+    if policy.base_branch != "master" {
+        bail!("GitHub policy base branch must be `master`");
+    }
+    if !policy.feature_branch_prefix.starts_with("talos/")
+        || !policy.feature_branch_prefix.ends_with('/')
+        || policy.feature_branch_prefix.len() > 64
+        || !policy
+            .feature_branch_prefix
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-'))
+        || policy.feature_branch_prefix.contains("..")
+        || policy.feature_branch_prefix.contains("//")
+    {
+        bail!("GitHub feature branch prefix must be a valid path beginning with `talos/`");
+    }
+    Ok(())
 }
 
 fn parse_adapter(value: &str, role: AgentRole) -> Result<AdapterKind> {

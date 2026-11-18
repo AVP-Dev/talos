@@ -15,7 +15,7 @@ use crate::{
     secrets::contains_sensitive,
 };
 
-const SCHEMA_VERSION: i64 = 14;
+const SCHEMA_VERSION: i64 = 15;
 const MAX_CHILD_TASK_ALLOWED_PATHS: usize = 64;
 const MAX_CHILD_TASK_SCOPE_BYTES: usize = 16 * 1024;
 const MIN_CHILD_TASK_TIMEOUT_MS: i64 = 1_000;
@@ -125,6 +125,42 @@ pub struct TaskWorktreeIntegrationRecord {
     pub started_at_ms: i64,
     pub updated_at_ms: i64,
     pub integrated_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct GithubPublicationRecord {
+    pub id: i64,
+    pub repository: String,
+    pub remote_name: String,
+    pub base_branch: String,
+    pub head_branch: String,
+    pub base_commit: String,
+    pub head_commit: String,
+    pub diff_sha256: String,
+    pub state: String,
+    pub pull_request_url: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+}
+
+pub struct GithubPublicationInput<'a> {
+    pub repository: &'a str,
+    pub remote_name: &'a str,
+    pub base_branch: &'a str,
+    pub head_branch: &'a str,
+    pub base_commit: &'a str,
+    pub head_commit: &'a str,
+    pub diff_sha256: &'a str,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct GithubPublicationEvent {
+    pub id: i64,
+    pub publication_id: i64,
+    pub occurred_at_ms: i64,
+    pub from_state: Option<String>,
+    pub to_state: String,
+    pub reason: String,
 }
 
 impl ChildTaskContract {
@@ -1200,6 +1236,214 @@ impl Database {
             .context("Cannot commit completed task worktree integration")?;
         self.task_worktree_integration(task_id)?
             .context("Task worktree integration disappeared after finalization")
+    }
+
+    pub fn begin_github_publication(
+        &mut self,
+        input: &GithubPublicationInput<'_>,
+    ) -> Result<GithubPublicationRecord> {
+        validate_github_repository(input.repository)?;
+        let repository = input.repository.to_ascii_lowercase();
+        validate_git_remote_name(input.remote_name)?;
+        validate_git_branch_name(input.base_branch, "base branch")?;
+        validate_git_branch_name(input.head_branch, "head branch")?;
+        if input.base_branch != "master" {
+            bail!("GitHub publication base branch must be `master`");
+        }
+        if !input.head_branch.starts_with("talos/") || input.head_branch == input.base_branch {
+            bail!("GitHub publication head must be a feature branch under `talos/`");
+        }
+        validate_git_revision(input.base_commit)?;
+        validate_git_revision(input.head_commit)?;
+        if input.base_commit == input.head_commit {
+            bail!("GitHub publication requires a head commit that differs from its base");
+        }
+        validate_sha256_id(input.diff_sha256, "GitHub publication diff digest")?;
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot start GitHub publication record")?;
+        let existing: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM github_publications
+                           WHERE repository = ?1 AND head_branch = ?2)",
+            params![repository, input.head_branch],
+            |row| row.get(0),
+        )?;
+        if existing {
+            bail!(
+                "A GitHub publication record already exists for {repository} branch {}",
+                input.head_branch
+            );
+        }
+        let now = now_ms()?;
+        transaction.execute(
+            "INSERT INTO github_publications
+                 (repository, remote_name, base_branch, head_branch, base_commit, head_commit,
+                  diff_sha256, state, created_at_ms, updated_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, 'push_pending', ?8, ?8)",
+            params![
+                repository,
+                input.remote_name,
+                input.base_branch,
+                input.head_branch,
+                input.base_commit,
+                input.head_commit,
+                input.diff_sha256,
+                now,
+            ],
+        )?;
+        let publication_id = transaction.last_insert_rowid();
+        transaction.execute(
+            "INSERT INTO github_publication_events
+                 (publication_id, occurred_at_ms, from_state, to_state, reason)
+             VALUES (?1, ?2, NULL, 'push_pending',
+                     'TALOS recorded the exact publication identity before any remote push')",
+            params![publication_id, now],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot commit GitHub publication intent")?;
+        self.github_publication(publication_id)?
+            .context("GitHub publication record disappeared after creation")
+    }
+
+    pub fn github_publication(
+        &self,
+        publication_id: i64,
+    ) -> Result<Option<GithubPublicationRecord>> {
+        self.connection
+            .query_row(
+                "SELECT id, repository, remote_name, base_branch, head_branch, base_commit,
+                        head_commit, diff_sha256, state, pull_request_url, created_at_ms, updated_at_ms
+                 FROM github_publications WHERE id = ?1",
+                [publication_id],
+                map_github_publication,
+            )
+            .optional()
+            .context("Cannot read GitHub publication record")
+    }
+
+    pub fn latest_github_publication_for_branch(
+        &self,
+        repository: &str,
+        head_branch: &str,
+    ) -> Result<Option<GithubPublicationRecord>> {
+        validate_github_repository(repository)?;
+        validate_git_branch_name(head_branch, "head branch")?;
+        let repository = repository.to_ascii_lowercase();
+        self.connection
+            .query_row(
+                "SELECT id, repository, remote_name, base_branch, head_branch, base_commit,
+                        head_commit, diff_sha256, state, pull_request_url, created_at_ms, updated_at_ms
+                 FROM github_publications WHERE repository = ?1 AND head_branch = ?2
+                 ORDER BY id DESC LIMIT 1",
+                params![repository, head_branch],
+                map_github_publication,
+            )
+            .optional()
+            .context("Cannot read GitHub publication for branch")
+    }
+
+    pub fn github_publication_events(
+        &self,
+        publication_id: i64,
+    ) -> Result<Vec<GithubPublicationEvent>> {
+        if self.github_publication(publication_id)?.is_none() {
+            bail!("GitHub publication #{publication_id} does not exist");
+        }
+        let mut statement = self.connection.prepare(
+            "SELECT id, publication_id, occurred_at_ms, from_state, to_state, reason
+             FROM github_publication_events WHERE publication_id = ?1 ORDER BY id",
+        )?;
+        let events = statement
+            .query_map([publication_id], map_github_publication_event)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        Ok(events)
+    }
+
+    pub fn transition_github_publication(
+        &mut self,
+        publication_id: i64,
+        target_state: &str,
+        reason: &str,
+        pull_request_url: Option<&str>,
+    ) -> Result<GithubPublicationRecord> {
+        if !matches!(
+            target_state,
+            "pushed" | "push_unknown" | "pr_pending" | "pr_unknown" | "open" | "needs_attention"
+        ) {
+            bail!("Unsupported GitHub publication state");
+        }
+        validate_record_text("GitHub publication reason", reason, 1_000)?;
+        if contains_sensitive(reason) {
+            bail!("GitHub publication reason must not contain credentials or private keys");
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot transition GitHub publication state")?;
+        let current: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT state, repository FROM github_publications WHERE id = ?1",
+                [publication_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((current_state, repository)) = current else {
+            bail!("GitHub publication #{publication_id} does not exist");
+        };
+        let valid_transition = matches!(
+            (current_state.as_str(), target_state),
+            (
+                "push_pending",
+                "pushed" | "push_unknown" | "needs_attention"
+            ) | ("push_unknown", "pushed" | "needs_attention")
+                | ("pushed", "pr_pending" | "needs_attention")
+                | ("pr_pending", "open" | "pr_unknown" | "needs_attention")
+                | ("pr_unknown", "open" | "needs_attention")
+        );
+        if !valid_transition {
+            bail!(
+                "GitHub publication #{publication_id} cannot transition from {current_state} to {target_state}"
+            );
+        }
+
+        match (target_state, pull_request_url) {
+            ("open", Some(url)) => validate_github_pull_request_url(url, &repository)?,
+            ("open", None) => bail!("An open GitHub publication must record its pull request URL"),
+            (_, Some(_)) => {
+                bail!("A pull request URL can only be recorded when the publication becomes open")
+            }
+            (_, None) => {}
+        }
+        let now = now_ms()?;
+        let changed = transaction.execute(
+            "UPDATE github_publications SET state = ?1, pull_request_url = ?2, updated_at_ms = ?3
+             WHERE id = ?4 AND state = ?5",
+            params![
+                target_state,
+                pull_request_url,
+                now,
+                publication_id,
+                current_state
+            ],
+        )?;
+        if changed != 1 {
+            bail!("GitHub publication #{publication_id} changed while updating its state");
+        }
+        transaction.execute(
+            "INSERT INTO github_publication_events
+                 (publication_id, occurred_at_ms, from_state, to_state, reason)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![publication_id, now, current_state, target_state, reason],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot commit GitHub publication transition")?;
+        self.github_publication(publication_id)?
+            .context("GitHub publication record disappeared after transition")
     }
 
     pub fn add_task_dependency(&mut self, task_id: i64, prerequisite_task_id: i64) -> Result<bool> {
@@ -4179,6 +4423,123 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .context("Cannot record task worktree Writer routing")?;
         migrated_version = 14;
     }
+    if migrated_version == 14 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE github_publications (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     repository TEXT NOT NULL CHECK(length(repository) BETWEEN 3 AND 140),
+                     remote_name TEXT NOT NULL CHECK(length(remote_name) BETWEEN 1 AND 64),
+                     base_branch TEXT NOT NULL CHECK(length(base_branch) BETWEEN 1 AND 200),
+                     head_branch TEXT NOT NULL CHECK(length(head_branch) BETWEEN 1 AND 200),
+                     base_commit TEXT NOT NULL CHECK(length(base_commit) IN (40, 64)),
+                     head_commit TEXT NOT NULL CHECK(length(head_commit) IN (40, 64)),
+                     diff_sha256 TEXT NOT NULL CHECK(length(diff_sha256) = 71),
+                     state TEXT NOT NULL CHECK(state IN (
+                         'push_pending', 'push_unknown', 'pushed', 'pr_pending',
+                         'pr_unknown', 'open', 'needs_attention'
+                     )),
+                     pull_request_url TEXT,
+                     created_at_ms INTEGER NOT NULL,
+                     updated_at_ms INTEGER NOT NULL,
+                     UNIQUE(repository, head_branch),
+                     CHECK(updated_at_ms >= created_at_ms),
+                     CHECK((state = 'open' AND pull_request_url IS NOT NULL)
+                           OR (state <> 'open' AND pull_request_url IS NULL))
+                 );
+                 CREATE TRIGGER github_publications_initial_state
+                     BEFORE INSERT ON github_publications
+                     WHEN NEW.state <> 'push_pending' OR NEW.pull_request_url IS NOT NULL BEGIN
+                         SELECT RAISE(ABORT, 'GitHub publication must begin before push with no PR URL');
+                     END;
+                 CREATE TRIGGER github_publications_identity_immutable
+                     BEFORE UPDATE OF repository, remote_name, base_branch, head_branch,
+                                      base_commit, head_commit, diff_sha256, created_at_ms
+                     ON github_publications BEGIN
+                         SELECT RAISE(ABORT, 'GitHub publication identity is immutable');
+                     END;
+                 CREATE TRIGGER github_publications_state_transition
+                     BEFORE UPDATE OF state ON github_publications
+                     WHEN NOT (
+                         (OLD.state = 'push_pending' AND NEW.state IN ('pushed', 'push_unknown', 'needs_attention'))
+                         OR (OLD.state = 'push_unknown' AND NEW.state IN ('pushed', 'needs_attention'))
+                         OR (OLD.state = 'pushed' AND NEW.state IN ('pr_pending', 'needs_attention'))
+                         OR (OLD.state = 'pr_pending' AND NEW.state IN ('open', 'pr_unknown', 'needs_attention'))
+                         OR (OLD.state = 'pr_unknown' AND NEW.state IN ('open', 'needs_attention'))
+                     ) BEGIN
+                         SELECT RAISE(ABORT, 'invalid GitHub publication state transition');
+                     END;
+                 CREATE TRIGGER github_publications_url_immutable
+                     BEFORE UPDATE OF pull_request_url ON github_publications
+                     WHEN OLD.pull_request_url IS NOT NULL
+                          AND NEW.pull_request_url IS NOT OLD.pull_request_url BEGIN
+                         SELECT RAISE(ABORT, 'GitHub pull request URL is immutable once recorded');
+                     END;
+                 CREATE TRIGGER github_publications_no_delete
+                     BEFORE DELETE ON github_publications BEGIN
+                         SELECT RAISE(ABORT, 'GitHub publication records are append-only');
+                     END;
+
+                 CREATE TABLE github_publication_events (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     publication_id INTEGER NOT NULL REFERENCES github_publications(id) ON DELETE RESTRICT,
+                     occurred_at_ms INTEGER NOT NULL,
+                     from_state TEXT CHECK(from_state IS NULL OR from_state IN (
+                         'push_pending', 'push_unknown', 'pushed', 'pr_pending',
+                         'pr_unknown', 'open', 'needs_attention'
+                     )),
+                     to_state TEXT NOT NULL CHECK(to_state IN (
+                         'push_pending', 'push_unknown', 'pushed', 'pr_pending',
+                         'pr_unknown', 'open', 'needs_attention'
+                     )),
+                     reason TEXT NOT NULL CHECK(length(reason) BETWEEN 1 AND 1000),
+                     CHECK((from_state IS NULL AND to_state = 'push_pending')
+                           OR (from_state IS NOT NULL AND from_state <> to_state))
+                 );
+                 CREATE INDEX github_publication_events_publication_id_id
+                     ON github_publication_events(publication_id, id);
+                 CREATE UNIQUE INDEX github_publication_events_one_initial
+                     ON github_publication_events(publication_id) WHERE from_state IS NULL;
+                 CREATE TRIGGER github_publication_events_initial_match
+                     BEFORE INSERT ON github_publication_events
+                     WHEN NEW.from_state IS NULL AND NOT EXISTS (
+                         SELECT 1 FROM github_publications
+                         WHERE id = NEW.publication_id AND state = 'push_pending'
+                     ) BEGIN
+                         SELECT RAISE(ABORT, 'initial GitHub publication event does not match its record');
+                     END;
+                 CREATE TRIGGER github_publication_events_transition_match
+                     BEFORE INSERT ON github_publication_events
+                     WHEN NEW.from_state IS NOT NULL AND (
+                         NOT EXISTS (
+                             SELECT 1 FROM github_publications
+                             WHERE id = NEW.publication_id AND state = NEW.to_state
+                         )
+                         OR NOT EXISTS (
+                             SELECT 1 FROM github_publication_events AS previous
+                             WHERE previous.publication_id = NEW.publication_id
+                               AND previous.id = (
+                                   SELECT MAX(id) FROM github_publication_events
+                                   WHERE publication_id = NEW.publication_id
+                               )
+                               AND previous.to_state = NEW.from_state
+                         )
+                     ) BEGIN
+                         SELECT RAISE(ABORT, 'GitHub publication event does not match its current state');
+                     END;
+                 CREATE TRIGGER github_publication_events_no_update
+                     BEFORE UPDATE ON github_publication_events BEGIN
+                         SELECT RAISE(ABORT, 'GitHub publication events are append-only');
+                     END;
+                 CREATE TRIGGER github_publication_events_no_delete
+                     BEFORE DELETE ON github_publication_events BEGIN
+                         SELECT RAISE(ABORT, 'GitHub publication events are append-only');
+                     END;
+                 PRAGMA user_version = 15;",
+            )
+            .context("Cannot add durable GitHub publication records")?;
+        migrated_version = 15;
+    }
     if migrated_version != SCHEMA_VERSION {
         bail!("Cannot migrate database from unsupported schema version {migrated_version}");
     }
@@ -4384,6 +4745,36 @@ fn map_task_worktree_integration(
     })
 }
 
+fn map_github_publication(row: &rusqlite::Row<'_>) -> rusqlite::Result<GithubPublicationRecord> {
+    Ok(GithubPublicationRecord {
+        id: row.get(0)?,
+        repository: row.get(1)?,
+        remote_name: row.get(2)?,
+        base_branch: row.get(3)?,
+        head_branch: row.get(4)?,
+        base_commit: row.get(5)?,
+        head_commit: row.get(6)?,
+        diff_sha256: row.get(7)?,
+        state: row.get(8)?,
+        pull_request_url: row.get(9)?,
+        created_at_ms: row.get(10)?,
+        updated_at_ms: row.get(11)?,
+    })
+}
+
+fn map_github_publication_event(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<GithubPublicationEvent> {
+    Ok(GithubPublicationEvent {
+        id: row.get(0)?,
+        publication_id: row.get(1)?,
+        occurred_at_ms: row.get(2)?,
+        from_state: row.get(3)?,
+        to_state: row.get(4)?,
+        reason: row.get(5)?,
+    })
+}
+
 fn map_critic_review_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CriticReviewRecord> {
     Ok(CriticReviewRecord {
         id: row.get(0)?,
@@ -4410,6 +4801,87 @@ fn validate_git_revision(value: &str) -> Result<()> {
             .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
     {
         bail!("Git revision must be a full hexadecimal object ID");
+    }
+    Ok(())
+}
+
+fn validate_github_repository(value: &str) -> Result<()> {
+    validate_record_text("GitHub repository", value, 140)?;
+    let Some((owner, repository)) = value.split_once('/') else {
+        bail!("GitHub repository must use owner/repository form");
+    };
+    if owner.is_empty()
+        || owner.len() > 39
+        || !owner
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+        || owner.starts_with('-')
+        || owner.ends_with('-')
+        || repository.is_empty()
+        || repository.len() > 100
+        || !repository
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.'))
+        || repository.starts_with('.')
+        || repository.ends_with('.')
+        || repository.contains("..")
+    {
+        bail!("GitHub repository has an invalid owner or repository component");
+    }
+    Ok(())
+}
+
+fn validate_git_remote_name(value: &str) -> Result<()> {
+    validate_record_text("Git remote name", value, 64)?;
+    if value.starts_with('-')
+        || value.starts_with('.')
+        || value.ends_with('.')
+        || value.contains("..")
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+    {
+        bail!("Git remote name is invalid");
+    }
+    Ok(())
+}
+
+fn validate_git_branch_name(value: &str, label: &str) -> Result<()> {
+    validate_record_text(label, value, 200)?;
+    if value.starts_with('-')
+        || value.starts_with('/')
+        || value.ends_with('/')
+        || value.ends_with('.')
+        || value.contains("..")
+        || value.contains("//")
+        || value.contains("@{")
+        || value
+            .split('/')
+            .any(|part| part.is_empty() || part.starts_with('.') || part.ends_with(".lock"))
+        || !value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-' | b'/'))
+    {
+        bail!("Git {label} name is invalid");
+    }
+    Ok(())
+}
+
+fn validate_github_pull_request_url(value: &str, repository: &str) -> Result<()> {
+    validate_record_text("GitHub pull request URL", value, 512)?;
+    let Some(path) = value.strip_prefix("https://github.com/") else {
+        bail!("GitHub pull request URL must use the github.com HTTPS host");
+    };
+    let Some((url_repository, number)) = path.split_once("/pull/") else {
+        bail!("GitHub pull request URL must include a pull request number");
+    };
+    let parsed_number = number.parse::<u64>().ok();
+    if !url_repository.eq_ignore_ascii_case(repository)
+        || number.is_empty()
+        || !number.bytes().all(|byte| byte.is_ascii_digit())
+        || parsed_number.is_none_or(|number| number == 0)
+    {
+        bail!("GitHub pull request URL does not match the recorded repository and number");
     }
     Ok(())
 }
@@ -4789,7 +5261,7 @@ mod tests {
     fn initialization_is_idempotent_and_uses_wal() {
         let project = temp_project();
         let first = Database::open(&project).expect("initialize database");
-        assert_eq!(first.schema_version().expect("read schema version"), 14);
+        assert_eq!(first.schema_version().expect("read schema version"), 15);
         assert_eq!(
             first
                 .journal_mode()
@@ -4800,7 +5272,7 @@ mod tests {
         drop(first);
 
         let second = Database::open(&project).expect("open database again");
-        assert_eq!(second.schema_version().expect("read schema version"), 14);
+        assert_eq!(second.schema_version().expect("read schema version"), 15);
         drop(second);
         cleanup(&project);
     }
@@ -4827,7 +5299,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema-v5 duration fields");
-        assert_eq!(migrated.schema_version().unwrap(), 14);
+        assert_eq!(migrated.schema_version().unwrap(), 15);
         let columns: (i64, i64) = migrated
             .connection
             .query_row(
@@ -4866,7 +5338,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v6");
-        assert_eq!(migrated.schema_version().unwrap(), 14);
+        assert_eq!(migrated.schema_version().unwrap(), 15);
         assert_eq!(migrated.list_tasks().unwrap()[0].id, task.id);
         assert!(!migrated.project_control_state().unwrap().queue_paused);
         cleanup(&project);
@@ -4891,7 +5363,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v7");
-        assert_eq!(migrated.schema_version().unwrap(), 14);
+        assert_eq!(migrated.schema_version().unwrap(), 15);
         assert_eq!(
             migrated
                 .project_control_state()
@@ -4920,7 +5392,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v8");
-        assert_eq!(migrated.schema_version().unwrap(), 14);
+        assert_eq!(migrated.schema_version().unwrap(), 15);
         assert!(
             migrated
                 .writer_attempts(None)
@@ -4948,7 +5420,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v9");
-        assert_eq!(migrated.schema_version().unwrap(), 14);
+        assert_eq!(migrated.schema_version().unwrap(), 15);
         let dependencies_table_exists: bool = migrated
             .connection
             .query_row(
@@ -4977,7 +5449,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v10");
-        assert_eq!(migrated.schema_version().unwrap(), 14);
+        assert_eq!(migrated.schema_version().unwrap(), 15);
         let contracts_table_exists: bool = migrated
             .connection
             .query_row(
@@ -5333,7 +5805,7 @@ mod tests {
         drop(database);
 
         let mut migrated = Database::open(&project).expect("migrate the v4 approval");
-        assert_eq!(migrated.schema_version().unwrap(), 14);
+        assert_eq!(migrated.schema_version().unwrap(), 15);
         assert_eq!(
             migrated.list_tasks().unwrap()[0].status,
             TaskStatus::Reviewing
@@ -5517,7 +5989,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate existing database");
-        assert_eq!(database.schema_version().expect("read schema version"), 14);
+        assert_eq!(database.schema_version().expect("read schema version"), 15);
         let tasks = database.list_tasks().expect("read preserved tasks");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Existing v1 task");
@@ -5813,7 +6285,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate v2 database");
-        assert_eq!(database.schema_version().expect("read schema version"), 14);
+        assert_eq!(database.schema_version().expect("read schema version"), 15);
         assert!(
             database
                 .has_unresolved_writer_attempts()

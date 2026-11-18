@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R6–R8 implementation remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. R7.1–R7.5 code is implemented or in progress, with behavior/migration acceptance still open; native subagent delegation and three-agent acceptance remain unavailable until verified. T8.1 local `gh` diagnostics are implemented; no auth/network check has been invoked. Backlog count: 40 of 61 scheduled tasks done (65.6% by task count, unweighted); two unscheduled ideas are recorded separately.
+**R6–R8 implementation remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. R7.1–R7.5 code is implemented or in progress, with behavior/migration acceptance still open; native subagent delegation and three-agent acceptance remain unavailable until verified. T8.1 diagnostics and T8.2 policy-gated GitHub publication code are implemented, but CLI behavior acceptance is pending; no GitHub authentication, repository, push, or PR operation has been performed. T8.3 CI evidence remains next. Linux access and native checks are deferred to the user's server. Backlog count must be recalculated after the current batch.
 
 ## Goal and fixed direction
 
@@ -296,10 +296,20 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - Added `doctor` reporting for local `gh` availability/version. Added `talos github status`; it stays local by default. `--check-auth` explicitly runs `gh auth status --active --json hosts`, bounds execution to 15 seconds and captured output to 32 KiB, discards raw stdout/stderr, and reports only an aggregate authentication state. It does not invoke `gh auth token` or inspect credential environment variables.
 - Checked current official GitHub CLI documentation with Context7. `gh auth status --json hosts` can include account names, token source, and expiration metadata, so TALOS only deserializes each entry's state and never prints raw output. During an explicit check, `gh` may use configured credentials internally; TALOS never requests, parses, stores, or exposes token values. The active auth command has not been run during implementation; no GitHub request, repository, remote, push, or PR was made.
 - Updated README, roadmap, task backlog, decisions, and this handoff. A read-only review found a missing-field parsing ambiguity and documentation overstatement; both were corrected. R8.1 remains in progress pending local CLI behavior acceptance. Linux checks and all automated tests remain deferred; `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo check --all-targets --all-features`, and `git diff --check` passed on macOS.
+- T8.1 implementation is committed locally as `0a8c9e7` (`feat: add safe GitHub CLI diagnostics`) on `master`. No remote is configured.
+
+## R8.2 progress — publication policy and local feature branches
+
+- Extended project config schema to v3 with an optional GitHub policy pinned to `owner/repository`, a named Git remote, the user-required `master` base, and a feature prefix rooted at `talos/`. Push and PR flags default to false; config rejects unknown fields and credential-like policy fields.
+- Added local `talos github policy` and `talos github branch create <slug>`. Branch creation requires the configured policy, a clean Git checkout currently on `master`, a valid unique feature ref, and uses `git switch --create` from `master`. It does not access GitHub or push.
+- Added `talos github publish` and `talos github reconcile`. Publication requires both policy permissions and explicit `--confirm-push` / `--confirm-pr`, verifies fetch and push URLs against the configured GitHub repository, verifies local/remote `master`, and records the exact head commit and diff digest before pushing only `refs/heads/<named-feature-branch>`. It requests a draft PR and does not merge.
+- Schema v15 stores immutable publication identity, state, PR URL, and append-only transition events. Push/PR outcomes that are not confirmed become unknown and require reconciliation; TALOS will not repeat an uncertain push or create a second PR without checking the recorded branch/PR first. Conflicts stop in `needs_attention`.
+- Reviewed the state transitions and consolidated CLI arguments to satisfy Clippy. Updated README and plan/task/decision/handoff docs. No repository or remote exists in the workspace, so no auth, network read, push, or PR operation has been invoked.
+- Current macOS checks after these edits: `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo check --all-targets --all-features`, and `git diff --check` passed. Automated tests and Linux-native checks were not run.
 
 ## Next action
 
-Continue with T8.2 policy and report design, keeping implementation local. Do not create a GitHub repository, add a remote, push, or open a PR until the user creates the repository and explicitly authorizes that external action. R6 acceptance gates remain open: T6.3 behavior/full-profile checks, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6's TUI trust/handoff scenario. R7.1–R7.5 behavior/migration checks and T7.3 native delegation acceptance remain open. No Linux connection or trust-setting change has been made. Keep all work local on `master`.
+Commit the completed T8.2 implementation locally, then continue sequentially with T8.3 CI status/evidence and T8.4 merge safeguards. Do not create a repository, add a remote, or invoke GitHub operations; the user will provide the repository later. Keep remote acceptance explicitly pending. R6 gates remain open: T6.3 behavior/profile checks, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 TUI trust/handoff. R7 behavior/migration checks and native delegation acceptance remain open. Skip Linux connection/setup and defer Linux-native checks until the server is available. Keep work local on `master`.
 
 ## Session close checklist
 

@@ -12,11 +12,15 @@ use serde_json::json;
 use crate::{
     adapter::agy::AgyProbe,
     checks::{CheckExecution, ProjectCheck, run_project_check, validate_selected_checks},
-    cli::{Cli, Command, GithubCommand, ResolveAction, TaskCommand, TaskWorktreeCommand},
-    config::{AdapterKind, AgentRole, ProjectConfig},
+    cli::{
+        Cli, Command, GithubBranchCommand, GithubCommand, ResolveAction, TaskCommand,
+        TaskWorktreeCommand,
+    },
+    config::{AdapterKind, AgentRole, GithubPolicy, ProjectConfig},
     db::{
-        Database, ProjectControlEvent, QueueSummary, ResumeProjectOutcome, StopRequestOutcome,
-        TaskEvent, TaskRecord, WriterResolutionAction, WriterResolutionRecord,
+        Database, GithubPublicationInput, GithubPublicationRecord, ProjectControlEvent,
+        QueueSummary, ResumeProjectOutcome, StopRequestOutcome, TaskEvent, TaskRecord,
+        WriterResolutionAction, WriterResolutionRecord,
     },
     github::{self, GithubProbe},
     policy::{self, Action as PolicyAction, Authorization, ExecutionMode},
@@ -65,6 +69,21 @@ struct DoctorReport {
     git: &'static str,
 }
 
+struct GithubPublishRequest<'a> {
+    branch: &'a str,
+    title: &'a str,
+    body: &'a str,
+    confirm_push: bool,
+    confirm_pr: bool,
+}
+
+#[derive(Clone, Copy)]
+struct GithubReconcileOptions<'a> {
+    create_pr: bool,
+    title: Option<&'a str>,
+    body: Option<&'a str>,
+}
+
 pub async fn run(cli: Cli) -> Result<()> {
     if let Command::Github(arguments) = &cli.command {
         match &arguments.command {
@@ -72,11 +91,36 @@ pub async fn run(cli: Cli) -> Result<()> {
                 run_github_status(cli.json, *check_auth).await?;
                 return Ok(());
             }
+            GithubCommand::Policy
+            | GithubCommand::Branch { .. }
+            | GithubCommand::Publish { .. }
+            | GithubCommand::Reconcile { .. } => {}
         }
     }
 
     let working_directory = env::current_dir().context("Cannot read current directory")?;
     let project = Project::discover(&working_directory)?;
+
+    if let Command::Github(arguments) = &cli.command {
+        match &arguments.command {
+            GithubCommand::Policy => {
+                ensure_talos_ignored(&project)?;
+                run_github_policy(cli.json, &project)?;
+                return Ok(());
+            }
+            GithubCommand::Branch {
+                command: GithubBranchCommand::Create { slug },
+            } => {
+                ensure_talos_ignored(&project)?;
+                create_github_branch(cli.json, &project, slug)?;
+                return Ok(());
+            }
+            GithubCommand::Status { .. } => {
+                bail!("GitHub status was not dispatched before project discovery");
+            }
+            GithubCommand::Publish { .. } | GithubCommand::Reconcile { .. } => {}
+        }
+    }
 
     if matches!(
         &cli.command,
@@ -768,9 +812,49 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Attach => bail!("Attach command was not dispatched before runtime initialization"),
-        Command::Github(_) => {
-            bail!("GitHub command was not dispatched before runtime initialization")
-        }
+        Command::Github(arguments) => match arguments.command {
+            GithubCommand::Publish {
+                branch,
+                title,
+                body,
+                confirm_push,
+                confirm_pr,
+            } => {
+                run_github_publish(
+                    cli.json,
+                    &project,
+                    &mut database,
+                    GithubPublishRequest {
+                        branch: &branch,
+                        title: &title,
+                        body: &body,
+                        confirm_push,
+                        confirm_pr,
+                    },
+                )
+                .await?;
+            }
+            GithubCommand::Reconcile {
+                publication_id,
+                create_pr,
+                title,
+                body,
+            } => {
+                run_github_reconcile(
+                    cli.json,
+                    &project,
+                    &mut database,
+                    publication_id,
+                    GithubReconcileOptions {
+                        create_pr,
+                        title: title.as_deref(),
+                        body: body.as_deref(),
+                    },
+                )
+                .await?;
+            }
+            _ => bail!("GitHub command was not dispatched before runtime initialization"),
+        },
     }
     Ok(())
 }
@@ -796,6 +880,640 @@ async fn run_github_status(json_output: bool, check_auth: bool) -> Result<()> {
         "needs_attention" => println!("Authentication: active account needs attention"),
         "timeout" => println!("Authentication: status check timed out"),
         _ => println!("Authentication: status unknown"),
+    }
+    Ok(())
+}
+
+fn run_github_policy(json_output: bool, project: &Project) -> Result<()> {
+    let policy = ProjectConfig::load(project)?.github;
+    if json_output {
+        print_json(&json!({
+            "configured": policy.is_some(),
+            "policy": policy,
+            "external_actions_enabled": policy.as_ref().is_some_and(|policy| {
+                policy.allow_push && policy.allow_pull_request
+            }),
+        }))?;
+    } else if let Some(policy) = policy {
+        println!("GitHub repository: {}", policy.repository);
+        println!("Git remote: {}", policy.remote);
+        println!("Base branch: {}", policy.base_branch);
+        println!("Feature prefix: {}", policy.feature_branch_prefix);
+        println!("Push allowed: {}", policy.allow_push);
+        println!(
+            "Pull request creation allowed: {}",
+            policy.allow_pull_request
+        );
+    } else {
+        println!("No GitHub publication policy is configured.");
+        println!(
+            "Publication stays disabled until .talos/config.json contains a validated schema-v3 GitHub policy."
+        );
+    }
+    Ok(())
+}
+
+fn create_github_branch(json_output: bool, project: &Project, slug: &str) -> Result<()> {
+    let mut database = Database::open(project)?;
+    with_worktree_supervisor_lease(&mut database, "github-branch-create", |_| {
+        create_github_branch_under_lease(json_output, project, slug)
+    })
+}
+
+fn create_github_branch_under_lease(
+    json_output: bool,
+    project: &Project,
+    slug: &str,
+) -> Result<()> {
+    if !matches!(&project.discovery, DiscoveryMethod::Git) {
+        bail!("GitHub feature branches require a Git project");
+    }
+    if slug.is_empty()
+        || slug.len() > 48
+        || !slug
+            .bytes()
+            .all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'-')
+        || !slug.as_bytes()[0].is_ascii_alphanumeric()
+        || !slug.as_bytes()[slug.len() - 1].is_ascii_alphanumeric()
+        || slug.contains("--")
+    {
+        bail!("Feature branch slug must be 1–48 lowercase letters, digits, or single hyphens");
+    }
+    let config = ProjectConfig::load(project)?;
+    let policy: GithubPolicy = config
+        .github
+        .context("No GitHub publication policy is configured; local branch creation is disabled")?;
+    let branch = format!("{}{}", policy.feature_branch_prefix, slug);
+    let dirty_paths = git_status_paths(project)?;
+    if !dirty_paths.is_empty() {
+        bail!(
+            "Cannot create a GitHub feature branch with a dirty primary worktree; inspect or commit these paths first: {}",
+            dirty_paths.join(", ")
+        );
+    }
+    let current_branch = git_command(project, &["branch", "--show-current"])?;
+    if !current_branch.status.success() {
+        bail!("Cannot read the current Git branch");
+    }
+    let current_branch = std::str::from_utf8(&current_branch.stdout)
+        .context("Current Git branch name is not valid UTF-8")?
+        .trim();
+    if current_branch != policy.base_branch {
+        bail!(
+            "Create feature branches only from the configured base branch `{}`; current branch is `{}`",
+            policy.base_branch,
+            current_branch
+        );
+    }
+    let branch_check = git_command(project, &["check-ref-format", "--branch", &branch])?;
+    if !branch_check.status.success() {
+        bail!("Configured feature branch name is not a valid Git branch");
+    }
+    let base_commit = git_command(
+        project,
+        &[
+            "rev-parse",
+            "--verify",
+            &format!("refs/heads/{}", policy.base_branch),
+        ],
+    )?;
+    if !base_commit.status.success() {
+        bail!(
+            "Configured base branch `{}` does not exist locally",
+            policy.base_branch
+        );
+    }
+    let existing_branch = git_command(
+        project,
+        &[
+            "show-ref",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ],
+    )?;
+    match existing_branch.status.code() {
+        Some(1) => {}
+        Some(0) => bail!("Feature branch `{branch}` already exists"),
+        _ => bail!("Cannot determine whether feature branch `{branch}` already exists"),
+    }
+    let switched = git_command(
+        project,
+        &["switch", "--create", &branch, &policy.base_branch],
+    )?;
+    if !switched.status.success() {
+        bail!("Git could not create and switch to feature branch `{branch}`");
+    }
+    let base_commit = std::str::from_utf8(&base_commit.stdout)
+        .context("Base branch commit is not valid UTF-8")?
+        .trim();
+    if json_output {
+        print_json(&json!({
+            "branch": branch,
+            "base_branch": policy.base_branch,
+            "base_commit": base_commit,
+            "local_only": true,
+            "pushed": false,
+        }))?;
+    } else {
+        println!(
+            "Created local feature branch `{branch}` from `{}`.",
+            policy.base_branch
+        );
+        println!("The branch has not been pushed.");
+    }
+    Ok(())
+}
+
+async fn run_github_publish(
+    json_output: bool,
+    project: &Project,
+    database: &mut Database,
+    request: GithubPublishRequest<'_>,
+) -> Result<()> {
+    if !request.confirm_push || !request.confirm_pr {
+        bail!("Publishing requires explicit --confirm-push and --confirm-pr flags");
+    }
+    let policy = ProjectConfig::load(project)?
+        .github
+        .context("No GitHub publication policy is configured")?;
+    if !policy.allow_push || !policy.allow_pull_request {
+        bail!(
+            "GitHub publication is disabled by the local policy; both push and PR permissions must be enabled"
+        );
+    }
+    validate_pull_request_text(request.title, request.body)?;
+
+    let lease = acquire_github_supervisor_lease(database, "publish")?;
+    let publication =
+        run_github_publish_under_lease(json_output, project, database, &policy, request).await;
+    let released = database.release_supervisor_lease(&lease)?;
+    if !released {
+        bail!("TALOS lost its supervisor lease during GitHub publication");
+    }
+    publication
+}
+
+async fn run_github_publish_under_lease(
+    json_output: bool,
+    project: &Project,
+    database: &mut Database,
+    policy: &GithubPolicy,
+    request: GithubPublishRequest<'_>,
+) -> Result<()> {
+    let GithubPublishRequest {
+        branch,
+        title,
+        body,
+        ..
+    } = request;
+    if !matches!(&project.discovery, DiscoveryMethod::Git) {
+        bail!("GitHub publication requires a Git project");
+    }
+    if !branch.starts_with(&policy.feature_branch_prefix) || branch == policy.base_branch {
+        bail!(
+            "GitHub publication is limited to a named feature branch under the configured prefix"
+        );
+    }
+    let branch_check = git_command(project, &["check-ref-format", "--branch", branch])?;
+    if !branch_check.status.success() {
+        bail!("GitHub publication branch is not a valid Git branch name");
+    }
+    let current_branch = git_command(project, &["branch", "--show-current"])?;
+    if !current_branch.status.success() {
+        bail!("Cannot read the current Git branch before GitHub publication");
+    }
+    let current_branch = std::str::from_utf8(&current_branch.stdout)
+        .context("Current Git branch name is not valid UTF-8")?
+        .trim();
+    if current_branch != branch {
+        bail!("Current Git branch does not match the explicitly named publication branch");
+    }
+    let dirty_paths = git_status_paths(project)?;
+    if !dirty_paths.is_empty() {
+        bail!(
+            "GitHub publication requires a clean feature branch; inspect or commit these paths first: {}",
+            dirty_paths.join(", ")
+        );
+    }
+
+    let base_ref = format!("refs/heads/{}", policy.base_branch);
+    let base_commit = git_command(project, &["rev-parse", "--verify", &base_ref])?;
+    if !base_commit.status.success() {
+        bail!(
+            "Configured GitHub base branch `{}` is missing locally",
+            policy.base_branch
+        );
+    }
+    let base_commit = std::str::from_utf8(&base_commit.stdout)
+        .context("Base branch commit is not valid UTF-8")?
+        .trim()
+        .to_owned();
+    let head_commit = git_head(&project.root)?
+        .context("GitHub publication requires at least one committed feature change")?;
+    if head_commit == base_commit {
+        bail!(
+            "GitHub publication branch has no commits beyond `{}`",
+            policy.base_branch
+        );
+    }
+    let ancestry = git_command(
+        project,
+        &["merge-base", "--is-ancestor", &policy.base_branch, "HEAD"],
+    )?;
+    if !ancestry.status.success() {
+        bail!("Feature branch must descend from the configured `master` base");
+    }
+    let revision = RevisionSnapshot::capture(&project.root, &base_commit)?;
+    if revision.head_commit != head_commit || revision.changed_paths.is_empty() {
+        bail!(
+            "Feature branch revision changed during publication preflight or has no diff from master"
+        );
+    }
+    if database
+        .latest_github_publication_for_branch(&policy.repository, branch)?
+        .is_some()
+    {
+        bail!(
+            "This repository/branch already has a durable publication record; inspect it with `talos github reconcile` instead of publishing again"
+        );
+    }
+
+    github::validate_remote_identity(&project.root, &policy.remote, &policy.repository)?;
+    if !github::repository_default_branch_matches(&policy.repository, &policy.base_branch).await {
+        bail!(
+            "GitHub repository is unavailable, unauthenticated, or does not use the configured base branch"
+        );
+    }
+    let remote_base = github::remote_ref_sha(&project.root, &policy.remote, &policy.base_branch)
+        .await?
+        .context("Configured GitHub base branch is missing on the remote")?;
+    if remote_base != base_commit {
+        bail!(
+            "Local master does not match the remote master; fetch and reconcile the feature branch before publishing"
+        );
+    }
+    if github::remote_ref_sha(&project.root, &policy.remote, branch)
+        .await?
+        .is_some()
+    {
+        bail!("The named remote feature branch already exists; TALOS will not update it");
+    }
+
+    let mut publication = database.begin_github_publication(&GithubPublicationInput {
+        repository: &policy.repository,
+        remote_name: &policy.remote,
+        base_branch: &policy.base_branch,
+        head_branch: branch,
+        base_commit: &base_commit,
+        head_commit: &head_commit,
+        diff_sha256: &revision.patch_sha256,
+    })?;
+    let push_outcome =
+        github::push_process_result(&project.root, &policy.remote, branch, &head_commit).await;
+    if push_outcome != "pushed" {
+        publication = database.transition_github_publication(
+            publication.id,
+            "push_unknown",
+            if push_outcome == "timed_out" {
+                "The explicit single-branch push timed out; remote state must be reconciled before retry"
+            } else {
+                "The explicit single-branch push did not confirm its outcome; remote state must be reconciled before retry"
+            },
+            None,
+        )?;
+        print_github_publication(json_output, &publication)?;
+        return Ok(());
+    }
+
+    publication = database.transition_github_publication(
+        publication.id,
+        "pushed",
+        "Git confirmed the exact recorded commit was pushed to the named feature branch",
+        None,
+    )?;
+    publication = database.transition_github_publication(
+        publication.id,
+        "pr_pending",
+        "TALOS recorded draft pull request intent before invoking GitHub CLI",
+        None,
+    )?;
+    let remote_head = github::remote_ref_sha(&project.root, &policy.remote, branch).await?;
+    if remote_head.as_deref() != Some(head_commit.as_str()) {
+        publication = database.transition_github_publication(
+            publication.id,
+            "needs_attention",
+            "Remote feature branch changed after push and before pull request creation",
+            None,
+        )?;
+        print_github_publication(json_output, &publication)?;
+        return Ok(());
+    }
+    if let Some((_, url)) = github::create_draft_pull_request(
+        &policy.repository,
+        &policy.base_branch,
+        branch,
+        title,
+        body,
+    )
+    .await
+    {
+        publication = database.transition_github_publication(
+            publication.id,
+            "open",
+            "GitHub CLI returned a matching draft pull request URL",
+            Some(&url),
+        )?;
+    } else {
+        publication = database.transition_github_publication(
+            publication.id,
+            "pr_unknown",
+            "Draft pull request command did not confirm its outcome; inspect GitHub before retry",
+            None,
+        )?;
+    }
+    print_github_publication(json_output, &publication)?;
+    Ok(())
+}
+
+async fn run_github_reconcile(
+    json_output: bool,
+    project: &Project,
+    database: &mut Database,
+    publication_id: i64,
+    options: GithubReconcileOptions<'_>,
+) -> Result<()> {
+    let record = database
+        .github_publication(publication_id)?
+        .with_context(|| format!("GitHub publication #{publication_id} does not exist"))?;
+    if options.create_pr {
+        let title = options.title.context("`--create-pr` requires `--title`")?;
+        let body = options.body.context("`--create-pr` requires `--body`")?;
+        validate_pull_request_text(title, body)?;
+    } else if options.title.is_some() || options.body.is_some() {
+        bail!("`--title` and `--body` can only be used with `--create-pr`");
+    }
+    if options.create_pr
+        && !matches!(
+            record.state.as_str(),
+            "push_pending" | "push_unknown" | "pushed"
+        )
+    {
+        bail!(
+            "`--create-pr` is only available when reconciling a push that has not entered PR creation; omit it to inspect an uncertain PR result"
+        );
+    }
+    let policy = ProjectConfig::load(project)?
+        .github
+        .context("No GitHub publication policy is configured")?;
+    if !record.repository.eq_ignore_ascii_case(&policy.repository)
+        || record.remote_name != policy.remote
+        || record.base_branch != policy.base_branch
+    {
+        bail!("Recorded GitHub publication does not match the current local policy");
+    }
+    if options.create_pr && !policy.allow_pull_request {
+        bail!("Draft pull request creation is disabled by the current GitHub policy");
+    }
+    let lease = acquire_github_supervisor_lease(database, "reconcile")?;
+    let outcome =
+        run_github_reconcile_under_lease(json_output, project, database, &policy, record, options)
+            .await;
+    let released = database.release_supervisor_lease(&lease)?;
+    if !released {
+        bail!("TALOS lost its supervisor lease during GitHub publication reconciliation");
+    }
+    outcome
+}
+
+async fn run_github_reconcile_under_lease(
+    json_output: bool,
+    project: &Project,
+    database: &mut Database,
+    policy: &GithubPolicy,
+    mut record: GithubPublicationRecord,
+    options: GithubReconcileOptions<'_>,
+) -> Result<()> {
+    github::validate_remote_identity(&project.root, &record.remote_name, &record.repository)?;
+    if !github::repository_default_branch_matches(&record.repository, &record.base_branch).await {
+        bail!("Cannot verify the recorded GitHub repository and base branch");
+    }
+    match record.state.as_str() {
+        "push_pending" | "push_unknown" => {
+            let remote_head =
+                github::remote_ref_sha(&project.root, &record.remote_name, &record.head_branch)
+                    .await?;
+            if remote_head.as_deref() == Some(record.head_commit.as_str()) {
+                record = database.transition_github_publication(
+                    record.id,
+                    "pushed",
+                    "Explicit reconciliation found the exact recorded commit on the remote branch",
+                    None,
+                )?;
+            } else {
+                record = database.transition_github_publication(
+                    record.id,
+                    "needs_attention",
+                    "Remote branch is absent or differs from the recorded commit; automatic retry is unsafe",
+                    None,
+                )?;
+                print_github_publication(json_output, &record)?;
+                return Ok(());
+            }
+        }
+        "pr_pending" | "pr_unknown" => {
+            let remote_head =
+                github::remote_ref_sha(&project.root, &record.remote_name, &record.head_branch)
+                    .await?;
+            let pull_request = github::find_matching_open_pull_request(
+                &record.repository,
+                &record.head_branch,
+                &record.base_branch,
+                &record.head_commit,
+            )
+            .await;
+            if remote_head.as_deref() != Some(record.head_commit.as_str()) {
+                record = database.transition_github_publication(
+                    record.id,
+                    "needs_attention",
+                    "Remote feature branch no longer matches the recorded commit; inspect the PR manually",
+                    None,
+                )?;
+                print_github_publication(json_output, &record)?;
+                return Ok(());
+            }
+            match pull_request {
+                github::PullRequestInspection::MatchingOpen { url, .. } => {
+                    record = database.transition_github_publication(
+                        record.id,
+                        "open",
+                        "Explicit reconciliation found one open PR for the recorded branch, base, and commit",
+                        Some(&url),
+                    )?;
+                }
+                _ => {
+                    record = database.transition_github_publication(
+                        record.id,
+                        "needs_attention",
+                        "GitHub did not confirm one matching open pull request; inspect the remote before continuing",
+                        None,
+                    )?;
+                    print_github_publication(json_output, &record)?;
+                    return Ok(());
+                }
+            }
+        }
+        "pushed" => {}
+        "open" | "needs_attention" => {
+            print_github_publication(json_output, &record)?;
+            return Ok(());
+        }
+        _ => bail!("GitHub publication has an unsupported state and needs manual inspection"),
+    }
+
+    if options.create_pr {
+        if !policy.allow_pull_request {
+            bail!("Draft pull request creation is disabled by the current GitHub policy");
+        }
+        let remote_head =
+            github::remote_ref_sha(&project.root, &record.remote_name, &record.head_branch).await?;
+        if remote_head.as_deref() != Some(record.head_commit.as_str()) {
+            record = database.transition_github_publication(
+                record.id,
+                "needs_attention",
+                "Remote feature branch no longer matches the recorded commit; PR creation stopped",
+                None,
+            )?;
+            print_github_publication(json_output, &record)?;
+            return Ok(());
+        }
+        match github::find_matching_open_pull_request(
+            &record.repository,
+            &record.head_branch,
+            &record.base_branch,
+            &record.head_commit,
+        )
+        .await
+        {
+            github::PullRequestInspection::None => {}
+            github::PullRequestInspection::MatchingOpen { url, .. } => {
+                record = database.transition_github_publication(
+                    record.id,
+                    "pr_pending",
+                    "Operator reconciliation found a PR created after push completion",
+                    None,
+                )?;
+                record = database.transition_github_publication(
+                    record.id,
+                    "open",
+                    "Operator reconciliation recorded the matching open pull request",
+                    Some(&url),
+                )?;
+                print_github_publication(json_output, &record)?;
+                return Ok(());
+            }
+            github::PullRequestInspection::OtherOrAmbiguous => {
+                record = database.transition_github_publication(
+                    record.id,
+                    "needs_attention",
+                    "A conflicting or non-matching pull request exists for this branch",
+                    None,
+                )?;
+                print_github_publication(json_output, &record)?;
+                return Ok(());
+            }
+            github::PullRequestInspection::Unknown => {
+                bail!("Cannot determine whether a pull request already exists; no PR was created");
+            }
+        }
+        let title = options.title.context("`--create-pr` requires `--title`")?;
+        let body = options.body.context("`--create-pr` requires `--body`")?;
+        record = database.transition_github_publication(
+            record.id,
+            "pr_pending",
+            "Operator explicitly authorized draft PR creation during reconciliation",
+            None,
+        )?;
+        if let Some((_, url)) = github::create_draft_pull_request(
+            &record.repository,
+            &record.base_branch,
+            &record.head_branch,
+            title,
+            body,
+        )
+        .await
+        {
+            record = database.transition_github_publication(
+                record.id,
+                "open",
+                "GitHub CLI returned a matching draft pull request URL during reconciliation",
+                Some(&url),
+            )?;
+        } else {
+            record = database.transition_github_publication(
+                record.id,
+                "pr_unknown",
+                "Draft pull request command did not confirm its outcome; inspect GitHub before retry",
+                None,
+            )?;
+        }
+    }
+    print_github_publication(json_output, &record)?;
+    Ok(())
+}
+
+fn acquire_github_supervisor_lease(
+    database: &mut Database,
+    action: &str,
+) -> Result<crate::db::SupervisorLease> {
+    let now = now_ms()?;
+    let owner_id = format!("talos-task-github-{action}-{}-{now}", std::process::id());
+    let duration_ms = i64::try_from(SUPERVISOR_LEASE.as_millis())
+        .context("Supervisor lease duration is out of range")?;
+    database
+        .acquire_supervisor_lease(&owner_id, now, duration_ms)?
+        .context("Another TALOS supervisor currently owns the project lease")
+}
+
+fn validate_pull_request_text(title: &str, body: &str) -> Result<()> {
+    if title.trim().is_empty() || title.len() > 200 || contains_sensitive(title) {
+        bail!(
+            "Pull request title must be non-empty, at most 200 bytes, and contain no secret-like text"
+        );
+    }
+    if body.trim().is_empty() || body.len() > 16_000 || contains_sensitive(body) {
+        bail!(
+            "Pull request body must be non-empty, at most 16000 bytes, and contain no secret-like text"
+        );
+    }
+    Ok(())
+}
+
+fn print_github_publication(json_output: bool, record: &GithubPublicationRecord) -> Result<()> {
+    if json_output {
+        print_json(record)?;
+        return Ok(());
+    } else {
+        println!(
+            "GitHub publication #{}: {} ({}, {})",
+            record.id, record.state, record.repository, record.head_branch
+        );
+        println!("Diff: {}", record.diff_sha256);
+        if let Some(url) = &record.pull_request_url {
+            println!("Draft PR: {url}");
+        } else if matches!(
+            record.state.as_str(),
+            "push_unknown" | "pr_pending" | "pr_unknown"
+        ) {
+            println!(
+                "Inspect the remote, then run `talos github reconcile {}` before any retry.",
+                record.id
+            );
+        } else if record.state == "needs_attention" {
+            println!(
+                "Inspect GitHub and the local branch manually; TALOS will not retry this publication."
+            );
+        }
     }
     Ok(())
 }

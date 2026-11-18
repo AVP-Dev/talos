@@ -119,7 +119,7 @@ Dependency: R5/R7.
 | ID | Status | Task | Exit criteria |
 |---|---|---|---|
 | T8.1 | in progress | Check `gh` auth and GitHub capability without reading token values | `doctor` and `talos github status` report local `gh` availability/version without contacting GitHub. Only explicit `talos github status --check-auth` invokes `gh auth status --active --json hosts`; output is bounded and only aggregate state is exposed. The auth command has not been invoked during development. Repo-specific access checks remain deferred until the user creates a repository. |
-| T8.2 | planned | Create feature branch, push, and PR under an explicit policy | Push is limited to a named feature branch; URL and diff hash are recorded. |
+| T8.2 | in progress | Create feature branch, push, and PR under an explicit policy | Schema-v3 policy pins repository, remote, `master`, and `talos/` prefix; push/PR default off. Local branch creation is network-free. `publish` verifies remote identity and exact commits, stores append-only intent/state before push, pushes one exact branch, creates a draft PR, and records its URL. `reconcile` checks ambiguous outcomes before any retry. Code compiles and passes Clippy; remote behavior is unverified because no repository/remote exists. |
 | T8.3 | planned | Wait for CI and attach evidence | Status comes from GitHub; timeout/error remains visibly incomplete. |
 | T8.4 | planned | Keep merge under user control | No automatic merge or deletion of a branch with unverified changes. |
 

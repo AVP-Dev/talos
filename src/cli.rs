@@ -54,6 +54,54 @@ pub enum GithubCommand {
         #[arg(long)]
         check_auth: bool,
     },
+    /// Show the local GitHub publication policy without contacting GitHub.
+    Policy,
+    /// Create or inspect a local feature branch; this does not push it.
+    Branch {
+        #[command(subcommand)]
+        command: GithubBranchCommand,
+    },
+    /// Push one named feature branch and open a draft PR under the configured policy.
+    Publish {
+        /// Exact local and remote feature branch to publish.
+        #[arg(long)]
+        branch: String,
+        /// Pull request title.
+        #[arg(long)]
+        title: String,
+        /// Pull request body.
+        #[arg(long)]
+        body: String,
+        /// Explicitly authorize pushing this feature branch to the configured remote.
+        #[arg(long, required = true, action = clap::ArgAction::SetTrue)]
+        confirm_push: bool,
+        /// Explicitly authorize opening a draft pull request against `master`.
+        #[arg(long, required = true, action = clap::ArgAction::SetTrue)]
+        confirm_pr: bool,
+    },
+    /// Inspect and reconcile an interrupted push or pull request operation.
+    Reconcile {
+        /// ID of the recorded GitHub publication.
+        publication_id: i64,
+        /// Create a draft PR after reconciliation confirms the branch is pushed and no PR exists.
+        #[arg(long, requires_all = ["title", "body"])]
+        create_pr: bool,
+        /// Title to use only with --create-pr.
+        #[arg(long)]
+        title: Option<String>,
+        /// Body to use only with --create-pr.
+        #[arg(long)]
+        body: Option<String>,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GithubBranchCommand {
+    /// Create and switch to a clean feature branch from the configured `master` base.
+    Create {
+        /// Lowercase slug appended to the configured `talos/` branch prefix.
+        slug: String,
+    },
 }
 
 #[derive(Debug, Args)]

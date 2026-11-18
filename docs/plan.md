@@ -87,7 +87,7 @@ Each round ends with a usable, verifiable result, an updated backlog, and a sess
 | R5 | Verification and permissions | Configured checks, exact Git facts, Auto/Semi policy, redaction, and evidence-gated completion. Complete on macOS; see R5 acceptance below. |
 | R6 | Persistent runtime and recovery | In progress: T6.1 adds a project-scoped tmux control shell; T6.2 adds durable pause/resume and manual-change reconciliation; T6.3 adds cooperative stop and safer recovery; T6.4 SSH reconnect and T6.5 Linux identity/server acceptance remain open. R6.3 behavior/profile verification is pending. |
 | R7 | Decomposition and parallel work | In progress: T7.1 dependency scheduling and T7.2 child-task contracts are implemented with behavior checks pending; T7.3 capability reporting is implemented but native delegation remains unverified; T7.4 adds explicit task worktree lifecycle management; T7.5 adds Writer routing and evidence-gated integration. Behavior and migration acceptance remain open. |
-| R8 | GitHub workflow | In progress: T8.1 adds local `gh` capability reporting and an explicitly requested aggregate auth check. Repository-specific remote operations wait for the user's repository and authorization; no automatic merge. |
+| R8 | GitHub workflow | In progress: T8.1 adds local `gh` capability reporting and an explicitly requested aggregate auth check. T8.2 implements policy-gated exact branch push, durable reconciliation, and draft PR creation. Remote behavior awaits the user's repository; CI evidence remains T8.3. No automatic merge. |
 | R9 | Hardening and release | Resilience, long-running checks, macOS install/update/uninstall, complete operator documentation, and Linux build/runtime/package acceptance. |
 
 ### R0 — completed foundation
@@ -179,6 +179,8 @@ Start with a dependency DAG and bounded child tasks. Use native subagents only w
 
 **T8.1 implementation (in progress):** `doctor` reports local `gh` availability/version without checking authentication. `talos github status --check-auth` explicitly requests `gh auth status --active --json hosts`; output is bounded, raw stdout/stderr is discarded, and only an aggregate state is reported. The auth command has not been invoked during development. Repo identity, remote access, push, PR, and CI checks remain deferred until a repository exists and the user authorizes those effects.
 
+**T8.2 implementation (in progress):** schema-v3 project config carries a credential-free GitHub publication policy pinned to `owner/repository`, a named remote, the `master` base, and a `talos/` feature prefix. Push and PR permissions are opt-in and default false. `talos github policy` reports local policy; `talos github branch create <slug>` creates a clean local feature branch from `master` without network access. `talos github publish` checks both remote URLs, base/head commits, clean branch state, and diff identity; writes durable intent before pushing one exact branch; and creates a draft PR. `talos github reconcile` inspects ambiguous push/PR outcomes and never retries an unverified effect. Local compile and Clippy pass. No remote operation has been run because the user has not created the repository/remote. PR/CI status and evidence remain T8.3.
+
 **Exit criteria:** dependent tasks wait for complete and integrated prerequisites; duplicate child submission does not create a second worker; real checks run after integration; separate workspaces and scopes do not collide. The configured three-agent live acceptance remains open while Agy's public delegation capability is unverified.
 
 ### R8 — GitHub
@@ -215,4 +217,4 @@ Implementation details may change based on experiments. Preserve invariants and 
 
 ## 8. Current continuation point
 
-R3–R5 are closed. T6 and T7 code are in progress with behavior and platform acceptance gates recorded in `docs/state.md`. T8.1 diagnostics are implemented locally. Continue with T8.2 policy and report design without creating a repository, adding a remote, pushing, or opening a PR until the user creates the repository and explicitly authorizes the external action. Linux-specific checks remain deferred until server access.
+R3–R5 are closed. T6 and T7 code are implemented in part, with behavior and platform acceptance gates recorded in `docs/state.md`. T8.1 diagnostics and T8.2 policy-gated publication are implemented locally; their behavior acceptance is pending. Continue with T8.3 CI status/evidence without creating a repository, adding a remote, pushing, or opening a PR. Linux-specific checks remain deferred until server access.

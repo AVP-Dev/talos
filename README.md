@@ -2,7 +2,7 @@
 
 TALOS is a Rust CLI-first orchestrator for local AI coding CLIs. It stores tasks, Writer attempts, and events in a durable local SQLite database, supervises one verified Antigravity Writer at a time, and preserves ambiguous work for operator review.
 
-> **Current status:** R6 remains in progress: macOS SSH reconnect, process-recovery behavior, interactive handoff, and Linux server acceptance are open. R7.1–R7.5 implementation is in progress; dependency scheduling, bounded child contracts, explicit worktree lifecycle, automatic task-worktree routing, and guarded integration are implemented, with behavior and migration acceptance still open. Native Agy subagent delegation remains disabled until its public invocation interface and configured roster pass a live probe. T8.1 adds local GitHub CLI diagnostics; authentication is checked only when explicitly requested. Linux-specific checks wait for the user's server; Linux support remains unverified. No Docker or VM is required. Antigravity 1.5.10 is the only Writer- and Critic-verified adapter. Critic approval moves a task to `verifying`; managed-worktree tasks also require explicit integration, post-integration checks, a user-created commit, and finalization. `up --auto` runs at most one task per explicit call. `up --semi` prompts before a Writer launch and requires an interactive terminal.
+> **Current status:** R6 remains in progress: macOS SSH reconnect, process-recovery behavior, interactive handoff, and Linux server acceptance are open. R7.1–R7.5 implementation is in progress; behavior and migration acceptance remain open. Native Agy subagent delegation remains disabled until its public invocation interface and configured roster pass a live probe. R8.1 diagnostics and R8.2 policy-gated local publication code are implemented; behavior acceptance, a user-provided GitHub repository, and R8.3 CI evidence remain pending. No GitHub auth or remote operation has been invoked. Linux-specific checks wait for the user's server; Linux support remains unverified. No Docker or VM is required. Antigravity 1.5.10 is the only Writer- and Critic-verified adapter. Critic approval moves a task to `verifying`; managed-worktree tasks also require explicit integration, post-integration checks, a user-created commit, and finalization. `up --auto` runs at most one task per explicit call. `up --semi` prompts before a Writer launch and requires an interactive terminal.
 
 ## Start here
 
@@ -60,6 +60,29 @@ Tasks can be linked into a directed acyclic graph. `task depends <TASK> --on <PR
 `talos doctor` reports native subagent invocation as advertised only when the installed CLI help exposes its public invocation tool. Otherwise the capability remains untested and native delegation stays disabled until the configured agent roster and a harmless invocation are verified. Manual child tasks remain available.
 
 `talos doctor` checks whether GitHub CLI (`gh`) is locally available and reports its version; it does not check authentication. `talos github status` also avoids a network call by default. Use `talos github status --check-auth` to explicitly check the active GitHub CLI authentication. During that check, `gh` may use its configured credentials. TALOS retains and reports only an aggregate state, discards raw CLI output, never invokes `gh auth token`, and does not parse, store, or expose credential values, login names, or token sources. Repository creation, remote setup, push, and PR operations remain separate and require the appropriate user direction.
+
+`talos github policy` shows the local publication policy. A schema-v3 `.talos/config.json` may include a `github` object with an `owner/repository`, remote name, `master` base, `talos/` feature prefix, and explicit `allow_push` / `allow_pull_request` flags. Both external-action flags default to false. `talos github branch create <slug>` creates and switches to a clean local feature branch from `master`; it does not contact GitHub or push.
+
+`talos github publish --branch talos/<slug> --title "..." --body "..." --confirm-push --confirm-pr` requires both policy permissions and explicit per-invocation confirmations. It verifies the fetch and push URLs, remote `master`, the clean local branch, and the exact commit/diff before writing a durable publication record and pushing only that branch. It opens a draft PR and does not merge. If a push or PR result is uncertain, inspect the publication ID and run `talos github reconcile <ID>`; this command only records a matching remote result. To create a PR during reconciliation, pass `--create-pr --title "..." --body "..."`. A conflicting or unverifiable remote result stops for manual inspection. The implementation has only been compile/lint checked locally; no repository or remote operation has been exercised.
+
+Example policy fields (keep your existing `writer`, `critic`, and `checks` entries):
+
+```json
+{
+  "schema_version": 3,
+  "writer": "agy",
+  "critic": "agy",
+  "checks": [],
+  "github": {
+    "repository": "OWNER/REPOSITORY",
+    "remote": "origin",
+    "base_branch": "master",
+    "feature_branch_prefix": "talos/",
+    "allow_push": false,
+    "allow_pull_request": false
+  }
+}
+```
 
 `task worktree create <ID>` explicitly creates a private linked worktree for an unused queued task, under a sibling `.talos-worktrees/<project-hash>` directory. TALOS records its branch, base commit, path, lifecycle, and first Writer-routing event in SQLite. When an active worktree is selected, `task run` routes Writer attempts there; Critic review and verification are refused until the operator integrates the patch. `task worktree integrate <ID>` requires the primary tree to be clean and still at the recorded base, checks the child path scope, then applies and stages the exact saved patch. It does not commit. Critic review and project checks then use the primary tree. A rejection routes the next Writer fix to that primary tree. After the approved revision passes checks, commit it manually in the primary project and run `task worktree finalize <ID>`; finalization checks the commit, latest review, and latest passing check evidence before marking the task complete. Prerequisites remain blocked until this finalization succeeds. `task worktree reconcile <ID>` inspects interrupted creation or integration and may reapply an exact recorded patch only when the primary tree is still clean at its saved base. `task worktree remove <ID>` only removes an active, unused queued worktree after checking that it has no tracked, untracked, or ignored files; it never force-removes the worktree or deletes its branch. The task then runs in the primary project. Integrated Writer worktrees remain dirty and are preserved for manual cleanup. Migrated worktrees with earlier Writer history keep their existing primary-tree route.
 
