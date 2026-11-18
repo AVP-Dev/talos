@@ -6,6 +6,7 @@
 
 <p align="center">
   <a href="https://github.com/AVP-Dev/talos/releases"><img src="https://img.shields.io/badge/version-0.1.0-blue.svg" alt="Version"></a>
+  <a href="#"><img src="https://img.shields.io/badge/status-beta%20%2F%20preview-yellow.svg" alt="Status: Beta"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-green.svg" alt="License"></a>
   <a href="#"><img src="https://img.shields.io/badge/rust-1.94%2B-orange.svg" alt="Rust"></a>
   <a href="#"><img src="https://img.shields.io/badge/tests-140%20passed-brightgreen.svg" alt="Tests"></a>
@@ -13,6 +14,9 @@
 </p>
 
 ---
+
+> [!NOTE]
+> **Beta / Early Access:** TALOS is currently in active preview (`v0.1.0`). Core multi-CLI orchestration, worktree isolation, automated verification gates, and Team/Pair recovery loops are functional and verified end-to-end, but CLI commands and flags may evolve before `v1.0.0`. Community feedback and issue reports are welcome!
 
 TALOS is a local, CLI-first orchestrator for installed AI coding CLIs. It stores tasks, execution attempts, events, and subtasks in a durable local SQLite database, supervises AI CLI processes across 7 supported adapters (`agy`, `codex`, `omp`, `pi`, `kilo`, `opencode`, `claude`), coordinates Writer and Critic teams, verifies results against automated project checks, and commits verified code directly to Git.
 
