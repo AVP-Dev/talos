@@ -293,3 +293,10 @@ No schema change for process identity is selected or implemented. The separate s
 - **Failure handling:** a remote branch or PR head that differs from the recorded commit produces an incomplete observation; it cannot be recorded as a pass. GitHub CLI errors, malformed/oversized output, and API uncertainty remain visibly unknown. `--wait` bounds only the CI polling window; pre/post identity checks are separate calls bounded to 60 seconds each. The final compact snapshot is saved once, with no poll-by-poll event rows.
 - **Retention:** persist check names, workflow names, states/buckets, and timestamps only; omit descriptions, links, raw CLI output, account data, and credentials. Deduplicate identical summaries to limit database growth.
 - **Reference:** [GitHub CLI `gh pr checks`](https://cli.github.com/manual/gh_pr_checks).
+
+## ADR-037 — Keep merge and remote branch deletion outside TALOS
+
+- **Status:** implemented in T8.4.
+- **Decision:** TALOS can open draft pull requests and record their CI evidence. It has no merge or remote-branch deletion command. `talos github policy` reports `manual_only` merge and `unsupported` remote branch deletion in both human and JSON output.
+- **Reason:** approval of code integration and cleanup stays with the user. A passing CI result is evidence, not authority to merge or remove remote refs.
+- **Consequence:** TALOS never calls `gh pr merge`, GitHub's merge API, or a remote branch deletion command. Users perform merge and cleanup through their chosen GitHub workflow after review.

@@ -914,6 +914,8 @@ fn run_github_policy(json_output: bool, project: &Project) -> Result<()> {
             "external_actions_enabled": policy.as_ref().is_some_and(|policy| {
                 policy.allow_push && policy.allow_pull_request
             }),
+            "merge": "manual_only",
+            "remote_branch_deletion": "unsupported",
         }))?;
     } else if let Some(policy) = policy {
         println!("GitHub repository: {}", policy.repository);
@@ -930,6 +932,10 @@ fn run_github_policy(json_output: bool, project: &Project) -> Result<()> {
         println!(
             "Publication stays disabled until .talos/config.json contains a validated schema-v3 GitHub policy."
         );
+    }
+    if !json_output {
+        println!("Merge: manual only");
+        println!("Remote branch deletion: unsupported");
     }
     Ok(())
 }

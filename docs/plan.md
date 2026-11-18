@@ -183,6 +183,8 @@ Start with a dependency DAG and bounded child tasks. Use native subagents only w
 
 **T8.3 implementation (in progress):** `talos github ci <publication_id>` verifies that the remote branch and open PR still point to the recorded commit before and after reading `gh pr checks` JSON. `--wait` polls at a bounded interval/deadline, and each check request is capped by the remaining wait time. Schema v16 stores an append-only, deduplicated snapshot with check names, workflows, buckets, states, and timestamps only; raw output, descriptions, links, and credential metadata are omitted. `pending`, `timeout`, `unknown`, and `no_checks` are never represented as passing. This evidence does not change task state. Code compiles and passes Clippy, but live behavior and migration acceptance await the user's repository; tests were not run.
 
+**T8.4 complete:** `talos github policy` reports that merge is `manual_only` and remote branch deletion is `unsupported`. TALOS has no merge or remote branch deletion command; publication creates draft PRs only.
+
 **Exit criteria:** dependent tasks wait for complete and integrated prerequisites; duplicate child submission does not create a second worker; real checks run after integration; separate workspaces and scopes do not collide. The configured three-agent live acceptance remains open while Agy's public delegation capability is unverified.
 
 ### R8 — GitHub
@@ -219,4 +221,4 @@ Implementation details may change based on experiments. Preserve invariants and 
 
 ## 8. Current continuation point
 
-R3–R5 are closed. T6 and T7 code are implemented in part, with behavior and platform acceptance gates recorded in `docs/state.md`. T8.1 diagnostics, T8.2 policy-gated publication, and T8.3 commit-bound CI snapshots are implemented locally; behavior acceptance is pending. Continue with T8.4 merge safeguards without creating a repository, adding a remote, or invoking GitHub. Linux-specific checks remain deferred until server access.
+R3–R5 are closed. T6 and T7 code are implemented in part, with behavior and platform acceptance gates recorded in `docs/state.md`. R8 code is implemented locally: T8.1–T8.3 acceptance awaits the user's repository, and T8.4 keeps merge/deletion manual. Continue to R9.1 preparation without creating a repository, adding a remote, or invoking GitHub. Linux-specific checks remain deferred until server access.

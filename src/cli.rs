@@ -54,7 +54,7 @@ pub enum GithubCommand {
         #[arg(long)]
         check_auth: bool,
     },
-    /// Show the local GitHub publication policy without contacting GitHub.
+    /// Show local GitHub policy and the manual merge/deletion boundary.
     Policy,
     /// Create or inspect a local feature branch; this does not push it.
     Branch {

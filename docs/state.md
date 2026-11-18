@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R6–R8 implementation remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. R7.1–R7.5 code is implemented or in progress, with behavior/migration acceptance still open; native subagent delegation and three-agent acceptance remain unavailable until verified. T8.1 diagnostics, T8.2 policy-gated publication, and T8.3 commit-bound CI snapshots are implemented locally, but command, migration, and remote behavior acceptance remains pending. No GitHub authentication or remote operation has been performed. Linux access and native checks are deferred to the user's server. Backlog count must be recalculated after the current batch.
+**R6–R8 implementation remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. R7.1–R7.5 code is implemented or in progress, with behavior/migration acceptance still open; native subagent delegation and three-agent acceptance remain unavailable until verified. T8.1 diagnostics, T8.2 publication, and T8.3 commit-bound CI snapshots are implemented locally; T8.4 keeps merge/deletion manual. T8.1–T8.3 command, migration, and remote acceptance remains pending. No GitHub authentication or remote operation has been performed. Linux access and native checks are deferred to the user's server. Backlog count must be recalculated after the current batch.
 
 ## Goal and fixed direction
 
@@ -318,9 +318,15 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - ADR-036 records schema invariants and failure handling before the migration. Official GitHub CLI `gh pr checks` docs were fetched with Context7 and specify the JSON fields, buckets, and pending exit code. No repository/auth/network operation or test was run.
 - `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo check --all-targets --all-features`, and `git diff --check` passed on macOS after the schema-v16 and CLI changes. SQLite migration behavior is not yet runtime-verified.
 
+## R8.4 closure — manual merge and branch cleanup
+
+- `talos github publish` creates draft pull requests only. The CLI has no merge or remote branch deletion command, and no automatic merge path exists.
+- `talos github policy` now reports `manual_only` merge and `unsupported` remote branch deletion in human and JSON output, even when publication policy is absent.
+- No schema or network operation is required. T8.4 implementation is complete; T8.1–T8.3 live behavior remains pending until the user creates a repository.
+
 ## Next action
 
-Commit the T8.3 code/docs locally, then continue to T8.4 merge safeguards. T8.2 commits are `efaaa75` and `8728ce4`; the latter contains the reviewed tag and PR URL fixes. Do not create a repository, add a remote, or invoke GitHub operations; the user will provide the repository later. Keep remote acceptance explicitly pending. R6 gates remain open: T6.3 behavior/profile checks, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 TUI trust/handoff. R7 behavior/migration checks and native delegation acceptance remain open. Skip Linux connection/setup and defer Linux-native checks until the server is available. Keep work local on `master`.
+Commit the T8.3 race/timeout fixes and T8.4 policy output, then proceed to R9.1 hardening/delivery inventory. R8 implementation is locally complete; live CLI and remote acceptance remain pending. T8.2 commits are `efaaa75` and `8728ce4`; T8.3 initial commit is `877ae10`. Do not create a repository, add a remote, or invoke GitHub operations; the user will provide the repository later. R6 gates remain open: T6.3 behavior/profile checks, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 TUI trust/handoff. R7 behavior/migration checks and native delegation acceptance remain open. Skip Linux connection/setup and defer Linux-native checks until the server is available. Keep work local on `master`.
 
 ## Session close checklist
 
