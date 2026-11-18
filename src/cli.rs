@@ -254,6 +254,12 @@ pub enum TaskCommand {
     Evidence {
         /// ID of the task whose verification history will be shown.
         task_id: i64,
+        /// Maximum verification runs to print, from 1 through 100.
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+        /// Continue with older verification runs before this run ID.
+        #[arg(long)]
+        before: Option<i64>,
     },
     /// Continue the latest eligible terminal Antigravity error conversation.
     Continue {
@@ -419,7 +425,7 @@ mod tests {
         let cli = Cli::try_parse_from(["talos", "task", "evidence", "17"])
             .expect("parse task evidence command");
         let Command::Task(TaskArgs {
-            command: TaskCommand::Evidence { task_id },
+            command: TaskCommand::Evidence { task_id, .. },
         }) = cli.command
         else {
             panic!("expected task evidence command");

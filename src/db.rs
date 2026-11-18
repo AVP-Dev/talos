@@ -22,9 +22,10 @@ const MAX_CHILD_TASK_SCOPE_BYTES: usize = 16 * 1024;
 const MIN_CHILD_TASK_TIMEOUT_MS: i64 = 1_000;
 const MAX_CHILD_TASK_TIMEOUT_MS: i64 = 30 * 60 * 1_000;
 const MAX_TASK_LIST_PAGE_SIZE: usize = 100;
-const MAX_LOG_PAGE_SIZE: usize = 100;
+const MAX_HISTORY_PAGE_SIZE: usize = 100;
 const MAX_REOPENED_TASK_IDS_IN_EVENT: usize = 50;
 type FinalizeReviewRow = (i64, String, String, String, Option<String>, Option<String>);
+type VerificationEvidenceRow = (VerificationRunRecord, String, String, String, String);
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -238,6 +239,15 @@ pub struct TaskEvent {
 #[derive(Clone, Debug, Serialize)]
 pub struct EventPage<T> {
     pub events: Vec<T>,
+    pub before: Option<i64>,
+    pub limit: usize,
+    pub has_more: bool,
+    pub next_before: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct VerificationEvidencePage {
+    pub runs: Vec<VerificationEvidenceRecord>,
     pub before: Option<i64>,
     pub limit: usize,
     pub has_more: bool,
@@ -2042,11 +2052,11 @@ impl Database {
         before: Option<i64>,
         limit: usize,
     ) -> Result<EventPage<TaskEvent>> {
-        validate_event_page(before, limit)?;
+        validate_history_page(before, limit)?;
         if task_id.is_some_and(|id| id <= 0) {
             bail!("Task event filter must be a positive task ID");
         }
-        let query_limit = log_page_query_limit(limit)?;
+        let query_limit = history_page_query_limit(limit)?;
         let mut events = if let Some(task_id) = task_id {
             let mut statement = self.connection.prepare(
                 "SELECT id, task_id, occurred_at_ms, actor, event_type, reason, data_json
@@ -2406,8 +2416,8 @@ impl Database {
         before: Option<i64>,
         limit: usize,
     ) -> Result<EventPage<ProjectControlEvent>> {
-        validate_event_page(before, limit)?;
-        let query_limit = log_page_query_limit(limit)?;
+        validate_history_page(before, limit)?;
+        let query_limit = history_page_query_limit(limit)?;
         let mut statement = self.connection.prepare(
             "SELECT id, occurred_at_ms, event_type, reason, data_json
              FROM project_control_events
@@ -2450,24 +2460,58 @@ impl Database {
              FROM verification_runs WHERE task_id = ?1 ORDER BY id",
         )?;
         let runs = statement
-            .query_map([task_id], |row| {
-                Ok((
-                    VerificationRunRecord {
-                        id: row.get(0)?,
-                        task_id: row.get(1)?,
-                        critic_review_id: row.get(2)?,
-                        status: row.get(3)?,
-                        revision_id: row.get(4)?,
-                        started_at_ms: row.get(5)?,
-                        finished_at_ms: row.get(6)?,
-                    },
-                    row.get::<_, String>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, String>(9)?,
-                    row.get::<_, String>(10)?,
-                ))
-            })?
+            .query_map([task_id], map_verification_evidence_row)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
+        self.load_verification_evidence(runs)
+    }
+
+    pub fn verification_history_page(
+        &self,
+        task_id: i64,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<VerificationEvidencePage> {
+        validate_history_page(before, limit)?;
+        if task_id <= 0 {
+            bail!("Verification history requires a positive task ID");
+        }
+        let query_limit = history_page_query_limit(limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, task_id, critic_review_id, status, revision_id, started_at_ms,
+                    finished_at_ms, base_revision, head_commit, patch_sha256, changed_paths_json
+             FROM verification_runs
+             WHERE task_id = ?1 AND (?2 IS NULL OR id < ?2)
+             ORDER BY id DESC LIMIT ?3",
+        )?;
+        let mut rows = statement
+            .query_map(
+                params![task_id, before, query_limit],
+                map_verification_evidence_row,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = rows.len() > limit;
+        if has_more {
+            rows.pop();
+        }
+        let next_before = if has_more {
+            rows.last().map(|row| row.0.id)
+        } else {
+            None
+        };
+        let runs = self.load_verification_evidence(rows)?;
+        Ok(VerificationEvidencePage {
+            runs,
+            before,
+            limit,
+            has_more,
+            next_before,
+        })
+    }
+
+    fn load_verification_evidence(
+        &self,
+        runs: Vec<VerificationEvidenceRow>,
+    ) -> Result<Vec<VerificationEvidenceRecord>> {
         let mut history = Vec::with_capacity(runs.len());
         for (run, base_revision, head_commit, patch_sha256, changed_paths_json) in runs {
             let mut results = self.connection.prepare(
@@ -5518,20 +5562,32 @@ fn validate_changed_paths_json(value: &str) -> Result<()> {
     Ok(())
 }
 
-fn validate_event_page(before: Option<i64>, limit: usize) -> Result<()> {
-    if before.is_some_and(|id| id <= 0) || !(1..=MAX_LOG_PAGE_SIZE).contains(&limit) {
-        bail!("Event history requires a limit from 1 to 100 and a positive cursor when specified");
+fn validate_history_page(before: Option<i64>, limit: usize) -> Result<()> {
+    if before.is_some_and(|id| id <= 0) || !(1..=MAX_HISTORY_PAGE_SIZE).contains(&limit) {
+        bail!("History pages require a limit from 1 to 100 and a positive cursor when specified");
     }
     Ok(())
 }
 
-fn log_page_query_limit(limit: usize) -> Result<i64> {
+fn history_page_query_limit(limit: usize) -> Result<i64> {
     i64::try_from(
         limit
             .checked_add(1)
-            .context("Event history page limit is out of range")?,
+            .context("History page limit is out of range")?,
     )
-    .context("Event history page limit is out of range")
+    .context("History page limit is out of range")
+}
+
+fn map_verification_evidence_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<VerificationEvidenceRow> {
+    Ok((
+        map_verification_run_record(row)?,
+        row.get(7)?,
+        row.get(8)?,
+        row.get(9)?,
+        row.get(10)?,
+    ))
 }
 
 fn validate_child_task_text(title: &str, acceptance_criteria: &str) -> Result<()> {

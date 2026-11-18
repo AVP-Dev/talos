@@ -57,7 +57,7 @@ talos task run <ID>         # implemented in R3 for the verified Writer
 talos task review <ID>      # implemented in R4 for the independent Critic
 talos task checks <ID> ...  # add immutable verification requirements
 talos task verify <ID>      # run checks for the exact approved Git revision
-talos task evidence <ID>    # inspect saved verification evidence
+talos task evidence <ID>    # inspect paged saved verification evidence
 talos task continue <ID> --confirm-project-inspected  # implemented for one eligible terminal ERROR result
 talos task recover          # implemented: quarantine ambiguous attempts as unknown
 talos task resolve <ATTEMPT_ID> ...  # implemented: audited operator decision
@@ -71,7 +71,7 @@ talos doctor                # diagnose CLI, tmux, Git, and database setup
 talos stop                  # request graceful Writer/process-group shutdown
 ```
 
-R3 Writer commands, R4 `task review`, and R5 verification commands are implemented for the verified macOS Antigravity 1.5.10 path. T6.1 adds `attach`; T6.2 adds durable pause/resume and project event history; T6.3 now adds a cooperative `stop` request, process-group timeout/interrupt cleanup, and best-effort stale-lease reclaim. T6.3 behavior tests and full-profile verification remain pending. `task continue` is limited to one explicit follow-up for the latest terminal Agy `ERROR` result with exit status zero and a validated public conversation ID. It never handles `unknown`, timeout, nonzero exit, or malformed output. TALOS resumes that exact ID through the public `--conversation` interface, verifies the resumed `init` ID before sending the follow-up, and asks the operator to inspect current workspace state without replaying the original prompt. A successful follow-up remains `reviewing`. Critic approval moves a task only to `verifying`; it does not claim project checks or completion.
+R3 Writer commands, R4 `task review`, and R5 verification commands are implemented for the verified macOS Antigravity 1.5.10 path. Task list, event logs, and verification evidence expose bounded cursor pages. T6.1 adds `attach`; T6.2 adds durable pause/resume and project event history; T6.3 now adds a cooperative `stop` request, process-group timeout/interrupt cleanup, and best-effort stale-lease reclaim. T6.3 behavior tests and full-profile verification remain pending. `task continue` is limited to one explicit follow-up for the latest terminal Agy `ERROR` result with exit status zero and a validated public conversation ID. It never handles `unknown`, timeout, nonzero exit, or malformed output. TALOS resumes that exact ID through the public `--conversation` interface, verifies the resumed `init` ID before sending the follow-up, and asks the operator to inspect current workspace state without replaying the original prompt. A successful follow-up remains `reviewing`. Critic approval moves a task only to `verifying`; it does not claim project checks or completion.
 
 ## 4. Roadmap and rounds
 

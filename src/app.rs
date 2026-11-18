@@ -453,17 +453,25 @@ pub async fn run(cli: Cli) -> Result<()> {
             TaskCommand::Verify { task_id } => {
                 run_task_verification(cli.json, &project, &mut database, task_id).await?;
             }
-            TaskCommand::Evidence { task_id } => {
+            TaskCommand::Evidence {
+                task_id,
+                limit,
+                before,
+            } => {
                 if database.get_task(task_id)?.is_none() {
                     bail!("Task #{task_id} does not exist");
                 }
-                let history = database.verification_history(task_id)?;
+                let page = database.verification_history_page(task_id, before, limit)?;
                 if cli.json {
-                    print_json(&history)?;
-                } else if history.is_empty() {
-                    println!("Task #{task_id} has no project verification history.");
+                    print_json(&page)?;
+                } else if page.runs.is_empty() {
+                    if before.is_some() {
+                        println!("No older verification runs for task #{task_id}.");
+                    } else {
+                        println!("Task #{task_id} has no project verification history.");
+                    }
                 } else {
-                    for evidence in history {
+                    for evidence in &page.runs {
                         println!(
                             "Run #{} {} (review #{}, revision {}).",
                             evidence.run.id,
@@ -504,6 +512,11 @@ pub async fn run(cli: Cli) -> Result<()> {
                                 check.stdout_sha256, check.stderr_sha256
                             );
                         }
+                    }
+                    if let Some(next_before) = page.next_before {
+                        println!(
+                            "More evidence is available: `talos task evidence {task_id} --before {next_before} --limit {limit}`."
+                        );
                     }
                 }
             }
