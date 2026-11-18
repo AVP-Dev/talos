@@ -7,12 +7,22 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: 'Release tag to build and attach assets to (e.g. v0.1.0)'
+        description: Existing stable release tag to build
         required: true
-        default: 'v0.1.0'
+      propose_tap_update:
+        description: Open a Homebrew tap pull request after publishing the release
+        type: boolean
+        default: false
 
 permissions:
-  contents: write
+  contents: read
+
+env:
+  RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+
+concurrency:
+  group: release-${{ inputs.tag || github.ref_name }}
+  cancel-in-progress: false
 
 jobs:
   build-release:
@@ -22,40 +32,121 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          - os: ubuntu-latest
+          - os: ubuntu-22.04
             target: x86_64-unknown-linux-gnu
-            artifact_name: talos
-          - os: macos-latest
+          - os: ubuntu-22.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-15
             target: aarch64-apple-darwin
-            artifact_name: talos
-
+          - os: macos-15-intel
+            target: x86_64-apple-darwin
     steps:
-      - name: Checkout Code
-        uses: actions/checkout@v4
-
-      - name: Set up Rust
-        uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
-
-      - name: Build Release Binary
-        run: cargo build --release --locked --target ${{ matrix.target }}
-
-      - name: Package Binary
-        run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          PKG_NAME="talos-${TAG}-${{ matrix.target }}"
-          STAGE_DIR="/tmp/${PKG_NAME}"
-          mkdir -p "${STAGE_DIR}"
-          cp "target/${{ matrix.target }}/release/talos" "${STAGE_DIR}/talos"
-          cp LICENSE README.md "${STAGE_DIR}/"
-          tar -czf "${PKG_NAME}.tar.gz" -C "/tmp" "${PKG_NAME}"
-          shasum -a 256 "${PKG_NAME}.tar.gz" > "${PKG_NAME}.tar.gz.sha256"
-
-      - name: Upload Release Asset
+      - name: Build and verify the binary
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TARGET: ${{ matrix.target }}
         run: |
-          TAG="${{ github.event.inputs.tag || github.ref_name }}"
-          PKG_NAME="talos-${TAG}-${{ matrix.target }}"
-          gh release upload "${TAG}" "${PKG_NAME}.tar.gz" "${PKG_NAME}.tar.gz.sha256" --clobber
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          cargo build --release --locked --target "$TARGET"
+          binary="$PWD/target/$TARGET/release/talos"
+          test "$("$binary" --version)" = "talos ${RELEASE_TAG#v}"
+          temp_project="$(mktemp -d)"
+          git -C "$temp_project" init --quiet
+          (cd "$temp_project" && "$binary" task add "Release smoke test" && "$binary" task list)
+          test -z "$(git -C "$temp_project" status --porcelain)"
+          package="talos-$RELEASE_TAG-$TARGET"
+          mkdir -p "package/$package"
+          cp "$binary" LICENSE README.md "package/$package/"
+          tar -czf "$package.tar.gz" -C package "$package"
+          shasum -a 256 "$package.tar.gz" > "$package.tar.gz.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.target }}
+          path: talos-*.tar.gz*
+          if-no-files-found: error
+
+  publish-release:
+    needs: build-release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: refs/tags/${{ env.RELEASE_TAG }}
+          persist-credentials: false
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: archives
+          merge-multiple: true
+      - name: Publish archives and generate the Homebrew formula
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh release view "$RELEASE_TAG" >/dev/null 2>&1; then
+            mkdir published
+            gh release download "$RELEASE_TAG" --pattern "talos-$RELEASE_TAG-*.tar.gz*" --dir published
+            bash scripts/render-homebrew-formula.sh "$RELEASE_TAG" published > talos.rb
+            ruby -c talos.rb
+          else
+            bash scripts/render-homebrew-formula.sh "$RELEASE_TAG" archives > talos.rb
+            ruby -c talos.rb
+            gh release create "$RELEASE_TAG" --verify-tag --generate-notes archives/* talos.rb
+          fi
+      - uses: actions/upload-artifact@v4
+        with:
+          name: homebrew-formula
+          path: talos.rb
+          if-no-files-found: error
+
+  propose-tap-update:
+    if: inputs.propose_tap_update || vars.TALOS_AUTO_PROPOSE_TAP == 'true'
+    needs: publish-release
+    runs-on: ubuntu-latest
+    permissions: {}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: homebrew-formula
+          path: formula
+      - name: Propose the published formula in the tap
+        env:
+          GH_TOKEN: ${{ secrets.TALOS_HOMEBREW_TAP_TOKEN }}
+        run: |
+          tap=AVP-Dev/homebrew-apps
+          branch="release/talos-$RELEASE_TAG"
+          test -n "$GH_TOKEN" || { echo "Configure TALOS_HOMEBREW_TAP_TOKEN to propose tap updates."; exit 1; }
+          existing="$(gh pr list --repo "$tap" --state all --head "$branch" --json number --jq '.[0].number // empty')"
+          if [ -n "$existing" ]; then
+            gh pr view "$existing" --repo "$tap" --json url --jq .url
+            exit 0
+          fi
+          gh auth setup-git
+          gh repo clone "$tap" tap
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git show-ref --verify --quiet "refs/remotes/origin/$branch"; then
+            git switch --track "origin/$branch"
+          else
+            git switch -c "$branch"
+          fi
+          cp ../formula/talos.rb Formula/talos.rb
+          if ! git diff --quiet -- Formula/talos.rb; then
+            git add -- Formula/talos.rb
+            git commit -m "Update TALOS to $RELEASE_TAG"
+          fi
+          if [ "$(git rev-parse HEAD)" = "$(git rev-parse origin/HEAD)" ]; then
+            exit 0
+          fi
+          git push origin "HEAD:refs/heads/$branch"
+          gh pr create --repo "$tap" --head "$branch" \
+            --title "Update TALOS to $RELEASE_TAG" \
+            --body "Use the published assets and verified checksums for TALOS $RELEASE_TAG."

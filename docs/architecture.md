@@ -42,9 +42,12 @@ TALOS provides two complementary orchestration modes:
 
 2. **Team Mode (`--mode team`):**
    Two-tier team orchestration designed for multi-task and parallel workflows:
+   - **Advisory Pre-flight Triage:** Analyzes requirements against repo structure to recommend depth and team composition without rigid workflow lock-in.
    - **Writer Lead:** Autonomously plans and decomposes parent tasks into child subtasks, manages parallel Writer Workers in isolated Git worktrees, monitors progress, detects stalled or failed workers (e.g. via `RETRY WITH GUIDANCE` or takeover), and integrates validated worktree patches into the primary branch.
    - **Critic Team:** Performs multi-angle audits (functional correctness, security, architectural consistency), while the **Critic Lead** aggregates findings and issues authoritative verdicts (`approve` or `request_changes` with actionable rebuttal guidance).
-   - **Fix Loops:** Automated feedback cycles where Critic findings are directly routed back to the Writer Lead or Workers for targeted resolution.
+   - **Deliberation & Rebuttal Loop:** Writer Lead formulates technical justifications or code adjustments upon review feedback. Passing unit tests inform the trade-offs, but do not automatically excuse architectural flaws.
+   - **Anti-Stagnation Loop Detection:** Evaluates patch hashes across consecutive fix rounds to halt futile loops when changes cease.
+   - **Backlog Curation:** Retains non-critical and cross-cutting findings in SQLite and the deliverable summary artifact (`TALOS_SUMMARY.md`).
 
 ## Persistent State
 

@@ -2059,12 +2059,17 @@ impl Database {
     }
 
     pub fn first_runnable_queued_task(&self) -> Result<Option<TaskRecord>> {
+        self.runnable_task(None)
+    }
+
+    pub fn runnable_task(&self, selected: Option<i64>) -> Result<Option<TaskRecord>> {
         self.connection
             .query_row(
                 "SELECT tasks.id, tasks.title, tasks.acceptance_criteria, tasks.status,
                         tasks.created_at_ms, tasks.updated_at_ms
                  FROM tasks
                  WHERE tasks.status IN ('verifying', 'reviewing', 'implementing', 'queued')
+                   AND (?1 IS NULL OR tasks.id = ?1)
                    AND NOT EXISTS (
                        SELECT 1 FROM child_task_contracts WHERE child_task_id = tasks.id
                    )
@@ -2085,7 +2090,7 @@ impl Database {
                      WHEN 'reviewing' THEN 1
                      WHEN 'implementing' THEN 2
                      ELSE 3 END, tasks.id LIMIT 1",
-                [],
+                [selected],
                 map_task_record,
             )
             .optional()
@@ -2275,6 +2280,27 @@ impl Database {
         actor: &str,
         reason: &str,
     ) -> Result<TaskRecord> {
+        self.transition_task_from(task_id, None, target, actor, reason)
+    }
+
+    pub fn cancel_queued_task(&mut self, task_id: i64) -> Result<TaskRecord> {
+        self.transition_task_from(
+            task_id,
+            Some(TaskStatus::Queued),
+            TaskStatus::Failed,
+            "operator",
+            "Cancelled by the operator before execution",
+        )
+    }
+
+    fn transition_task_from(
+        &mut self,
+        task_id: i64,
+        expected: Option<TaskStatus>,
+        target: TaskStatus,
+        actor: &str,
+        reason: &str,
+    ) -> Result<TaskRecord> {
         if actor.trim().is_empty() || reason.trim().is_empty() {
             bail!("Task transition requires a non-empty actor and reason");
         }
@@ -2313,6 +2339,9 @@ impl Database {
         };
         let current_status = parse_task_status(&status_value)
             .with_context(|| format!("Task #{task_id} has an unknown status"))?;
+        if expected.is_some_and(|expected| current_status != expected) {
+            bail!("Task #{task_id} is no longer queued. Check its status in History.");
+        }
         if !is_allowed_transition(&current_status, &target) {
             bail!(
                 "Task #{task_id} cannot transition from {} to {}",
@@ -2361,6 +2390,22 @@ impl Database {
             .query_map([], map_task_record)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(records)
+    }
+
+    pub fn recent_tasks(
+        &self,
+        before: Option<i64>,
+        limit: usize,
+    ) -> Result<Vec<TaskSummaryRecord>> {
+        validate_history_page(before, limit)?;
+        let mut statement = self.connection.prepare(
+            "SELECT id, title, status FROM tasks
+             WHERE (?1 IS NULL OR id < ?1) ORDER BY id DESC LIMIT ?2",
+        )?;
+        statement
+            .query_map(params![before, limit as i64], map_task_summary_record)?
+            .collect::<rusqlite::Result<Vec<_>>>()
+            .context("Cannot read task history")
     }
 
     pub fn active_tasks(&self) -> Result<Vec<TaskRecord>> {

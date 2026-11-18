@@ -6,7 +6,8 @@
 
 ## 1. Ergonomics & Usability (Удобство и UX/DX)
 
-### IDEA-01: Tab-Completion & Argument Hints in TUI Command Bar
+### IDEA-01: Tab-Completion & Argument Hints in TUI Command Bar [DONE - R16]
+- **Status**: Implemented & verified in R16 (T16.1).
 - **Value**: High
 - **Context**: Currently, the TUI command bar requires full manual typing for commands (`/cli codex`, `/commit <msg>`, `/mode team`) and project file paths.
 - **Proposal**: Implement Crossterm/Ratatui inline completion on `Tab`:
@@ -15,7 +16,8 @@
   - Relative file path completion based on repository tree (`tests/t<Tab>` -> `tests/test_calc.py`).
 - **Impact**: Makes TUI interaction as fast and fluid as modern shells (Fish/Zsh), eliminating typos.
 
-### IDEA-02: Task Presets & Archetypes (`/task:test`, `/task:refactor`, `/task:fix`)
+### IDEA-02: Task Presets & Archetypes (`/task:test`, `/task:refactor`, `/task:fix`) [DONE - R16]
+- **Status**: Implemented & verified in R16 (T16.2).
 - **Value**: High
 - **Context**: Developers frequently submit recurring patterns: adding test suites, fixing defects, or optimizing existing functions.
 - **Proposal**: Add parameterized task shortcuts:
@@ -24,7 +26,8 @@
   - `/task:bench <func>`: Creates benchmark tasks.
 - **Impact**: Saves time on prompt crafting and guarantees strict, deterministic acceptance criteria.
 
-### IDEA-03: Interactive Hunk & File Staging in TUI Git Diff View
+### IDEA-03: Interactive Hunk & File Staging in TUI Git Diff View [DONE - R16]
+- **Status**: Implemented & verified in R16 (T16.3).
 - **Value**: High
 - **Context**: An AI agent may implement a requested feature correctly, but accidentally touch whitespace or leave temporary debug statements in another file.
 - **Proposal**: In Tab 3 (`Git Diff`), allow arrow-key navigation through modified files with single-key actions:

@@ -177,6 +177,11 @@ pub struct UpArgs {
     /// Orchestration mode: pair or team.
     #[arg(long, value_enum)]
     pub mode: Option<crate::config::OrchestrationMode>,
+    /// Run only this runnable task.
+    #[arg(long, requires = "auto")]
+    pub task: Option<i64>,
+    #[arg(long, requires = "task", hide = true)]
+    pub expected_config: Option<String>,
 }
 
 #[derive(Debug, Args)]

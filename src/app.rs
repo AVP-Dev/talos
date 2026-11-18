@@ -58,7 +58,7 @@ impl GitStatusPaths {
         self.total_count == 0
     }
 
-    fn display_preview(&self) -> String {
+    pub(crate) fn display_preview(&self) -> String {
         let mut output = self
             .preview
             .iter()
@@ -96,6 +96,8 @@ struct StatusReport {
 
 #[derive(Serialize)]
 struct DoctorReport {
+    talos_executable: PathBuf,
+    talos_version: &'static str,
     project_root: String,
     discovery: crate::project::DiscoveryMethod,
     database_path: String,
@@ -248,7 +250,15 @@ pub async fn run(cli: Cli) -> Result<()> {
     match command {
         Command::Up(arguments) if arguments.auto => {
             ensure_queue_running(&database)?;
-            run_one_shot_auto(cli.json, &project, &mut database, arguments.mode).await?;
+            run_one_shot_auto(
+                cli.json,
+                &project,
+                &mut database,
+                arguments.mode,
+                arguments.task,
+                arguments.expected_config.as_deref(),
+            )
+            .await?;
         }
         Command::Up(arguments) if arguments.semi => {
             ensure_queue_running(&database)?;
@@ -877,6 +887,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 ),
             );
             let report = DoctorReport {
+                talos_executable: env::current_exe()
+                    .context("Cannot determine the current TALOS binary")?,
+                talos_version: env!("CARGO_PKG_VERSION"),
                 project_root: project.root.display().to_string(),
                 discovery: project.discovery,
                 database_path: database.path().display().to_string(),
@@ -901,6 +914,14 @@ pub async fn run(cli: Cli) -> Result<()> {
             if cli.json {
                 print_json(&report)?;
             } else {
+                println!(
+                    "TALOS {} · {}",
+                    report.talos_version,
+                    redact_sensitive(&report.talos_executable.display().to_string())
+                );
+                println!(
+                    "Multiple installations? Use 'type -a talos' to see which copy your shell picks."
+                );
                 println!(
                     "Project root: {} ({:?})",
                     redact_sensitive(&report.project_root),
@@ -2075,8 +2096,15 @@ async fn run_queued_task(
     task_id: i64,
 ) -> Result<()> {
     let execution_project = execution_project_for_task(project, database, task_id)?;
-    let report =
-        execute_writer_task(json_output, &execution_project, database, task_id, None).await?;
+    let report = execute_writer_task(
+        json_output,
+        &execution_project,
+        database,
+        task_id,
+        None,
+        None,
+    )
+    .await?;
     print_writer_report(json_output, &report, None)?;
     ensure_writer_succeeded(&report)
 }
@@ -2249,6 +2277,7 @@ async fn continue_task(
         database,
         task_id,
         Some(continuation),
+        None,
     )
     .await?;
     print_writer_report(json_output, &report, None)?;
@@ -2264,7 +2293,7 @@ async fn run_task_review(
     ensure_task_worktree_integrated_before_review(database, task_id)?;
     let execution_project = execution_project_for_task(project, database, task_id)?;
     validate_project_scope(&execution_project)?;
-    let report = execute_critic_review(&execution_project, database, task_id).await?;
+    let report = execute_critic_review(&execution_project, database, task_id, None).await?;
     print_critic_report(json_output, &report)?;
     Ok(())
 }
@@ -2817,12 +2846,13 @@ async fn execute_critic_review(
     project: &Project,
     database: &mut Database,
     task_id: i64,
+    run_config: Option<&ProjectConfig>,
 ) -> Result<crate::supervisor::CriticReviewReport> {
     let mut rate_limit_retries = 0;
     const MAX_RATE_LIMIT_RETRIES: usize = 5;
 
     loop {
-        let result = execute_critic_review_once(project, database, task_id).await;
+        let result = execute_critic_review_once(project, database, task_id, run_config).await;
 
         if let Err(ref e) = result {
             let err_msg = format!("{e:#}");
@@ -2864,8 +2894,15 @@ async fn execute_critic_review_once(
     project: &Project,
     database: &mut Database,
     task_id: i64,
+    run_config: Option<&ProjectConfig>,
 ) -> Result<crate::supervisor::CriticReviewReport> {
-    let config = ProjectConfig::load(project)?;
+    let loaded;
+    let config = if let Some(config) = run_config {
+        config
+    } else {
+        loaded = ProjectConfig::load(project)?;
+        &loaded
+    };
     let configured_adapter = config.adapter_for(AgentRole::Critic);
     if !configured_adapter.is_implemented() {
         bail!(
@@ -2909,6 +2946,7 @@ async fn execute_writer_task(
     database: &mut Database,
     task_id: i64,
     continuation: Option<WriterContinuation>,
+    run_config: Option<&ProjectConfig>,
 ) -> Result<crate::supervisor::WriterExecutionReport> {
     let mut rate_limit_retries = 0;
     const MAX_RATE_LIMIT_RETRIES: usize = 5;
@@ -2920,6 +2958,7 @@ async fn execute_writer_task(
             database,
             task_id,
             continuation.clone(),
+            run_config,
         )
         .await;
 
@@ -2986,8 +3025,15 @@ async fn execute_writer_task_once(
     database: &mut Database,
     task_id: i64,
     continuation: Option<WriterContinuation>,
+    run_config: Option<&ProjectConfig>,
 ) -> Result<crate::supervisor::WriterExecutionReport> {
-    let config = ProjectConfig::load(project)?;
+    let loaded;
+    let config = if let Some(config) = run_config {
+        config
+    } else {
+        loaded = ProjectConfig::load(project)?;
+        &loaded
+    };
     let configured_adapter = config.adapter_for(AgentRole::Writer);
     if !configured_adapter.is_implemented() {
         bail!(
@@ -3153,11 +3199,20 @@ fn ensure_writer_succeeded(report: &crate::supervisor::WriterExecutionReport) ->
     Ok(())
 }
 
+pub(crate) fn config_fingerprint(config: &ProjectConfig) -> Result<String> {
+    Ok(Sha256::digest(serde_json::to_vec(config)?)
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect())
+}
+
 async fn run_one_shot_auto(
     json_output: bool,
     project: &Project,
     database: &mut Database,
     mode_override: Option<crate::config::OrchestrationMode>,
+    selected_task: Option<i64>,
+    expected_config: Option<&str>,
 ) -> Result<()> {
     if policy::authorize(ExecutionMode::Auto, PolicyAction::WriterLaunch, true)
         != Authorization::Allow
@@ -3169,12 +3224,22 @@ async fn run_one_shot_auto(
     }
     validate_project_scope(project)?;
     let config = ProjectConfig::load(project)?;
+    if let Some(expected) = expected_config
+        && config_fingerprint(&config)? != expected
+    {
+        bail!(
+            "Project settings changed since confirmation. Review the current roles before retrying."
+        );
+    }
     let mode = mode_override.unwrap_or(config.orchestration.mode);
 
     let mut tasks_processed = 0;
     loop {
-        let task = database.first_runnable_queued_task()?;
+        let task = database.runnable_task(selected_task)?;
         let Some(task) = task else {
+            if let Some(id) = selected_task {
+                bail!("Task #{id} is no longer runnable. Check History for its status.");
+            }
             if tasks_processed == 0 {
                 let has_queued_tasks = database.has_queued_tasks()?;
                 let waiting_tasks = database.queued_tasks_waiting_on_dependencies()?;
@@ -3224,7 +3289,49 @@ async fn run_one_shot_auto(
                 run_team_task(json_output, project, database, &task, &config).await?;
             }
         }
+        if selected_task.is_some() {
+            return Ok(());
+        }
     }
+}
+
+fn commit_approved_changes(
+    project: &Project,
+    database: &Database,
+    task: &TaskRecord,
+) -> Result<()> {
+    let review = database
+        .latest_critic_review(task.id)?
+        .context("Missing approved revision")?;
+    let revision = RevisionSnapshot::capture(&project.root, &review.base_revision)?;
+    if revision.revision_id != review.revision_id
+        || review.decision != "approve"
+        || revision.changed_paths.is_empty()
+    {
+        bail!(
+            "Task verified, but project changes no longer match its approved revision. Inspect the diff before committing."
+        );
+    }
+    let paths: Vec<String> = revision
+        .changed_paths
+        .iter()
+        .map(|path| format!(":(literal){path}"))
+        .collect();
+    let commit_msg = format!("talos: task #{}: {}", task.id, task.title);
+    let mut add = vec!["add", "--"];
+    add.extend(paths.iter().map(String::as_str));
+    let mut commit = vec!["commit", "--only", "-m", commit_msg.as_str(), "--"];
+    commit.extend(paths.iter().map(String::as_str));
+    for args in [&add, &commit] {
+        let output = git_command(project, args)?;
+        if !output.status.success() {
+            bail!(
+                "Task verified, but Git could not save the changes. Inspect the working tree and Git settings: {}",
+                redact_sensitive(&String::from_utf8_lossy(&output.stderr))
+            );
+        }
+    }
+    Ok(())
 }
 
 async fn run_pair_task(
@@ -3258,8 +3365,15 @@ async fn run_pair_task(
     if task.status != crate::db::TaskStatus::Verifying
         && task.status != crate::db::TaskStatus::Reviewing
     {
-        let execution =
-            execute_writer_task(json_output, &execution_project, database, task.id, None).await;
+        let execution = execute_writer_task(
+            json_output,
+            &execution_project,
+            database,
+            task.id,
+            None,
+            Some(config),
+        )
+        .await;
         let changed_files = git_status_paths(&execution_project)?;
         let report = execution?;
         print_writer_report(json_output, &report, Some(&changed_files))?;
@@ -3306,7 +3420,8 @@ async fn run_pair_task(
                 "\n>>> [TALOS Auto] Starting Critic review for task #{} (round {cycles})...",
                 task.id
             );
-            let critic_report = execute_critic_review(review_project, database, task.id).await?;
+            let critic_report =
+                execute_critic_review(review_project, database, task.id, Some(config)).await?;
             print_critic_report(json_output, &critic_report)?;
 
             let current_patch_digest = critic_report
@@ -3372,9 +3487,15 @@ async fn run_pair_task(
             println!(
                 "\n>>> [TALOS Auto] Critic requested changes. Launching Writer fix iteration..."
             );
-            let fix_execution =
-                execute_writer_task(json_output, &execution_project, database, task.id, None)
-                    .await?;
+            let fix_execution = execute_writer_task(
+                json_output,
+                &execution_project,
+                database,
+                task.id,
+                None,
+                Some(config),
+            )
+            .await?;
             let fix_changed = git_status_paths(&execution_project)?;
             print_writer_report(json_output, &fix_execution, Some(&fix_changed))?;
             ensure_writer_succeeded(&fix_execution)?;
@@ -3447,9 +3568,7 @@ async fn run_pair_task(
     // Commit task changes locally if primary worktree is dirty
     let dirty = git_status_paths(project)?;
     if !dirty.is_empty() {
-        let commit_msg = format!("talos: task #{}: {}", task.id, task.title);
-        let _ = git_command(project, &["add", "."]);
-        let _ = git_command(project, &["commit", "-m", &commit_msg]);
+        commit_approved_changes(project, database, task)?;
         println!(
             ">>> [TALOS Auto] Committed task #{} changes locally in Git.",
             task.id
@@ -3467,18 +3586,6 @@ async fn run_pair_task(
         );
         let branch = format!("{}task-{}", policy.feature_branch_prefix, task.id);
         let _ = git_command(project, &["checkout", "-B", &branch]);
-        let status = git_status_paths(project)?;
-        if !status.is_empty() {
-            let _ = git_command(project, &["add", "."]);
-            let _ = git_command(
-                project,
-                &[
-                    "commit",
-                    "-m",
-                    &format!("feat: task #{}: {}", task.id, task.title),
-                ],
-            );
-        }
         let req = GithubPublishRequest {
             branch: &branch,
             title: &format!("talos: task #{}: {}", task.id, task.title),
@@ -3495,8 +3602,10 @@ async fn run_pair_task(
     }
 
     let commit_hash = git_head(&project.root).ok().flatten();
-    let changed = git_status_paths(project)
-        .map(|p| p.preview)
+    let changed = database
+        .latest_critic_review(task.id)?
+        .and_then(|review| review.changed_paths_json)
+        .and_then(|paths| serde_json::from_str(&paths).ok())
         .unwrap_or_default();
 
     if deferred_findings.is_empty()
@@ -3815,9 +3924,15 @@ async fn run_team_task(
                     ">>> [TALOS Team] [Worker 1] STARTED at: {} ms | Subtask #{}: '{}' (Worktree: {})",
                     start_time, child1_id, title1, wt_path1
                 );
-                let exec =
-                    execute_writer_task(json_output, &project_clone1, &mut db, child1_id, None)
-                        .await;
+                let exec = execute_writer_task(
+                    json_output,
+                    &project_clone1,
+                    &mut db,
+                    child1_id,
+                    None,
+                    Some(config),
+                )
+                .await;
                 let end_time = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -3841,9 +3956,15 @@ async fn run_team_task(
                     ">>> [TALOS Team] [Worker 2] STARTED at: {} ms | Subtask #{}: '{}' (Worktree: {})",
                     start_time, child2_id, title2, wt_path2
                 );
-                let exec =
-                    execute_writer_task(json_output, &project_clone2, &mut db, child2_id, None)
-                        .await;
+                let exec = execute_writer_task(
+                    json_output,
+                    &project_clone2,
+                    &mut db,
+                    child2_id,
+                    None,
+                    Some(config),
+                )
+                .await;
                 let end_time = SystemTime::now()
                     .duration_since(UNIX_EPOCH)
                     .unwrap_or_default()
@@ -3874,8 +3995,15 @@ async fn run_team_task(
                     ">>> [TALOS Team] Dispatching Writer Worker for subtask #{} ('{}')...",
                     child_task.id, child_task.title
                 );
-                let exec =
-                    execute_writer_task(json_output, project, database, child_task.id, None).await;
+                let exec = execute_writer_task(
+                    json_output,
+                    project,
+                    database,
+                    child_task.id,
+                    None,
+                    Some(config),
+                )
+                .await;
                 worker_exec_results.push((child_task, subtask, contract, wt, exec));
             }
         }
@@ -4016,6 +4144,7 @@ async fn run_team_task(
                                 database,
                                 child_task.id,
                                 None,
+                                Some(config),
                             )
                             .await?;
                             ensure_writer_succeeded(&takeover_exec)?;
@@ -4089,6 +4218,7 @@ async fn run_team_task(
                                 database,
                                 child_task.id,
                                 None,
+                                Some(config),
                             )
                             .await;
                             if let Ok(rep) = &exec_result
@@ -4144,6 +4274,7 @@ async fn run_team_task(
                                 database,
                                 child_task.id,
                                 None,
+                                Some(config),
                             )
                             .await;
                             if let Ok(rep) = &exec_result
@@ -4241,7 +4372,9 @@ async fn run_team_task(
             "Writer Lead chose direct execution",
             None,
         );
-        let execution = execute_writer_task(json_output, project, database, task.id, None).await?;
+        let execution =
+            execute_writer_task(json_output, project, database, task.id, None, Some(config))
+                .await?;
         let changed_files = git_status_paths(project)?;
         print_writer_report(json_output, &execution, Some(&changed_files))?;
         ensure_writer_succeeded(&execution)?;
@@ -4321,7 +4454,7 @@ async fn run_team_task(
             "\n>>> [TALOS Team] Critic Lead conducting consolidated review (Round {}/{})...",
             round, max_rounds
         );
-        let critic_report = execute_critic_review(project, database, task.id).await?;
+        let critic_report = execute_critic_review(project, database, task.id, Some(config)).await?;
         print_critic_report(json_output, &critic_report)?;
 
         let current_patch_digest = critic_report
@@ -4453,7 +4586,8 @@ async fn run_team_task(
         }
 
         let fix_execution =
-            execute_writer_task(json_output, project, database, task.id, None).await?;
+            execute_writer_task(json_output, project, database, task.id, None, Some(config))
+                .await?;
         let fix_changed = git_status_paths(project)?;
         print_writer_report(json_output, &fix_execution, Some(&fix_changed))?;
         ensure_writer_succeeded(&fix_execution)?;
@@ -4505,9 +4639,7 @@ async fn run_team_task(
     // Step 4: Local Git Commit & Completion
     let dirty = git_status_paths(project)?;
     if !dirty.is_empty() {
-        let commit_msg = format!("talos: task #{}: {}", task.id, task.title);
-        let _ = git_command(project, &["add", "."]);
-        let _ = git_command(project, &["commit", "-m", &commit_msg]);
+        commit_approved_changes(project, database, task)?;
         println!(
             ">>> [TALOS Team] Committed task #{} changes locally in Git.",
             task.id
@@ -4515,8 +4647,10 @@ async fn run_team_task(
     }
 
     let commit_hash = git_head(&project.root).ok().flatten();
-    let changed = git_status_paths(project)
-        .map(|p| p.preview)
+    let changed = database
+        .latest_critic_review(task.id)?
+        .and_then(|review| review.changed_paths_json)
+        .and_then(|paths| serde_json::from_str(&paths).ok())
         .unwrap_or_default();
 
     if !team_deferred_findings.is_empty() {
@@ -4619,8 +4753,15 @@ async fn run_one_shot_semi(
         "Start the configured Writer for task #{} ({})?",
         task.id, task.title
     ))?;
-    let execution =
-        execute_writer_task(json_output, &execution_project, database, task.id, None).await;
+    let execution = execute_writer_task(
+        json_output,
+        &execution_project,
+        database,
+        task.id,
+        None,
+        None,
+    )
+    .await;
     let changed_files = git_status_paths(&execution_project)?;
     let report = execution?;
     print_writer_report(json_output, &report, Some(&changed_files))?;
@@ -4635,7 +4776,8 @@ async fn run_one_shot_semi(
             "\n>>> [TALOS Auto] Starting Critic review for task #{} (round {cycles})...",
             task.id
         );
-        let critic_report = execute_critic_review(&execution_project, database, task.id).await?;
+        let critic_report =
+            execute_critic_review(&execution_project, database, task.id, None).await?;
         print_critic_report(json_output, &critic_report)?;
 
         if critic_report.review.decision == "approve" {
@@ -4654,8 +4796,15 @@ async fn run_one_shot_semi(
         }
 
         println!("\n>>> [TALOS Auto] Critic requested changes. Launching Writer fix iteration...");
-        let fix_execution =
-            execute_writer_task(json_output, &execution_project, database, task.id, None).await?;
+        let fix_execution = execute_writer_task(
+            json_output,
+            &execution_project,
+            database,
+            task.id,
+            None,
+            None,
+        )
+        .await?;
         let fix_changed = git_status_paths(&execution_project)?;
         print_writer_report(json_output, &fix_execution, Some(&fix_changed))?;
         ensure_writer_succeeded(&fix_execution)?;
@@ -4851,21 +5000,76 @@ pub(crate) fn ensure_talos_ignored(project: &Project) -> Result<()> {
     match ignored.status.code() {
         Some(0) => Ok(()),
         Some(1) => {
-            let gitignore_path = project.root.join(".gitignore");
-            let mut content = if gitignore_path.exists() {
-                std::fs::read_to_string(&gitignore_path).unwrap_or_default()
-            } else {
-                String::new()
-            };
-            if !content.ends_with('\n') && !content.is_empty() {
-                content.push('\n');
+            use std::os::{fd::AsRawFd, unix::fs::OpenOptionsExt};
+
+            let output = git_command(
+                project,
+                &[
+                    "rev-parse",
+                    "--path-format=absolute",
+                    "--git-path",
+                    "info/exclude",
+                ],
+            )?;
+            if !output.status.success() {
+                bail!("Cannot locate the local Git exclude file");
             }
-            content.push_str(".talos/\n");
-            std::fs::write(&gitignore_path, content)
-                .context("Failed to automatically add .talos/ to .gitignore")?;
-            eprintln!(
-                "Notice: added .talos/ to .gitignore to keep database and task state untracked."
-            );
+            let path = std::str::from_utf8(&output.stdout)
+                .context("Git exclude path is not valid UTF-8")?
+                .trim_end_matches('\n');
+            let path = Path::new(path);
+            let info = path
+                .parent()
+                .filter(|_| path.is_absolute())
+                .context("Git returned an invalid exclude path")?;
+            std::fs::create_dir_all(info).context("Cannot create the local Git info directory")?;
+            if std::fs::symlink_metadata(info)?.is_symlink() {
+                bail!("Local Git info directory must not be a symlink");
+            }
+            let mut file = std::fs::OpenOptions::new()
+                .read(true)
+                .append(true)
+                .create(true)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+                .open(path)
+                .context("Cannot open the local Git exclude file")?;
+            if !file.metadata()?.is_file() {
+                bail!("Local Git exclude path must be a regular file");
+            }
+            // Serialize initialization from multiple TALOS processes.
+            if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
+                return Err(io::Error::last_os_error())
+                    .context("Cannot lock the local Git exclude file");
+            }
+            let mut content = Vec::new();
+            file.read_to_end(&mut content)?;
+            if !content
+                .split(|byte| *byte == b'\n')
+                .any(|line| line == b"/.talos/")
+            {
+                let rule = if content.is_empty() || content.ends_with(b"\n") {
+                    b"/.talos/\n".as_slice()
+                } else {
+                    b"\n/.talos/\n".as_slice()
+                };
+                file.write_all(rule)
+                    .context("Cannot add TALOS to the local Git exclude file")?;
+            }
+            let verified = git_command(
+                project,
+                &[
+                    "check-ignore",
+                    "--no-index",
+                    "-q",
+                    "--",
+                    ".talos/state.sqlite3",
+                ],
+            )?;
+            if !verified.status.success() {
+                bail!(
+                    "Git still exposes .talos/ after setting the local exclusion. Check conflicting ignore rules before starting TALOS."
+                );
+            }
             Ok(())
         }
         _ => bail!("Git could not determine whether .talos/state.sqlite3 is ignored"),
@@ -5302,6 +5506,15 @@ fn print_resolution(resolution: &WriterResolutionRecord) {
     }
 }
 
+pub(crate) fn adapter_available_for_cockpit(adapter: AdapterKind, root: &Path) -> bool {
+    if adapter == AdapterKind::Agy {
+        let probe = AgyProbe::inspect(root);
+        return adapter_role_status(adapter, AgentRole::Writer, &probe, root) == "verified"
+            && adapter_role_status(adapter, AgentRole::Critic, &probe, root) == "verified";
+    }
+    resolve_adapter_executable(adapter, root).is_ok()
+}
+
 fn adapter_capability_reports(
     probe: &AgyProbe,
     project_root: &Path,
@@ -5525,7 +5738,7 @@ mod tests {
     }
 
     #[test]
-    fn git_project_automatically_adds_talos_to_gitignore() {
+    fn git_project_excludes_talos_without_changing_the_worktree() {
         let project = temp_project();
         init_git(&project.root);
         let git_project = Project {
@@ -5533,10 +5746,13 @@ mod tests {
             state_root: project.root.clone(),
             discovery: DiscoveryMethod::Git,
         };
-        ensure_talos_ignored(&git_project).expect("automatically adds .talos/ to .gitignore");
-        let gitignore =
-            fs::read_to_string(project.root.join(".gitignore")).expect("read gitignore");
-        assert!(gitignore.contains(".talos/"));
+        ensure_talos_ignored(&git_project).expect("adds the local exclusion");
+        assert!(!project.root.join(".gitignore").exists());
+        assert_eq!(
+            git(&project.root, &["check-ignore", ".talos/state.sqlite3"]),
+            ".talos/state.sqlite3"
+        );
+        assert!(git(&project.root, &["status", "--porcelain"]).is_empty());
 
         // Running it again is idempotent
         ensure_talos_ignored(&git_project).expect("already ignored TALOS state is allowed");

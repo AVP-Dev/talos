@@ -49,15 +49,20 @@ The Critic must return a single JSON object matching this shape, with no surroun
 }
 ```
 
-Each finding has `severity` (`blocker`, `major`, `minor`, or `note`), a repository-relative `path`, an optional positive line number, a short `title`, and a concrete `reason`. Paths must name a file in `changed_paths` and may not be absolute or escape the project root.
+Each finding has `severity` (`blocker`, `major`, `minor`, or `note`), a repository-relative `path`, an optional positive line number, a short `title`, and a concrete `reason`. Paths must be valid project-relative paths and may not be absolute or escape the project root (`../`).
+- Findings targeting modified files in `changed_paths` participate in the immediate revision verdict.
+- Findings targeting unmodified files in the repository are recognized as cross-cutting / out-of-scope findings and routed to the deferred backlog rather than failing review validation.
+- Line numbers equal to `0` are safely normalized to `None`.
+- Thorough explanations are preserved in full without arbitrary byte caps.
 
 Deterministic acceptance rules:
 
 - A process error, nonzero exit, truncated output, malformed JSON, unknown schema version, revision mismatch, invalid finding, or stale working tree is a failed review, never approval.
 - Persist only the validated structured result and bounded task/revision metadata. Do not persist the full prompt, patch, or CLI transcript in SQLite.
 - The response schema rejects unknown fields, including `patch`; Critic output is findings-only and TALOS has no Critic patch-application route.
-- `request_changes` requires at least one `blocker` or `major` finding.
-- `approve` is accepted only when no `blocker` or `major` findings remain. `minor` and `note` findings are recorded as non-blocking observations.
+- `request_changes` requires at least one `blocker` or `major` finding on changed files. If Critic requests changes with only non-blocking findings (`minor`, `note`, or out-of-scope), the decision is gracefully downgraded to `approve` with remarks.
+- `approve` is accepted only when no `blocker` or `major` findings remain. `minor`, `note`, and out-of-scope findings are recorded as non-blocking observations and preserved in the task backlog and deliverable summary (`TALOS_SUMMARY.md`).
+- Passing unit tests provide empirical evidence during deliberation, but do NOT automatically dismiss Critic's architectural concerns.
 - Findings are immutable historical records tied to one revision. A later fix and review create a new record; they do not edit or delete earlier findings.
 - A rejection moves the task back to `implementing`; a valid approval moves it to `verifying`. R5 completion requires separately recorded project-check evidence for this exact approved Git revision.
 

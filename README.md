@@ -7,7 +7,7 @@
     <img src="https://img.shields.io/badge/Status-Beta%20%2F%20Preview-yellow?style=for-the-badge" alt="Status: Beta" />
     <img src="https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-black?style=for-the-badge&logo=apple" alt="macOS and Linux" />
     <img src="https://img.shields.io/badge/Rust-1.100%2B-orange?style=for-the-badge&logo=rust" alt="Rust" />
-    <img src="https://img.shields.io/badge/Tests-154%20passed-brightgreen?style=for-the-badge" alt="Tests" />
+    <img src="https://img.shields.io/badge/Tests-166%20passed-brightgreen?style=for-the-badge" alt="Tests" />
   </p>
 
   <p>
@@ -36,10 +36,14 @@
 - **Dual Orchestration Modes:**
   - **Team Mode (`--mode team`):** Two-tier team collaboration. Writer Lead autonomously plans, decomposes subtasks, supervises parallel Writer Workers in isolated Git worktrees, assists failing workers, and integrates code. Critic Team performs multi-angle audits, and Critic Lead renders the authoritative verdict with automated rebuttal and fix loops.
   - **Pair Mode (`pair`, default):** Sequential Writer → Critic → Verify → Complete pipeline.
+- **Reasoned Deliberation & Rebuttal:** Writer Lead can provide structured technical justification or code fixes upon review feedback. Passing tests inform discussion but do not automatically excuse architectural flaws.
+- **Adaptive Task Triage:** Pre-flight advisory triage evaluates task complexity and recommends depth without rigid workflow lock-in.
+- **Backlog Curation:** Deferred non-critical observations (`Minor`, `Note`, cross-cutting findings) are preserved in SQLite and surfaced in `TALOS_SUMMARY.md`.
+- **Anti-Stagnation Protection:** Automatically detects identical diffs across fix iterations and halts futile loops early to conserve tokens.
 - **7 AI CLI Adapters:** Native headless runners for `codex`, `agy` (Antigravity), `claude` (Claude Code), `omp`, `pi`, `kilo`, and `opencode`.
 - **Deterministic Rust Core:** SQLite WAL (`.talos/state.sqlite3`, schema v19). No Docker, no Kubernetes, no Python runtime, and no separate local server required.
 - **Git Worktree Isolation:** Parallel workers run in isolated checkouts with strict path containment enforcement.
-- **Automated Verification Gate:** Runs project test suites (`pytest`, `cargo test`, `npm test`) and requires exit 0 before task completion.
+- **Automated Verification Gate:** Runs project test suites (`pytest`, `cargo test`, `npm test`) and requires exit 0 before task completion. Failed checks cleanly abort completion and re-route tasks for fixes.
 
 ---
 

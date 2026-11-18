@@ -162,11 +162,36 @@ pub fn generate_summary_markdown(data: &TaskSummaryData) -> String {
     doc
 }
 
+pub(crate) fn task_summary_path(project_root: &Path, task_id: i64) -> std::path::PathBuf {
+    project_root
+        .join(".talos")
+        .join("reports")
+        .join(format!("task-{task_id}.md"))
+}
+
 pub fn write_task_summary(project_root: &Path, data: &TaskSummaryData) -> Result<String> {
-    let markdown = generate_summary_markdown(data);
-    let artifact_path = project_root.join("TALOS_SUMMARY.md");
-    fs::write(&artifact_path, &markdown)
-        .with_context(|| format!("Failed to write {}", artifact_path.display()))?;
+    use std::{io::Write, os::unix::fs::OpenOptionsExt};
+
+    let artifact_path = task_summary_path(project_root, data.task.id);
+    let reports = artifact_path.parent().expect("report has a parent");
+    fs::create_dir_all(reports).context("Cannot create the local reports directory")?;
+    if fs::symlink_metadata(reports)?.is_symlink() {
+        anyhow::bail!("Local reports directory must not be a symlink");
+    }
+    let staging = artifact_path.with_extension(format!("{}.tmp", std::process::id()));
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&staging)
+        .context("Cannot stage the task report")?;
+    let result = file
+        .write_all(generate_summary_markdown(data).as_bytes())
+        .and_then(|()| fs::rename(&staging, &artifact_path));
+    if result.is_err() {
+        let _ = fs::remove_file(&staging);
+    }
+    result.with_context(|| format!("Failed to write {}", artifact_path.display()))?;
     Ok(artifact_path.display().to_string())
 }
 

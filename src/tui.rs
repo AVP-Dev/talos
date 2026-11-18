@@ -1,12 +1,17 @@
 use std::{
     fs::{File, OpenOptions},
-    io::{self, BufRead, BufReader},
+    io::{self, Read, Seek, SeekFrom},
+    path::{Path, PathBuf},
+    process::Child,
     time::{Duration, Instant},
 };
 
 use anyhow::{Context, Result};
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers},
+    event::{
+        self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+        KeyModifiers,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
@@ -16,19 +21,22 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs},
+    widgets::{Block, Borders, List, ListItem, Paragraph, Tabs, Wrap},
 };
 
 use crate::{
     adapter::AdapterId as AdapterKind,
-    app::{GitStatusPaths, current_project_revision_id, ensure_talos_ignored, git_status_paths},
+    app::{
+        GitStatusPaths, adapter_available_for_cockpit, config_fingerprint,
+        current_project_revision_id, ensure_talos_ignored, git_status_paths,
+    },
     checks::ProjectCheck,
     config::{OrchestrationMode, ProjectConfig},
     db::{
         CriticReviewRecord, Database, QueueSummary, StopRequestOutcome, TaskEvent, TaskRecord,
-        TaskStatus, TaskWorktreeRecord,
+        TaskStatus, TaskSummaryRecord, TaskWorktreeRecord,
     },
-    project::Project,
+    project::{DiscoveryMethod, Project},
     tmux::{TmuxClient, project_session_name},
 };
 
@@ -60,11 +68,46 @@ impl ActiveTab {
     }
 }
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum Screen {
+    #[default]
+    Main,
+    Settings,
+    WriterModel,
+    CriticModel,
+    Review,
+    History,
+    Task,
+    ChooseProject,
+}
+
+struct TaskDraft {
+    title: String,
+    criteria: String,
+    config: ProjectConfig,
+}
+
 pub struct TuiApp {
     project: Project,
     config: ProjectConfig,
     active_tab: ActiveTab,
     input: String,
+    cursor: usize,
+    screen: Screen,
+    draft: Option<TaskDraft>,
+    settings: Option<ProjectConfig>,
+    selection: usize,
+    available: Vec<AdapterKind>,
+    history: Vec<TaskSummaryRecord>,
+    history_before: Option<i64>,
+    task_view: Option<i64>,
+    detail_scroll: u16,
+    event_baseline: i64,
+    log_baseline: u64,
+    child: Option<Child>,
+    run_notice: Option<String>,
+    task_status: Option<TaskStatus>,
+    task_details: String,
     status_message: Option<(String, Instant)>,
     scroll_offset: usize,
 
@@ -91,7 +134,16 @@ pub struct TuiApp {
 
 impl TuiApp {
     pub fn new(project: Project) -> Result<Self> {
-        let config = ProjectConfig::load(&project).unwrap_or_default();
+        let available = available_adapters(&project);
+        let mut config = ProjectConfig::load(&project)?;
+        if matches!(project.discovery, DiscoveryMethod::Git)
+            && !crate::config::config_path(&project.state_root).exists()
+            && let Some(writer) = available.first().copied()
+        {
+            config.writer = writer;
+            config.critic = available.get(1).copied().unwrap_or(writer);
+            config.save(&project)?;
+        }
         let queue = QueueSummary {
             total: 0,
             queued: 0,
@@ -108,10 +160,30 @@ impl TuiApp {
         let is_in_tmux = std::env::var_os("TMUX").is_some();
 
         let mut app = Self {
-            project,
             config,
             active_tab: ActiveTab::Feed,
             input: String::new(),
+            cursor: 0,
+            screen: if matches!(project.discovery, DiscoveryMethod::Git) {
+                Screen::Main
+            } else {
+                Screen::ChooseProject
+            },
+            project,
+            draft: None,
+            settings: None,
+            selection: 0,
+            available,
+            history: Vec::new(),
+            history_before: None,
+            task_view: None,
+            detail_scroll: 0,
+            event_baseline: 0,
+            log_baseline: 0,
+            child: None,
+            run_notice: None,
+            task_status: None,
+            task_details: String::new(),
             status_message: None,
             scroll_offset: 0,
             queue,
@@ -134,7 +206,9 @@ impl TuiApp {
             should_exit: false,
         };
 
-        app.refresh_state()?;
+        if matches!(app.project.discovery, DiscoveryMethod::Git) {
+            app.refresh_state()?;
+        }
         if let Some(task) = app.active_tasks.first() {
             app.reconnect_notice = Some(format!(
                 "Active session reconnected for Task #{} ({})",
@@ -147,6 +221,20 @@ impl TuiApp {
     }
 
     pub fn refresh_state(&mut self) -> Result<()> {
+        if !matches!(self.project.discovery, DiscoveryMethod::Git) {
+            return Ok(());
+        }
+        if let Some(child) = &mut self.child
+            && let Some(status) = child.try_wait()?
+        {
+            self.child = None;
+            if !status.success()
+                && let Some(id) = self.task_view
+            {
+                let log = recent_log_lines(&self.task_log(id), 0);
+                self.run_notice = Some(run_recovery_hint(&log, &self.config));
+            }
+        }
         if let Ok(cfg) = ProjectConfig::load(&self.project) {
             self.config = cfg;
         }
@@ -183,9 +271,19 @@ impl TuiApp {
             self.supervisor_owner = None;
         }
 
-        self.active_tasks = database.active_tasks().unwrap_or_default();
+        self.supervisor_running |= self.child.is_some();
+        self.active_tasks = database.active_tasks()?;
+        if let Some(id) = self.task_view {
+            let task = database.get_task(id)?;
+            self.task_status = task.as_ref().map(|task| task.status.clone());
+            if let Some(task) = task {
+                self.update_task_details(&database, &task)?;
+            }
+        }
         self.worktrees = database.task_worktrees().unwrap_or_default();
-        self.recent_events = database.recent_events(50).unwrap_or_default();
+        self.recent_events = database.recent_events(50)?;
+        self.recent_events
+            .retain(|event| event.id > self.event_baseline);
 
         if let Some(active) = self.active_tasks.first() {
             self.latest_review = database.latest_critic_review(active.id).ok().flatten();
@@ -197,29 +295,23 @@ impl TuiApp {
             self.verification_checks = self.config.checks.clone();
         }
 
-        self.dirty_paths = git_status_paths(&self.project).unwrap_or(GitStatusPaths {
-            total_count: 0,
-            preview: Vec::new(),
-            preview_values_truncated: false,
-        });
-
+        self.dirty_paths = git_status_paths(&self.project)?;
         self.read_supervisor_logs();
-        self.load_git_diff();
+        if self.active_tab == ActiveTab::Diff {
+            self.load_git_diff();
+        }
         Ok(())
     }
 
     fn read_supervisor_logs(&mut self) {
-        let log_path = self.project.root.join(".talos").join("supervisor.log");
-        if let Ok(file) = File::open(&log_path) {
-            let reader = BufReader::new(file);
-            let lines: Vec<String> = reader
-                .lines()
-                .map_while(Result::ok)
-                .filter(|l| !l.trim().is_empty())
-                .collect();
-            let start = lines.len().saturating_sub(500);
-            self.supervisor_logs = lines[start..].to_vec();
-        }
+        let (path, baseline) = match self.task_view {
+            Some(id) => (self.task_log(id), 0),
+            None => (
+                self.project.root.join(".talos").join("supervisor.log"),
+                self.log_baseline,
+            ),
+        };
+        self.supervisor_logs = recent_log_lines(&path, baseline);
     }
 
     fn load_git_diff(&mut self) {
@@ -331,6 +423,9 @@ impl TuiApp {
         if input_text.starts_with('/') && !input_text.contains(' ') {
             let slash_commands = [
                 "/cli",
+                "/config",
+                "/new",
+                "/history",
                 "/commit",
                 "/mode",
                 "/writer",
@@ -494,33 +589,240 @@ impl TuiApp {
     }
 
     pub fn handle_submit(&mut self) -> Result<()> {
-        let input_text = self.input.trim().to_string();
-        if input_text.is_empty() {
+        let text = self.input.trim().to_owned();
+        if self.screen == Screen::Task && text.starts_with('/') {
+            self.execute_slash_command(&text)?;
+            self.clear_input();
             return Ok(());
         }
-
-        if input_text.starts_with('/') {
-            self.execute_slash_command(&input_text)?;
-        } else {
-            self.submit_task(&input_text)?;
+        match self.screen {
+            Screen::ChooseProject => {
+                if text.is_empty() {
+                    return Ok(());
+                }
+                let path = text
+                    .strip_prefix("~/")
+                    .and_then(|tail| {
+                        std::env::var_os("HOME").map(|home| PathBuf::from(home).join(tail))
+                    })
+                    .unwrap_or_else(|| PathBuf::from(&text));
+                let project = Project::discover(&path)?;
+                anyhow::ensure!(
+                    matches!(project.discovery, DiscoveryMethod::Git),
+                    "Choose a folder inside a Git repository."
+                );
+                ensure_talos_ignored(&project)?;
+                *self = Self::new(project)?;
+            }
+            Screen::Main if !text.is_empty() => {
+                if text.starts_with('/') {
+                    self.execute_slash_command(&text)?;
+                } else {
+                    let first_line = text.lines().next().unwrap_or_default().trim();
+                    let end = first_line.floor_char_boundary(first_line.len().min(160));
+                    self.prepare_draft(first_line[..end].to_owned(), text);
+                }
+            }
+            Screen::WriterModel | Screen::CriticModel => {
+                let settings = self.settings.as_mut().context("Open Settings first")?;
+                anyhow::ensure!(
+                    text.len() <= 200 && !crate::secrets::contains_sensitive(&text),
+                    "Enter a model name, up to 200 bytes."
+                );
+                let model = (!text.is_empty()).then_some(text);
+                if self.screen == Screen::WriterModel {
+                    settings.writer_model = model;
+                } else {
+                    settings.critic_model = model;
+                }
+                self.screen = Screen::Settings;
+            }
+            Screen::Settings => {
+                let settings = self.settings.as_ref().context("Open Settings first")?;
+                settings.save(&self.project)?;
+                self.config = settings.clone();
+                self.settings = None;
+                if let Some(draft) = &mut self.draft {
+                    draft.config = self.config.clone();
+                    self.screen = Screen::Review;
+                } else {
+                    self.screen = Screen::Main;
+                }
+                self.notice("Settings saved.");
+            }
+            Screen::Review => self.run_draft()?,
+            Screen::History => {
+                if let Some(task) = self.history.get(self.selection) {
+                    self.task_view = Some(task.id);
+                    self.run_notice = None;
+                    self.detail_scroll = 0;
+                    self.screen = Screen::Task;
+                    self.refresh_state()?;
+                }
+            }
+            _ => {}
         }
+        self.clear_input();
+        Ok(())
+    }
+
+    fn notice(&mut self, message: impl Into<String>) {
+        self.status_message = Some((message.into(), Instant::now()));
+    }
+
+    fn clear_input(&mut self) {
         self.input.clear();
+        self.cursor = 0;
+    }
+
+    fn prepare_draft(&mut self, title: String, criteria: String) {
+        self.draft = Some(TaskDraft {
+            title,
+            criteria,
+            config: self.config.clone(),
+        });
+        self.screen = Screen::Review;
+        self.detail_scroll = 0;
+        self.status_message = None;
+    }
+
+    fn run_draft(&mut self) -> Result<()> {
+        self.refresh_state()?;
+        let draft = self.draft.as_ref().context("Create a task first")?;
+        anyhow::ensure!(
+            draft.config == self.config,
+            "Project settings changed. Open Settings and save to review the new assignments."
+        );
+        if let Some(blocker) = self.run_blocker() {
+            anyhow::bail!("{blocker}");
+        }
+        let mut database = Database::open(&self.project)?;
+        let task =
+            database.add_task_with_checks(&draft.title, &draft.criteria, &draft.config.checks)?;
+        self.draft = None;
+        self.task_view = Some(task.id);
+        self.run_notice = None;
+        self.detail_scroll = 0;
+        self.screen = Screen::Task;
+        self.start_selected_task(task.id)
+    }
+
+    fn run_blocker(&self) -> Option<String> {
+        if self.supervisor_running || !self.active_tasks.is_empty() {
+            return Some(
+                "A task is active. Wait for it to finish or request Stop for its Writer.".into(),
+            );
+        }
+        if self.queue_paused {
+            return Some("The queue is paused. Press U to resume the queue, then retry.".into());
+        }
+        if !self.dirty_paths.is_empty() {
+            return Some(format!(
+                "Project has uncommitted changes. Press D to view them. Commit or stash your own changes, then retry. {}",
+                self.dirty_paths.display_preview()
+            ));
+        }
+        for adapter in [self.config.writer, self.config.critic] {
+            if !self.available.contains(&adapter) {
+                return Some(format!(
+                    "{} was not found or failed its capability check. Press S to choose an available CLI, or install it and press R to check again.",
+                    adapter.as_str()
+                ));
+            }
+        }
+        None
+    }
+
+    fn open_settings(&mut self) {
+        self.available = available_adapters(&self.project);
+        self.settings = Some(self.config.clone());
+        self.selection = 0;
+        self.screen = Screen::Settings;
+        self.status_message = None;
+    }
+
+    fn new_session(&mut self) -> Result<()> {
+        self.refresh_state()?;
+        anyhow::ensure!(
+            !self.supervisor_running && self.active_tasks.is_empty(),
+            "A task is still active. Wait for it to finish or use /stop to stop the active Writer."
+        );
+        self.event_baseline = Database::open(&self.project)?
+            .recent_events(1)?
+            .last()
+            .map_or(0, |event| event.id);
+        self.log_baseline =
+            std::fs::metadata(self.project.root.join(".talos").join("supervisor.log"))
+                .map_or(0, |metadata| metadata.len());
+        self.clear_input();
+        self.draft = None;
+        self.task_view = None;
+        self.task_status = None;
+        self.run_notice = None;
+        self.reconnect_notice = None;
+        self.scroll_offset = 0;
+        self.active_tab = ActiveTab::Feed;
+        self.screen = Screen::Main;
+        self.notice("New session. Describe your next task and press Enter to review.");
+        Ok(())
+    }
+
+    fn task_log(&self, id: i64) -> PathBuf {
+        self.project
+            .root
+            .join(".talos")
+            .join(format!("task-{id}.log"))
+    }
+
+    fn open_history(&mut self, before: Option<i64>) -> Result<()> {
+        self.history = Database::open(&self.project)?.recent_tasks(before, 50)?;
+        self.history_before = before;
+        self.selection = 0;
+        self.screen = Screen::History;
+        self.status_message = None;
+        Ok(())
+    }
+
+    fn update_task_details(&mut self, database: &Database, task: &TaskRecord) -> Result<()> {
+        let report = crate::summary::task_summary_path(&self.project.root, task.id);
+        let mut details = format!(
+            "Task #{} · {}\n{}\n",
+            task.id,
+            task.status.as_str(),
+            task.title
+        );
+        if let Some(integration) = database.task_worktree_integration(task.id)? {
+            details.push_str("\nChanged files\n");
+            details.push_str(&integration.changed_paths.join("\n"));
+            details.push('\n');
+        }
+        let report_text = File::open(&report).and_then(|file| {
+            let mut text = Vec::new();
+            file.take(64 * 1024).read_to_end(&mut text)?;
+            Ok(String::from_utf8_lossy(&text).into_owned())
+        });
+        if let Ok(report_text) = report_text {
+            details.push('\n');
+            details.push_str(&report_text);
+        } else {
+            let events = database.task_events_page(Some(task.id), None, 20)?;
+            for event in events.events.iter().take(5).rev() {
+                details.push_str(&format!("\n{}", event.reason));
+            }
+        }
+        if self.screen == Screen::Task {
+            let logs = recent_log_lines(&self.task_log(task.id), 0);
+            if !logs.is_empty() {
+                details.push_str("\n\nRun details\n");
+                details.push_str(&logs.join("\n"));
+            }
+        }
+        self.task_details = details;
         Ok(())
     }
 
     pub fn submit_task(&mut self, task_text: &str) -> Result<()> {
-        let mut database = Database::open(&self.project)?;
-        let task = database.add_task(task_text, task_text)?;
-        self.status_message = Some((
-            format!("Task #{} enqueued: {}", task.id, task.title),
-            Instant::now(),
-        ));
-
-        if !self.supervisor_running {
-            self.spawn_background_worker();
-        }
-
-        self.refresh_state()?;
+        self.prepare_draft(task_text.to_owned(), task_text.to_owned());
         Ok(())
     }
 
@@ -532,7 +834,7 @@ impl TuiApp {
         match cmd.as_str() {
             "/help" | "/помощь" | "/справка" => {
                 self.status_message = Some((
-                    "Commands: /cli <name>, /task:test <file>, /task:refactor <file>, /task:fix <path> <issue>, /task:bench <path>, /stop, /pause, /resume, /run, /commit <msg>, /feed, /diff, /dialogue, /audit, /writer, /critic, /model, /mode, /exit".to_string(),
+                    "Commands: /config, /new, /history, /cli <writer> <critic>, /task:test <file>, /task:refactor <file>, /task:fix <path> <issue>, /task:bench <path>, /stop, /pause, /resume, /run, /commit <msg>, /feed, /diff, /dialogue, /audit, /writer, /critic, /model, /mode, /exit".to_string(),
                     Instant::now(),
                 ));
             }
@@ -547,16 +849,7 @@ impl TuiApp {
                     let criteria = format!(
                         "Verify {arg} behavior with thorough unit tests. Production code in {arg} must not be altered. All assertions must pass."
                     );
-                    let mut database = Database::open(&self.project)?;
-                    let task = database.add_task(&title, &criteria)?;
-                    self.status_message = Some((
-                        format!("Preset Task #{} enqueued: {}", task.id, task.title),
-                        Instant::now(),
-                    ));
-                    if !self.supervisor_running {
-                        self.spawn_background_worker();
-                    }
-                    self.refresh_state()?;
+                    self.prepare_draft(title, criteria);
                 }
             }
             "/task:refactor" | "/рефакторинг" => {
@@ -571,16 +864,7 @@ impl TuiApp {
                     let criteria = format!(
                         "Refactor {arg} to improve code clarity and structure without breaking behavior or altering public API. All existing tests must pass."
                     );
-                    let mut database = Database::open(&self.project)?;
-                    let task = database.add_task(&title, &criteria)?;
-                    self.status_message = Some((
-                        format!("Preset Task #{} enqueued: {}", task.id, task.title),
-                        Instant::now(),
-                    ));
-                    if !self.supervisor_running {
-                        self.spawn_background_worker();
-                    }
-                    self.refresh_state()?;
+                    self.prepare_draft(title, criteria);
                 }
             }
             "/task:fix" | "/фикс" => {
@@ -595,16 +879,7 @@ impl TuiApp {
                     let criteria = format!(
                         "Diagnose and resolve defect: {arg}. Ensure full test suite passes and add regression test coverage."
                     );
-                    let mut database = Database::open(&self.project)?;
-                    let task = database.add_task(&title, &criteria)?;
-                    self.status_message = Some((
-                        format!("Preset Task #{} enqueued: {}", task.id, task.title),
-                        Instant::now(),
-                    ));
-                    if !self.supervisor_running {
-                        self.spawn_background_worker();
-                    }
-                    self.refresh_state()?;
+                    self.prepare_draft(title, criteria);
                 }
             }
             "/task:bench" => {
@@ -618,18 +893,12 @@ impl TuiApp {
                     let criteria = format!(
                         "Measure execution performance and optimize critical paths in {arg}. Verify functional correctness with unit tests."
                     );
-                    let mut database = Database::open(&self.project)?;
-                    let task = database.add_task(&title, &criteria)?;
-                    self.status_message = Some((
-                        format!("Preset Task #{} enqueued: {}", task.id, task.title),
-                        Instant::now(),
-                    ));
-                    if !self.supervisor_running {
-                        self.spawn_background_worker();
-                    }
-                    self.refresh_state()?;
+                    self.prepare_draft(title, criteria);
                 }
             }
+            "/config" | "/settings" => self.open_settings(),
+            "/new" | "/session" => self.new_session()?,
+            "/history" => self.open_history(None)?,
             "/feed" | "/фид" | "/лента" | "/overview" | "/обзор" => {
                 self.active_tab = ActiveTab::Feed;
             }
@@ -744,19 +1013,22 @@ impl TuiApp {
             "/resume" | "/continue" | "/резюм" | "/продолжить" => {
                 let mut database = Database::open(&self.project)?;
                 let revision_id = current_project_revision_id(&self.project);
-                let _ = database.resume_project(revision_id.as_deref(), false);
-                self.queue_paused = false;
-                self.status_message = Some(("Queue resumed.".to_string(), Instant::now()));
-                if !self.supervisor_running {
-                    self.spawn_background_worker();
-                }
+                let outcome = database.resume_project(revision_id.as_deref(), false)?;
+                self.refresh_state()?;
+                self.notice(if self.queue_paused {
+                    format!(
+                        "Queue still paused. Inspect project changes before resuming. {outcome:?}"
+                    )
+                } else {
+                    "Queue resumed. Open History to retry a queued task.".to_owned()
+                });
             }
             "/quit" | "/exit" | "/выход" | "/q" => {
                 self.should_exit = true;
             }
             "/clear" | "/очистить" => {
                 self.status_message = None;
-                self.input.clear();
+                self.clear_input();
             }
             "/stash" | "/стэш" => {
                 let mut stash_cmd = std::process::Command::new("git");
@@ -888,9 +1160,6 @@ impl TuiApp {
                             Instant::now(),
                         ));
                         self.refresh_state()?;
-                        if !self.supervisor_running {
-                            self.spawn_background_worker();
-                        }
                     }
                     Ok(out) => {
                         let err = String::from_utf8_lossy(&out.stderr);
@@ -943,6 +1212,45 @@ impl TuiApp {
 
         self.refresh_state()?;
         Ok(())
+    }
+
+    fn start_selected_task(&mut self, id: i64) -> Result<()> {
+        anyhow::ensure!(self.child.is_none(), "A task is still running.");
+        use std::os::unix::fs::OpenOptionsExt;
+        let log = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+            .open(self.task_log(id))
+            .context("Cannot open the task log. Check that .talos is writable, then retry.")?;
+        anyhow::ensure!(
+            log.metadata()?.is_file(),
+            "The task log must be a regular file."
+        );
+        use std::os::unix::process::CommandExt;
+        let expected_config = config_fingerprint(&self.config)?;
+        let child = std::process::Command::new(std::env::current_exe()?)
+            .args([
+                "up",
+                "--auto",
+                "--task",
+                &id.to_string(),
+                "--expected-config",
+                &expected_config,
+            ])
+            .process_group(0)
+            .current_dir(&self.project.root)
+            .stdin(std::process::Stdio::null())
+            .stdout(log.try_clone()?)
+            .stderr(log)
+            .spawn()
+            .context("Cannot start TALOS. Check the installation and retry.")?;
+        self.child = Some(child);
+        self.supervisor_running = true;
+        self.run_notice = None;
+        self.notice(format!("Starting task #{id}."));
+        self.refresh_state()
     }
 
     pub fn spawn_background_worker(&mut self) {
@@ -1007,145 +1315,501 @@ impl TuiApp {
     }
 }
 
+fn available_adapters(project: &Project) -> Vec<AdapterKind> {
+    if !matches!(project.discovery, DiscoveryMethod::Git) {
+        return Vec::new();
+    }
+    [
+        AdapterKind::Codex,
+        AdapterKind::Claude,
+        AdapterKind::Agy,
+        AdapterKind::OpenCode,
+        AdapterKind::Pi,
+        AdapterKind::Omp,
+        AdapterKind::Kilo,
+    ]
+    .into_iter()
+    .filter(|adapter| adapter_available_for_cockpit(*adapter, &project.root))
+    .collect()
+}
+
+fn run_recovery_hint(log: &[String], config: &ProjectConfig) -> String {
+    if log.iter().rev().any(|line| {
+        let line = line.to_ascii_lowercase();
+        [
+            "not logged in",
+            "authentication required",
+            "unauthorized",
+            "status 401",
+            "api key is missing",
+            "invalid api key",
+            "please run /login",
+        ]
+        .iter()
+        .any(|marker| line.contains(marker))
+    }) {
+        let mut commands = [config.writer, config.critic]
+            .into_iter()
+            .filter_map(|adapter| match adapter {
+                AdapterKind::Codex => Some("codex login"),
+                AdapterKind::Claude => Some("claude auth login"),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        commands.dedup();
+        let actions = if commands.is_empty() {
+            "Sign in or configure credentials in the selected agent's own CLI.".to_owned()
+        } else {
+            format!(
+                "Check the failing role below. Sign in from a shell with {} where applicable.",
+                commands.join(" or ")
+            )
+        };
+        format!(
+            "The agent could not authenticate. {actions} Return to TALOS to retry, or press F2 to choose another CLI."
+        )
+    } else {
+        "Run stopped. See Run details below for the error and the next action.".to_owned()
+    }
+}
+
+fn recent_log_lines(path: &Path, baseline: u64) -> Vec<String> {
+    let Ok(mut file) = File::open(path) else {
+        return Vec::new();
+    };
+    let Ok(metadata) = file.metadata() else {
+        return Vec::new();
+    };
+    if !metadata.is_file() {
+        return Vec::new();
+    }
+    let end = metadata.len();
+    let start = baseline.min(end).max(end.saturating_sub(48 * 1024));
+    if file.seek(SeekFrom::Start(start)).is_err() {
+        return Vec::new();
+    }
+    let mut bytes = Vec::new();
+    if file.take(end - start).read_to_end(&mut bytes).is_err() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&bytes)
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(crate::secrets::redact_sensitive)
+        .collect()
+}
+
+impl TuiApp {
+    fn change_setting(&mut self, forward: bool) -> Result<()> {
+        let settings = self.settings.as_mut().context("Open Settings first")?;
+        match self.selection {
+            0 | 2 => {
+                let (adapter, model) = if self.selection == 0 {
+                    (&mut settings.writer, &mut settings.writer_model)
+                } else {
+                    (&mut settings.critic, &mut settings.critic_model)
+                };
+                if self.available.is_empty() {
+                    self.notice(
+                        "No compatible CLI was found. Install an agent and press R to check again.",
+                    );
+                    return Ok(());
+                }
+                let next = self
+                    .available
+                    .iter()
+                    .position(|candidate| candidate == adapter)
+                    .map_or(0, |position| {
+                        (position + if forward { 1 } else { self.available.len() - 1 })
+                            % self.available.len()
+                    });
+                if *adapter != self.available[next] {
+                    *adapter = self.available[next];
+                    *model = None;
+                }
+            }
+            1 | 3 => {
+                let writer = self.selection == 1;
+                self.input = if writer {
+                    settings.writer_model.clone()
+                } else {
+                    settings.critic_model.clone()
+                }
+                .unwrap_or_default();
+                self.cursor = self.input.len();
+                self.screen = if writer {
+                    Screen::WriterModel
+                } else {
+                    Screen::CriticModel
+                };
+            }
+            _ => {
+                settings.orchestration.mode = match settings.orchestration.mode {
+                    OrchestrationMode::Pair => OrchestrationMode::Team,
+                    OrchestrationMode::Team => OrchestrationMode::Pair,
+                };
+            }
+        }
+        Ok(())
+    }
+
+    fn handle_key(&mut self, key: KeyEvent) -> Result<()> {
+        let modifiers = key.modifiers;
+        let ctrl = modifiers.contains(KeyModifiers::CONTROL);
+        if key.kind == KeyEventKind::Release {
+            return Ok(());
+        }
+        let repeat = key.kind == KeyEventKind::Repeat;
+        if repeat
+            && !matches!(
+                key.code,
+                KeyCode::Backspace
+                    | KeyCode::Delete
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Char(_)
+            )
+        {
+            return Ok(());
+        }
+        if matches!(key.code, KeyCode::Char('c')) && ctrl && !repeat {
+            self.should_exit = true;
+            return Ok(());
+        }
+
+        let editing = matches!(
+            self.screen,
+            Screen::Main | Screen::ChooseProject | Screen::WriterModel | Screen::CriticModel
+        );
+        if key.code == KeyCode::Enter {
+            return self.handle_submit();
+        }
+        if key.code == KeyCode::Esc {
+            if self.screen == Screen::Task && !self.input.is_empty() {
+                self.clear_input();
+                return Ok(());
+            }
+            self.screen = match self.screen {
+                Screen::Main if !self.input.is_empty() => Screen::Main,
+                Screen::Main => {
+                    self.active_tab = ActiveTab::Feed;
+                    Screen::Main
+                }
+                Screen::Settings if self.draft.is_some() => {
+                    self.settings = None;
+                    Screen::Review
+                }
+                Screen::Settings => {
+                    self.settings = None;
+                    Screen::Main
+                }
+                Screen::WriterModel | Screen::CriticModel => Screen::Settings,
+                Screen::Review => {
+                    if let Some(draft) = self.draft.take() {
+                        self.input = draft.criteria;
+                        self.cursor = self.input.len();
+                    }
+                    self.screen = Screen::Main;
+                    return Ok(());
+                }
+                Screen::ChooseProject => {
+                    self.clear_input();
+                    return Ok(());
+                }
+                _ => Screen::Main,
+            };
+            self.clear_input();
+            self.status_message = None;
+            return Ok(());
+        }
+
+        if !repeat && self.screen != Screen::ChooseProject {
+            match key.code {
+                KeyCode::F(2) => {
+                    self.clear_input();
+                    self.open_settings();
+                    return Ok(());
+                }
+                KeyCode::F(3) => return self.open_history(None),
+                KeyCode::F(4) => return self.new_session(),
+                _ => {}
+            }
+        }
+
+        if self.screen == Screen::Task && (!self.input.is_empty() || key.code == KeyCode::Char('/'))
+        {
+            self.edit_input(key, repeat);
+            return Ok(());
+        }
+
+        match self.screen {
+            Screen::Settings => match key.code {
+                KeyCode::Up => self.selection = (self.selection + 4) % 5,
+                KeyCode::Down | KeyCode::Tab => self.selection = (self.selection + 1) % 5,
+                KeyCode::Left => self.change_setting(false)?,
+                KeyCode::Right | KeyCode::Char('e' | 'E') if !repeat => {
+                    self.change_setting(true)?
+                }
+                KeyCode::Char('r' | 'R') if !repeat => {
+                    self.available = available_adapters(&self.project);
+                    self.notice("Checked for installed agent CLIs.");
+                }
+                _ => {}
+            },
+            Screen::Review => match key.code {
+                KeyCode::Char('s' | 'S') if !repeat => self.open_settings(),
+                KeyCode::Char('d' | 'D') if !repeat => {
+                    self.active_tab = ActiveTab::Diff;
+                    self.load_git_diff();
+                    self.screen = Screen::Main;
+                    self.notice("Review your changes. Press F5 to return to the task draft.");
+                }
+                KeyCode::Char('r' | 'R') if !repeat => {
+                    self.available = available_adapters(&self.project);
+                    self.refresh_state()?;
+                }
+                KeyCode::Char('u' | 'U') if !repeat => self.execute_slash_command("/resume")?,
+                KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+                KeyCode::Down => self.detail_scroll = self.detail_scroll.saturating_add(1),
+                _ => {}
+            },
+            Screen::History => match key.code {
+                KeyCode::Up => self.selection = self.selection.saturating_sub(1),
+                KeyCode::Down => {
+                    self.selection = (self.selection + 1).min(self.history.len().saturating_sub(1))
+                }
+                KeyCode::PageDown if !repeat && self.history.len() == 50 => {
+                    self.open_history(self.history.last().map(|task| task.id))?;
+                }
+                KeyCode::PageUp if !repeat && self.history_before.is_some() => {
+                    self.open_history(None)?
+                }
+                _ => {}
+            },
+            Screen::Task => match key.code {
+                KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+                KeyCode::Down => self.detail_scroll = self.detail_scroll.saturating_add(1),
+                KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
+                KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(10),
+                KeyCode::End => {
+                    self.detail_scroll = self
+                        .task_details
+                        .lines()
+                        .count()
+                        .saturating_sub(10)
+                        .min(u16::MAX as usize) as u16
+                }
+                KeyCode::Char('s' | 'S')
+                    if !repeat
+                        && self
+                            .active_tasks
+                            .iter()
+                            .any(|task| Some(task.id) == self.task_view) =>
+                {
+                    self.execute_slash_command("/stop")?
+                }
+                KeyCode::Char('r' | 'R')
+                    if !repeat && self.task_status == Some(TaskStatus::Queued) =>
+                {
+                    self.available = available_adapters(&self.project);
+                    self.refresh_state()?;
+                    if let Some(blocker) = self.run_blocker() {
+                        anyhow::bail!("{blocker}");
+                    }
+                    if let Some(id) = self.task_view {
+                        self.start_selected_task(id)?;
+                    }
+                }
+                KeyCode::Char('c' | 'C')
+                    if !repeat
+                        && !self.supervisor_running
+                        && self.task_status == Some(TaskStatus::Queued) =>
+                {
+                    if let Some(id) = self.task_view {
+                        Database::open(&self.project)?.cancel_queued_task(id)?;
+                        self.run_notice = Some(format!("Task #{id} cancelled."));
+                        self.refresh_state()?;
+                    }
+                }
+                _ => {}
+            },
+            _ if editing => self.edit_input(key, repeat),
+            _ => {}
+        }
+        Ok(())
+    }
+
+    fn edit_input(&mut self, key: KeyEvent, repeat: bool) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let main = self.screen == Screen::Main;
+        let previous = self.input[..self.cursor]
+            .char_indices()
+            .next_back()
+            .map_or(0, |(index, _)| index);
+        let next = self.input[self.cursor..]
+            .chars()
+            .next()
+            .map_or(self.cursor, |ch| self.cursor + ch.len_utf8());
+        match key.code {
+            KeyCode::Backspace | KeyCode::Char('w')
+                if alt || (key.code == KeyCode::Char('w') && ctrl) =>
+            {
+                let prefix = self.input[..self.cursor].trim_end();
+                let start = prefix.rfind(char::is_whitespace).map_or(0, |index| {
+                    index + prefix[index..].chars().next().map_or(0, char::len_utf8)
+                });
+                self.input.drain(start..self.cursor);
+                self.cursor = start;
+            }
+            KeyCode::Char('u') if ctrl => self.clear_input(),
+            KeyCode::Backspace => {
+                self.input.drain(previous..self.cursor);
+                self.cursor = previous;
+            }
+            KeyCode::Delete => {
+                self.input.drain(self.cursor..next);
+            }
+            KeyCode::Left => self.cursor = previous,
+            KeyCode::Right => self.cursor = next,
+            KeyCode::Home if !main || !self.input.is_empty() => self.cursor = 0,
+            KeyCode::End if !main || !self.input.is_empty() => self.cursor = self.input.len(),
+            KeyCode::F(5) if main && self.draft.is_some() => self.screen = Screen::Review,
+            KeyCode::Tab if main && self.input.is_empty() && !repeat => {
+                self.active_tab = self.active_tab.next();
+                if self.active_tab == ActiveTab::Diff {
+                    self.load_git_diff();
+                }
+            }
+            KeyCode::Tab if main => {
+                self.complete_input();
+                self.cursor = self.input.len();
+            }
+            KeyCode::Char(ch @ '1'..='4')
+                if main && self.input.is_empty() && !repeat && !alt && !ctrl =>
+            {
+                self.active_tab = [
+                    ActiveTab::Feed,
+                    ActiveTab::Dialogue,
+                    ActiveTab::Diff,
+                    ActiveTab::Audit,
+                ][ch as usize - '1' as usize];
+                if self.active_tab == ActiveTab::Diff {
+                    self.load_git_diff();
+                }
+            }
+            KeyCode::Up if main && alt && self.active_tab == ActiveTab::Diff => {
+                self.diff_file_index = self.diff_file_index.saturating_sub(1);
+                self.load_git_diff();
+            }
+            KeyCode::Down if main && alt && self.active_tab == ActiveTab::Diff => {
+                self.diff_file_index =
+                    (self.diff_file_index + 1).min(self.modified_files.len().saturating_sub(1));
+                self.load_git_diff();
+            }
+            KeyCode::Up if main => self.scroll_offset = self.scroll_offset.saturating_add(1),
+            KeyCode::Down if main => self.scroll_offset = self.scroll_offset.saturating_sub(1),
+            KeyCode::PageUp if main => self.scroll_offset = self.scroll_offset.saturating_add(5),
+            KeyCode::PageDown if main => self.scroll_offset = self.scroll_offset.saturating_sub(5),
+            KeyCode::Home if main => self.scroll_offset = usize::MAX,
+            KeyCode::End if main => self.scroll_offset = 0,
+            KeyCode::Char(ch) if !ctrl && !alt && !ch.is_control() && self.input.len() < 8_000 => {
+                self.input.insert(self.cursor, ch);
+                self.cursor += ch.len_utf8();
+            }
+            _ => {}
+        }
+    }
+
+    fn paste(&mut self, text: &str) {
+        if !matches!(
+            self.screen,
+            Screen::Main | Screen::ChooseProject | Screen::WriterModel | Screen::CriticModel
+        ) {
+            return;
+        }
+        let remaining = 8_000_usize.saturating_sub(self.input.len());
+        let clean: String = text
+            .chars()
+            .filter(|ch| !ch.is_control() || matches!(*ch, '\n' | '\t'))
+            .collect();
+        let clean = &clean[..clean.floor_char_boundary(remaining.min(clean.len()))];
+        let single_line = clean.replace(['\n', '\t'], " ");
+        let text = if self.screen == Screen::Main {
+            clean
+        } else {
+            &single_line
+        };
+        self.input.insert_str(self.cursor, text);
+        self.cursor += text.len();
+    }
+}
+
 pub async fn run_tui(project: Project) -> Result<()> {
     ensure_talos_ignored(&project)?;
-
-    // Setup terminal
+    let mut app = TuiApp::new(project)?;
     enable_raw_mode().context("Failed to enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).context("Failed to enter alternate screen")?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).context("Failed to initialize terminal")?;
-
-    let mut app = TuiApp::new(project)?;
-    let mut last_tick = Instant::now();
-    let tick_rate = Duration::from_millis(250);
-
-    let res = run_app_loop(&mut terminal, &mut app, tick_rate, &mut last_tick).await;
-
-    // Restore terminal
+    if let Err(error) = execute!(stdout, EnterAlternateScreen, EnableBracketedPaste) {
+        let _ = disable_raw_mode();
+        return Err(error.into());
+    }
+    let mut terminal = match Terminal::new(CrosstermBackend::new(stdout)) {
+        Ok(terminal) => terminal,
+        Err(error) => {
+            let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
+            let _ = disable_raw_mode();
+            return Err(error.into());
+        }
+    };
+    let result = run_app_loop(&mut terminal, &mut app).await;
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
-
-    res
+    result
 }
 
 async fn run_app_loop(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut TuiApp,
-    tick_rate: Duration,
-    last_tick: &mut Instant,
 ) -> Result<()> {
-    loop {
-        if app.should_exit {
-            return Ok(());
-        }
-
-        terminal.draw(|f| ui(f, app))?;
-
-        let timeout = tick_rate
-            .checked_sub(last_tick.elapsed())
-            .unwrap_or_else(|| Duration::from_millis(0));
-
-        if crossterm::event::poll(timeout)?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            match key.code {
-                KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    return Ok(());
-                }
-                KeyCode::Char('q')
-                    if app.input.is_empty() && !key.modifiers.contains(KeyModifiers::CONTROL) =>
-                {
-                    return Ok(());
-                }
-                KeyCode::Tab => {
-                    if app.input.is_empty() {
-                        app.active_tab = app.active_tab.next();
-                        if app.active_tab == ActiveTab::Diff {
-                            app.load_git_diff();
-                        }
-                    } else {
-                        app.complete_input();
+    let mut last_tick = Instant::now();
+    let tick_rate = Duration::from_millis(300);
+    while !app.should_exit {
+        terminal.draw(|frame| ui(frame, app))?;
+        if event::poll(tick_rate.saturating_sub(last_tick.elapsed()))? {
+            match event::read()? {
+                Event::Key(key) => {
+                    if let Err(error) = app.handle_key(key) {
+                        app.notice(crate::secrets::redact_sensitive(&format!("{error:#}")));
                     }
                 }
-                KeyCode::Char('s') if app.active_tab == ActiveTab::Diff && app.input.is_empty() => {
-                    let _ = app.stage_selected_file();
-                }
-                KeyCode::Char('d') if app.active_tab == ActiveTab::Diff && app.input.is_empty() => {
-                    let _ = app.discard_selected_file();
-                }
-                KeyCode::Char('r') if app.active_tab == ActiveTab::Diff && app.input.is_empty() => {
-                    app.load_git_diff();
-                    app.status_message = Some(("Git diff reloaded.".to_string(), Instant::now()));
-                }
-                KeyCode::Char('j') if app.active_tab == ActiveTab::Diff && app.input.is_empty() => {
-                    if !app.modified_files.is_empty() {
-                        app.diff_file_index = (app.diff_file_index + 1)
-                            .min(app.modified_files.len().saturating_sub(1));
-                    }
-                }
-                KeyCode::Char('k') if app.active_tab == ActiveTab::Diff && app.input.is_empty() => {
-                    app.diff_file_index = app.diff_file_index.saturating_sub(1);
-                }
-                KeyCode::Char('1') if app.input.is_empty() => {
-                    app.active_tab = ActiveTab::Feed;
-                }
-                KeyCode::Char('2') if app.input.is_empty() => {
-                    app.active_tab = ActiveTab::Dialogue;
-                }
-                KeyCode::Char('3') if app.input.is_empty() => {
-                    app.active_tab = ActiveTab::Diff;
-                    app.load_git_diff();
-                }
-                KeyCode::Char('4') if app.input.is_empty() => {
-                    app.active_tab = ActiveTab::Audit;
-                }
-                KeyCode::Enter => {
-                    let _ = app.handle_submit();
-                }
-                KeyCode::Backspace => {
-                    app.input.pop();
-                }
-                KeyCode::Esc => {
-                    app.input.clear();
-                }
-                KeyCode::Up => {
-                    app.scroll_offset = app.scroll_offset.saturating_add(1);
-                }
-                KeyCode::Down => {
-                    app.scroll_offset = app.scroll_offset.saturating_sub(1);
-                }
-                KeyCode::PageUp => {
-                    app.scroll_offset = app.scroll_offset.saturating_add(5);
-                }
-                KeyCode::PageDown => {
-                    app.scroll_offset = app.scroll_offset.saturating_sub(5);
-                }
-                KeyCode::Home => {
-                    app.scroll_offset = usize::MAX;
-                }
-                KeyCode::End => {
-                    app.scroll_offset = 0;
-                }
-                KeyCode::Char(c) => {
-                    app.input.push(c);
-                }
+                Event::Paste(text) => app.paste(&text),
                 _ => {}
             }
         }
-
         if last_tick.elapsed() >= tick_rate {
-            let _ = app.refresh_state();
-            *last_tick = Instant::now();
+            if let Err(error) = app.refresh_state() {
+                app.notice(crate::secrets::redact_sensitive(&format!("{error:#}")));
+            }
+            last_tick = Instant::now();
         }
     }
+    Ok(())
 }
 
 fn ui(frame: &mut Frame, app: &TuiApp) {
     let size = frame.area();
+    if app.screen != Screen::Main {
+        render_workflow(frame, app, size);
+        return;
+    }
 
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -1160,7 +1824,8 @@ fn ui(frame: &mut Frame, app: &TuiApp) {
             ), // Alerts banner
             Constraint::Length(3), // Tabs navigation bar
             Constraint::Min(8),    // Active Tab View Content
-            Constraint::Length(3), // Input bar
+            Constraint::Length(4), // Input bar
+            Constraint::Length(if app.status_message.is_some() { 2 } else { 0 }),
         ])
         .split(size);
 
@@ -1180,6 +1845,166 @@ fn ui(frame: &mut Frame, app: &TuiApp) {
     }
 
     render_input(frame, app, chunks[4]);
+    if let Some((message, _)) = &app.status_message {
+        frame.render_widget(
+            Paragraph::new(message.as_str()).wrap(Wrap { trim: true }),
+            chunks[5],
+        );
+    }
+}
+
+fn render_workflow(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let editing = matches!(
+        app.screen,
+        Screen::ChooseProject | Screen::WriterModel | Screen::CriticModel | Screen::Task
+    );
+    let chunks = Layout::vertical([
+        Constraint::Length(3),
+        Constraint::Min(4),
+        Constraint::Length(if editing { 4 } else { 0 }),
+        Constraint::Length(4),
+    ])
+    .split(area);
+    let (title, body, actions) = match app.screen {
+        Screen::ChooseProject => (
+            "Choose project",
+            "Enter the path to an existing Git project. If you have just installed TALOS, you can also open a terminal inside your project and run talos there.".into(),
+            "Enter  Open project   Esc  Clear path".to_owned(),
+        ),
+        Screen::Settings => {
+            let config = app.settings.as_ref().unwrap_or(&app.config);
+            let writer = adapter_label(config.writer, &app.available);
+            let critic = adapter_label(config.critic, &app.available);
+            let rows = [
+                format!("Writes code        {writer}"),
+                format!("Writer model       {}", config.writer_model.as_deref().unwrap_or("CLI default")),
+                format!("Reviews changes    {critic}"),
+                format!("Reviewer model     {}", config.critic_model.as_deref().unwrap_or("CLI default")),
+                format!("Mode               {}", match config.orchestration.mode {
+                    OrchestrationMode::Pair => "Pair · write, review, verify",
+                    OrchestrationMode::Team => "Team · parallel writers and review",
+                }),
+            ];
+            let mut body = rows.iter().enumerate().map(|(index, row)| {
+                format!("{} {row}", if index == app.selection { ">" } else { " " })
+            }).collect::<Vec<_>>().join("\n");
+            let discovered = app.available.iter().map(|adapter| adapter.as_str()).collect::<Vec<_>>().join(", ");
+            if discovered.is_empty() {
+                body.push_str("\n\nNo compatible agent CLI found. Install one of these tools, then press R:\ncodex, claude, agy, opencode, pi, omp, kilo.");
+            } else {
+                body.push_str(&format!("\n\nFound locally: {discovered}\nSign in or configure credentials in the agent's own CLI if required."));
+            }
+            ("Settings", body, "↑ ↓  Select   ← →  Change / edit   Enter  Save   R  Check again   Esc  Back".to_owned())
+        }
+        Screen::WriterModel | Screen::CriticModel => (
+            if app.screen == Screen::WriterModel { "Writer model" } else { "Reviewer model" },
+            "Enter a model name supported by this CLI. Leave the field empty to use the CLI default.".into(),
+            "Enter  Apply   Esc  Back".to_owned(),
+        ),
+        Screen::Review => {
+            let Some(draft) = &app.draft else { return; };
+            let config = &draft.config;
+            let checks = if config.checks.is_empty() {
+                "No project checks configured".to_owned()
+            } else {
+                config.checks.iter().map(|check| format!("{} · {}", check.id, check.argv.join(" ")))
+                    .collect::<Vec<_>>().join("\n")
+            };
+            let mut body = format!(
+                "Writes code   {} ({})\nReviews       {} ({})\nMode          {}\nChecks        {}\n\n{}",
+                config.writer.as_str(), config.writer_model.as_deref().unwrap_or("CLI default"),
+                config.critic.as_str(), config.critic_model.as_deref().unwrap_or("CLI default"),
+                config.orchestration.mode.as_str(), checks, draft.criteria
+            );
+            let actions = if let Some(blocker) = app.run_blocker() {
+                body = format!("{blocker}\n\n{body}");
+                "Esc  Edit   S  Settings   D  View changes   R  Check again   U  Resume queue"
+            } else {
+                "Enter  Run task   Esc  Edit   S  Settings"
+            };
+            ("Review task", body, actions.to_owned())
+        }
+        Screen::History => {
+            let body = if app.history.is_empty() {
+                "No tasks on this page. Press F4 to start a new task or Page Up for the latest tasks.".to_owned()
+            } else {
+                let visible = usize::from(chunks[1].height).saturating_sub(2).max(1);
+                let start = app.selection.saturating_add(1).saturating_sub(visible);
+                app.history.iter().enumerate().skip(start).take(visible).map(|(index, task)| {
+                    let title = task.title.lines().next().unwrap_or_default();
+                    format!("{} #{} · {} · {}", if index == app.selection { ">" } else { " " }, task.id, task.status.as_str(), title)
+                }).collect::<Vec<_>>().join("\n")
+            };
+            ("History", body, "↑ ↓  Select   Enter  Open result   PgDn  Older   PgUp  Latest   F4  New session   Esc  Back".to_owned())
+        }
+        Screen::Task => {
+            let hint = if app.supervisor_running {
+                if app.active_tasks.iter().any(|task| Some(task.id) == app.task_view) {
+                    "Running   S  Request stop for Writer   ↑ ↓  Scroll   F3  History"
+                } else {
+                    "Starting or another task is running   ↑ ↓  Scroll   F3  History"
+                }
+            } else if app.task_status == Some(TaskStatus::Queued) {
+                "R  Retry   C  Cancel queued task   F2  Settings   F3  History   F4  New session"
+            } else if !app.active_tasks.is_empty() {
+                "An unfinished task needs attention   ↑ ↓  Scroll   F3  History"
+            } else {
+                "F4  New session   F3  History   ↑ ↓  Scroll result   Esc  Back"
+            };
+            let body = if let Some(note) = &app.run_notice {
+                format!("{note}\n\n{}", app.task_details)
+            } else {
+                app.task_details.clone()
+            };
+            ("Task result", body, hint.to_owned())
+        }
+        Screen::Main => unreachable!(),
+    };
+    let project = app.project.root.display();
+    frame.render_widget(
+        Paragraph::new(format!("{title} · {project}")).block(Block::bordered()),
+        chunks[0],
+    );
+    let body = safe_display(&body);
+    let body = Paragraph::new(body)
+        .wrap(Wrap { trim: false })
+        .block(Block::bordered());
+    let body = if matches!(app.screen, Screen::Task | Screen::Review) {
+        body.scroll((app.detail_scroll, 0))
+    } else {
+        body
+    };
+    frame.render_widget(body, chunks[1]);
+    if editing {
+        render_input(frame, app, chunks[2]);
+    }
+    let message = app
+        .status_message
+        .as_ref()
+        .map(|(message, _)| message.as_str())
+        .unwrap_or("");
+    frame.render_widget(
+        Paragraph::new(format!("{actions}\n{message}")).wrap(Wrap { trim: true }),
+        chunks[3],
+    );
+}
+
+fn adapter_label(adapter: AdapterKind, available: &[AdapterKind]) -> String {
+    format!(
+        "{} · {}",
+        adapter.as_str(),
+        if available.contains(&adapter) {
+            "found"
+        } else {
+            "unavailable"
+        }
+    )
+}
+
+fn safe_display(text: &str) -> String {
+    text.chars()
+        .filter(|ch| !ch.is_control() || matches!(*ch, '\n' | '\t'))
+        .collect()
 }
 
 fn render_header(frame: &mut Frame, app: &TuiApp, area: Rect) {
@@ -1288,10 +2113,12 @@ fn render_alerts(frame: &mut Frame, app: &TuiApp, area: Rect) {
     if !app.dirty_paths.is_empty() {
         alert_spans.push(Span::styled(
             format!(
-                " ⚠️ Warning: {} uncommitted file(s) in repository. Type '/commit <msg>' to clean before worktree execution! ",
+                " {} uncommitted path(s). Press 3 to view changes before running a task. ",
                 app.dirty_paths.total_count
             ),
-            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
         ));
     }
 
@@ -1374,7 +2201,7 @@ fn render_cockpit_sidebar(frame: &mut Frame, app: &TuiApp, area: Rect) {
 
     let agent_lines = vec![
         Line::from(vec![
-            Span::styled("Writer: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Writes: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 writer_profile,
                 Style::default()
@@ -1387,7 +2214,7 @@ fn render_cockpit_sidebar(frame: &mut Frame, app: &TuiApp, area: Rect) {
             ),
         ]),
         Line::from(vec![
-            Span::styled("Critic: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Reviews: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
                 critic_profile,
                 Style::default()
@@ -1406,15 +2233,19 @@ fn render_cockpit_sidebar(frame: &mut Frame, app: &TuiApp, area: Rect) {
                 Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!(
-                    " (max {} workers)",
-                    app.config.orchestration.max_writer_workers
-                ),
+                if app.config.orchestration.mode == OrchestrationMode::Team {
+                    format!(
+                        " (max {} workers)",
+                        app.config.orchestration.max_writer_workers
+                    )
+                } else {
+                    String::new()
+                },
                 Style::default().fg(Color::DarkGray),
             ),
         ]),
         Line::from(Span::styled(
-            "Tip: Use /cli <name> to switch",
+            "F2 Settings · F4 New session",
             Style::default().fg(Color::DarkGray),
         )),
     ];
@@ -1439,7 +2270,7 @@ fn render_cockpit_sidebar(frame: &mut Frame, app: &TuiApp, area: Rect) {
         };
 
         let title_clean = if task.title.len() > 30 {
-            format!("{}...", &task.title[..27])
+            format!("{}...", &task.title[..task.title.floor_char_boundary(27)])
         } else {
             task.title.clone()
         };
@@ -1658,7 +2489,10 @@ fn build_unified_feed_lines(app: &TuiApp) -> Vec<Line<'static>> {
         };
 
         let reason_clean = if event.reason.len() > 72 {
-            format!("{}...", &event.reason[..69])
+            format!(
+                "{}...",
+                &event.reason[..event.reason.floor_char_boundary(69)]
+            )
         } else {
             event.reason.clone()
         };
@@ -1935,7 +2769,7 @@ fn render_diff_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
 
         let files_block = Block::default()
             .borders(Borders::ALL)
-            .title(" 📂 Modified Files (Keys: 'j'/'k' Navigate | 's' Stage | 'd' Discard | 'r' Reload) ")
+            .title(" Changed files · Alt+↑/↓ select · F5 back to task draft ")
             .border_style(Style::default().fg(Color::Yellow));
 
         frame.render_widget(List::new(file_items).block(files_block), chunks[0]);
@@ -2010,7 +2844,7 @@ fn render_audit_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
             "No automated verification checks configured for this project.",
             Style::default().fg(Color::DarkGray),
         )));
-        lines.push(Line::from(Span::styled("Tip: Add checks with /config set checks '[{\"id\":\"test\",\"argv\":[\"cargo\",\"test\"]}]'", Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled("In a shell, configure checks with talos config set checks '[{\"id\":\"test\",\"argv\":[\"cargo\",\"test\"]}]'", Style::default().fg(Color::DarkGray))));
     } else {
         for (i, check) in app.verification_checks.iter().enumerate() {
             lines.push(Line::from(vec![
@@ -2039,35 +2873,51 @@ fn render_audit_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
 }
 
 fn render_input(frame: &mut Frame, app: &TuiApp, area: Rect) {
-    let title = if let Some((ref msg, _)) = app.status_message {
-        format!(" Notice: {msg} ")
-    } else {
-        " Type task or command: /stop, /pause, /resume, /diff, /commit, /exit, /help | Tabs: [1-4] "
-            .to_string()
+    let title = match app.screen {
+        Screen::ChooseProject => " Project folder ",
+        Screen::Task => " /new New session · /config Settings · /history History ",
+        Screen::WriterModel | Screen::CriticModel => " Model name ",
+        _ if !app.available.contains(&app.config.writer)
+            || !app.available.contains(&app.config.critic) =>
+        {
+            " F2 Set up agents · F3 History · F4 New session "
+        }
+        _ => {
+            " Describe task · Enter Review · F2 Settings · F3 History · F4 New session · Esc Clear input "
+        }
     };
-
-    let input_line = Line::from(vec![
-        Span::styled(
-            "> ",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(&app.input, Style::default().fg(Color::White)),
-        Span::styled(
-            "█",
-            Style::default()
-                .fg(Color::Cyan)
-                .add_modifier(Modifier::SLOW_BLINK),
-        ),
-    ]);
-
-    let input_block = Block::default()
-        .borders(Borders::ALL)
-        .title(title)
-        .border_style(Style::default().fg(Color::Cyan));
-
-    frame.render_widget(Paragraph::new(input_line).block(input_block), area);
+    let before = &app.input[..app.cursor];
+    let after = &app.input[app.cursor..];
+    let mut lines: Vec<Line<'_>> = before.split('\n').map(Line::raw).collect();
+    let cursor_line = lines.last_mut().expect("split always has a line");
+    let mut suffix = after.split('\n');
+    let tail = suffix.next().unwrap_or_default();
+    let next = tail.chars().next().map_or(0, char::len_utf8);
+    let cursor_style = Style::default()
+        .fg(Color::Cyan)
+        .add_modifier(Modifier::REVERSED);
+    cursor_line.spans.push(Span::styled(
+        if next == 0 { " " } else { &tail[..next] },
+        cursor_style,
+    ));
+    cursor_line.spans.push(Span::raw(&tail[next..]));
+    let row = lines.len() - 1;
+    lines.extend(suffix.map(Line::raw));
+    let row_offset = row.saturating_sub(1);
+    let column = Line::raw(before.rsplit('\n').next().unwrap_or_default()).width();
+    let horizontal = column
+        .saturating_add(1)
+        .saturating_sub(area.width.saturating_sub(2) as usize);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .scroll((row_offset as u16, horizontal as u16))
+            .block(
+                Block::bordered()
+                    .title(title)
+                    .border_style(Style::default().fg(Color::Cyan)),
+            ),
+        area,
+    );
 }
 
 fn longest_common_prefix(strings: &[String]) -> String {
@@ -2077,13 +2927,16 @@ fn longest_common_prefix(strings: &[String]) -> String {
     let first = &strings[0];
     let mut len = 0;
     for (i, c) in first.char_indices() {
-        if strings.iter().all(|s| s[i..].starts_with(c)) {
+        if strings
+            .iter()
+            .all(|s| s.get(i..).is_some_and(|rest| rest.starts_with(c)))
+        {
             len += c.len_utf8();
         } else {
             break;
         }
     }
-    first[..len].to_string()
+    first[..first.floor_char_boundary(len)].to_string()
 }
 
 #[cfg(test)]
@@ -2231,37 +3084,21 @@ mod tests {
         let (msg, _) = app.status_message.as_ref().unwrap();
         assert!(msg.contains("Usage: /task:test"));
 
-        // 5. Task presets create enqueued tasks with clear criteria
-        app.execute_slash_command("/task:test src/calc.rs")
-            .expect("execute /task:test");
-        let (msg, _) = app.status_message.as_ref().unwrap();
-        assert!(msg.contains("Preset Task #"));
-        assert!(msg.contains("calc.rs"));
-
-        app.execute_slash_command("/task:refactor src/storage.rs")
-            .expect("execute /task:refactor");
-        let (msg, _) = app.status_message.as_ref().unwrap();
-        assert!(msg.contains("storage.rs"));
-
-        app.execute_slash_command("/task:fix src/parser.rs")
-            .expect("execute /task:fix");
-        let (msg, _) = app.status_message.as_ref().unwrap();
-        assert!(msg.contains("parser.rs"));
-
-        app.execute_slash_command("/task:bench src/engine.rs")
-            .expect("execute /task:bench");
-        let (msg, _) = app.status_message.as_ref().unwrap();
-        assert!(msg.contains("engine.rs"));
-
-        // Verify tasks in database
+        for (command, path) in [
+            ("/task:test src/calc.rs", "calc.rs"),
+            ("/task:refactor src/storage.rs", "storage.rs"),
+            ("/task:fix src/parser.rs", "parser.rs"),
+            ("/task:bench src/engine.rs", "engine.rs"),
+        ] {
+            app.execute_slash_command(command)
+                .expect("prepare preset draft");
+            let draft = app.draft.as_ref().expect("draft");
+            assert!(draft.title.contains(path));
+            assert!(draft.criteria.contains(path));
+            assert_eq!(app.screen, Screen::Review);
+        }
         let database = Database::open(&project).expect("open db");
-        let tasks = database.list_tasks().expect("list tasks");
-        assert_eq!(tasks.len(), 4);
-        assert!(tasks[0].title.contains("calc.rs"));
-        assert!(tasks[0].acceptance_criteria.contains("calc.rs"));
-        assert!(tasks[1].title.contains("storage.rs"));
-        assert!(tasks[2].title.contains("parser.rs"));
-        assert!(tasks[3].title.contains("engine.rs"));
+        assert!(database.list_tasks().expect("list tasks").is_empty());
 
         let _ = std::fs::remove_dir_all(&project.root);
     }

@@ -483,3 +483,9 @@ No schema change for process identity is selected or implemented. The separate s
      - Detect identical patch hashes and stagnant verification errors between successive fix rounds to halt futile loops early, saving tokens and operator time.
 - **Reason:** user feedback on the comprehensive system audit confirmed 85–90% alignment, with explicit guidance to preserve architectural authority during debate, prevent loss of long context, avoid rigid team selection rules, verify verification failure handling by test, and avoid overengineering.
 - **Consequence:** these guidelines govern Round 17 implementation. Existing core subsystems (SQLite, adapters, worktrees, TUI) remain unchanged.
+
+## ADR-051 — Guided first run and task sessions
+
+- **Decision:** The cockpit shows project readiness, role settings, a reviewable task draft, and task history. Confirmation dispatches only the selected task. A new cockpit session clears the draft and feed, keeps project settings and durable history, and never resumes a previous provider conversation implicitly.
+- **Invariants:** Automatic startup and reports leave tracked project files untouched. Existing dirty paths still block a new run. Queue cancellation and dispatch must remain consistent under concurrent processes. A CLI found locally does not prove authentication. Release automation proposes tap changes only after the release binaries exist.
+- **Failure cases:** Show missing tools, invalid project state, checkout changes, launch failures, and failed checks with an action the operator can take. A failed start keeps the queued task available for an explicit retry or cancellation.
