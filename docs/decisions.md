@@ -412,3 +412,23 @@ No schema change for process identity is selected or implemented. The separate s
   2. **Token Economy Truncation:** Large error outputs and compiler logs are truncated via `src/summary.rs::truncate_for_token_economy` to a bounded 4096-byte budget preserving head and tail diagnostic context, preventing token blowups in agent prompts.
   3. **Non-Intrusive Artifact Generation:** Written only on successful verification; failures remain recorded in SQLite without cluttering the project workspace with incomplete artifacts.
 - **Verification:** unit tests for token truncation head/tail boundaries and small-string bypass; live verification across `run_team_task` and `run_pair_task`.
+
+## ADR-048 — Dynamic CLI Adapter Selection (/cli) and Unified Feed Cockpit Redesign
+
+- **Status:** implemented and verified in R15.
+- **Decision:** provide immediate, ergonomic CLI adapter switching in both interactive TUI (`/cli <name>` with Russian aliases) and headless/batch commands (`--cli <name>` flag), and redesign the primary TUI view from fragmented cards into a responsive, live-streaming Unified Feed.
+- **Architecture and Invariants:**
+  1. **Dynamic Adapter Pass-Through:**
+     - In TUI command line: `/cli` inspects active adapters and valid options; `/cli <name>` sets both Writer and Critic to `<name>` and persists to `.talos/config.json`; `/cli <writer> <critic>` sets distinct roles. Supported aliases: `/кли`, `/adapter`, `/адаптер`.
+     - Global CLI flag: `--cli <name>` on `talos` overrides the active adapter and persists to `.talos/config.json`.
+     - Subcommand: `talos config set cli <name>` supported.
+  2. **Unified Feed Cockpit Architecture:**
+     - The primary screen (`ActiveTab::Feed`, " 1: Unified Feed ") replaces the old fragmented overview.
+     - Responsive layout: On wide viewports (>= 100 cols), provides a 34-col Cockpit Sidebar (AI Agents card, Active Task card, Queue & Repo card) alongside a prominent live Unified Feed. On narrow viewports, switches to a compact 7-row header summary.
+     - Merged event stream: Interleaves supervisor logs (streaming planning, subtask breakdown, worker assignments, test runs, rate limit countdowns) and SQLite milestone events (`task.created`, `task.transition`, `writer.started`, `critic.review`, `rate_limit_backoff`, `worktree.created`, `worktree.integrated`).
+     - Distinct color-coded badges: `[PHASE]`, `[WRITER]`, `[CRITIC]`, `[SUPERVISOR]`, `[TASK #N]`, `[VERIFY]`, `[RATE-LIMIT]`, `[WORKTREE]`, `[GIT]`, `[ERROR]`, `[SYS]`.
+  3. **Auto-Scroll & Manual Navigation Engine:**
+     - When `scroll_offset == 0`, view remains pinned to the bottom (live auto-scroll mode) as new logs arrive.
+     - Scrolling up (`Up`, `PageUp`, `Home`) engages manual history inspection, updating the title indicator to `"Viewing earlier lines: -N | Press 'End' to resume"`.
+     - Pressing `End` or scrolling down to the bottom snaps back to live stream auto-scroll.
+- **Verification:** automated CLI parsing tests (`cli_flag_parses_global_adapter_override`), TUI slash command tests (`tui_cli_slash_commands_and_feed`), tab title & navigation tests (`active_tab_navigation_and_titles`), and full verification profile `./scripts/verify-project.sh` clean.

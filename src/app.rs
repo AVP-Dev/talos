@@ -169,6 +169,19 @@ pub async fn run(cli: Cli) -> Result<()> {
     let working_directory = env::current_dir().context("Cannot read current directory")?;
     let project = Project::discover(&working_directory)?;
 
+    if let Some(cli_name) = &cli.cli {
+        let adapter = crate::adapter::AdapterId::parse(cli_name).ok_or_else(|| {
+            anyhow::anyhow!(
+                "Unknown CLI adapter '{cli_name}'. Valid adapters: agy, codex, claude, omp, pi, kilo, opencode"
+            )
+        })?;
+        if let Ok(mut cfg) = ProjectConfig::load(&project) {
+            cfg.writer = adapter;
+            cfg.critic = adapter;
+            let _ = cfg.save(&project);
+        }
+    }
+
     if let Command::Github(arguments) = &command {
         match &arguments.command {
             GithubCommand::Policy => {
@@ -1092,6 +1105,15 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 Some(ConfigCommand::Set { key, value }) => {
                     match key.to_ascii_lowercase().as_str() {
+                        "cli" => {
+                            let adapter = crate::adapter::AdapterId::parse(&value).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Unknown CLI adapter '{value}'. Supported adapters: agy, codex, claude, omp, pi, kilo, opencode"
+                                )
+                            })?;
+                            config.writer = adapter;
+                            config.critic = adapter;
+                        }
                         "writer" => {
                             let adapter = crate::adapter::AdapterId::parse(&value).ok_or_else(|| {
                                 anyhow::anyhow!(
@@ -1136,7 +1158,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                             config.checks = checks;
                         }
                         _ => bail!(
-                            "Unknown config key '{key}'. Supported keys: writer, critic, mode, max-writers, checks"
+                            "Unknown config key '{key}'. Supported keys: cli, writer, critic, mode, max-writers, checks"
                         ),
                     }
                     config.save(&project)?;

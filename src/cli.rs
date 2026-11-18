@@ -16,6 +16,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub tmux: bool,
 
+    /// Override the active AI CLI adapter (agy, codex, claude, omp, pi, kilo, opencode).
+    #[arg(long, global = true)]
+    pub cli: Option<String>,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
@@ -651,6 +655,16 @@ mod tests {
         };
         assert_eq!(key, "writer");
         assert_eq!(value, "codex");
+    }
+
+    #[test]
+    fn cli_flag_parses_global_adapter_override() {
+        let cli = Cli::try_parse_from(["talos", "--cli", "codex"]).expect("parse --cli flag");
+        assert_eq!(cli.cli.as_deref(), Some("codex"));
+
+        let cli_up = Cli::try_parse_from(["talos", "--cli", "claude", "up", "--auto"])
+            .expect("parse --cli with up auto");
+        assert_eq!(cli_up.cli.as_deref(), Some("claude"));
     }
 }
 

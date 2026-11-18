@@ -34,7 +34,7 @@ use crate::{
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ActiveTab {
-    Overview = 0,
+    Feed = 0,
     Dialogue = 1,
     Diff = 2,
     Audit = 3,
@@ -43,7 +43,7 @@ pub enum ActiveTab {
 impl ActiveTab {
     pub fn title(self) -> &'static str {
         match self {
-            Self::Overview => " 1: Overview ",
+            Self::Feed => " 1: Unified Feed ",
             Self::Dialogue => " 2: Dialogue & Review ",
             Self::Diff => " 3: Git Diff ",
             Self::Audit => " 4: Audit & Checks ",
@@ -52,10 +52,10 @@ impl ActiveTab {
 
     pub fn next(self) -> Self {
         match self {
-            Self::Overview => Self::Dialogue,
+            Self::Feed => Self::Dialogue,
             Self::Dialogue => Self::Diff,
             Self::Diff => Self::Audit,
-            Self::Audit => Self::Overview,
+            Self::Audit => Self::Feed,
         }
     }
 }
@@ -108,7 +108,7 @@ impl TuiApp {
         let mut app = Self {
             project,
             config,
-            active_tab: ActiveTab::Overview,
+            active_tab: ActiveTab::Feed,
             input: String::new(),
             status_message: None,
             scroll_offset: 0,
@@ -213,7 +213,7 @@ impl TuiApp {
                 .map_while(Result::ok)
                 .filter(|l| !l.trim().is_empty())
                 .collect();
-            let start = lines.len().saturating_sub(25);
+            let start = lines.len().saturating_sub(500);
             self.supervisor_logs = lines[start..].to_vec();
         }
     }
@@ -276,12 +276,82 @@ impl TuiApp {
         match cmd.as_str() {
             "/help" | "/помощь" | "/справка" => {
                 self.status_message = Some((
-                    "Commands: /stop, /pause, /resume, /run, /commit <msg>, /diff, /dialogue, /audit, /writer, /critic, /model, /mode, /exit".to_string(),
+                    "Commands: /cli <name>, /stop, /pause, /resume, /run, /commit <msg>, /feed, /diff, /dialogue, /audit, /writer, /critic, /model, /mode, /exit".to_string(),
                     Instant::now(),
                 ));
             }
-            "/overview" | "/обзор" => {
-                self.active_tab = ActiveTab::Overview;
+            "/feed" | "/фид" | "/лента" | "/overview" | "/обзор" => {
+                self.active_tab = ActiveTab::Feed;
+            }
+            "/cli" | "/кли" | "/adapter" | "/адаптер" => {
+                let tokens: Vec<&str> = arg.split_whitespace().collect();
+                if tokens.is_empty() {
+                    self.status_message = Some((
+                        format!(
+                            "Current CLI: Writer='{}', Critic='{}'. Valid: agy, codex, claude, omp, pi, kilo, opencode. Use /cli <name> to set both.",
+                            self.config.writer.as_str(),
+                            self.config.critic.as_str()
+                        ),
+                        Instant::now(),
+                    ));
+                } else if tokens.len() == 1 {
+                    if let Some(adapter) = AdapterKind::parse(tokens[0]) {
+                        self.config.writer = adapter;
+                        self.config.critic = adapter;
+                        self.config.save(&self.project)?;
+                        self.status_message = Some((
+                            format!(
+                                "Active CLI adapter updated to: {} (Writer & Critic)",
+                                adapter.as_str()
+                            ),
+                            Instant::now(),
+                        ));
+                    } else {
+                        self.status_message = Some((
+                            format!(
+                                "Unknown adapter '{}'. Valid adapters: agy, codex, claude, omp, pi, kilo, opencode",
+                                tokens[0]
+                            ),
+                            Instant::now(),
+                        ));
+                    }
+                } else {
+                    let w_opt = AdapterKind::parse(tokens[0]);
+                    let c_opt = AdapterKind::parse(tokens[1]);
+                    match (w_opt, c_opt) {
+                        (Some(w), Some(c)) => {
+                            self.config.writer = w;
+                            self.config.critic = c;
+                            self.config.save(&self.project)?;
+                            self.status_message = Some((
+                                format!(
+                                    "CLI adapters updated: Writer={}, Critic={}",
+                                    w.as_str(),
+                                    c.as_str()
+                                ),
+                                Instant::now(),
+                            ));
+                        }
+                        (None, _) => {
+                            self.status_message = Some((
+                                format!(
+                                    "Unknown writer adapter '{}'. Valid: agy, codex, claude, omp, pi, kilo, opencode",
+                                    tokens[0]
+                                ),
+                                Instant::now(),
+                            ));
+                        }
+                        (_, None) => {
+                            self.status_message = Some((
+                                format!(
+                                    "Unknown critic adapter '{}'. Valid: agy, codex, claude, omp, pi, kilo, opencode",
+                                    tokens[1]
+                                ),
+                                Instant::now(),
+                            ));
+                        }
+                    }
+                }
             }
             "/dialogue" | "/chat" | "/диалог" | "/чат" => {
                 self.active_tab = ActiveTab::Dialogue;
@@ -646,7 +716,7 @@ async fn run_app_loop(
                     }
                 }
                 KeyCode::Char('1') if app.input.is_empty() => {
-                    app.active_tab = ActiveTab::Overview;
+                    app.active_tab = ActiveTab::Feed;
                 }
                 KeyCode::Char('2') if app.input.is_empty() => {
                     app.active_tab = ActiveTab::Dialogue;
@@ -668,16 +738,22 @@ async fn run_app_loop(
                     app.input.clear();
                 }
                 KeyCode::Up => {
-                    app.scroll_offset = app.scroll_offset.saturating_sub(1);
-                }
-                KeyCode::Down => {
                     app.scroll_offset = app.scroll_offset.saturating_add(1);
                 }
+                KeyCode::Down => {
+                    app.scroll_offset = app.scroll_offset.saturating_sub(1);
+                }
                 KeyCode::PageUp => {
-                    app.scroll_offset = app.scroll_offset.saturating_sub(5);
+                    app.scroll_offset = app.scroll_offset.saturating_add(5);
                 }
                 KeyCode::PageDown => {
-                    app.scroll_offset = app.scroll_offset.saturating_add(5);
+                    app.scroll_offset = app.scroll_offset.saturating_sub(5);
+                }
+                KeyCode::Home => {
+                    app.scroll_offset = usize::MAX;
+                }
+                KeyCode::End => {
+                    app.scroll_offset = 0;
                 }
                 KeyCode::Char(c) => {
                     app.input.push(c);
@@ -722,7 +798,7 @@ fn ui(frame: &mut Frame, app: &TuiApp) {
     render_tabs(frame, app, chunks[2]);
 
     match app.active_tab {
-        ActiveTab::Overview => render_overview_tab(frame, app, chunks[3]),
+        ActiveTab::Feed => render_feed_tab(frame, app, chunks[3]),
         ActiveTab::Dialogue => render_dialogue_tab(frame, app, chunks[3]),
         ActiveTab::Diff => render_diff_tab(frame, app, chunks[3]),
         ActiveTab::Audit => render_audit_tab(frame, app, chunks[3]),
@@ -854,7 +930,7 @@ fn render_alerts(frame: &mut Frame, app: &TuiApp, area: Rect) {
 
 fn render_tabs(frame: &mut Frame, app: &TuiApp, area: Rect) {
     let titles = vec![
-        ActiveTab::Overview.title(),
+        ActiveTab::Feed.title(),
         ActiveTab::Dialogue.title(),
         ActiveTab::Diff.title(),
         ActiveTab::Audit.title(),
@@ -877,214 +953,505 @@ fn render_tabs(frame: &mut Frame, app: &TuiApp, area: Rect) {
     frame.render_widget(tabs, area);
 }
 
-fn render_overview_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
-    let layout = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Length(8), Constraint::Min(6)])
-        .split(area);
+fn render_feed_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    if area.width >= 100 {
+        // Horizontal split: Left Cockpit Sidebar (34 cols), Right Unified Feed
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(34), Constraint::Min(40)])
+            .split(area);
 
-    render_agents(frame, app, layout[0]);
-    render_activity(frame, app, layout[1]);
+        render_cockpit_sidebar(frame, app, chunks[0]);
+        render_unified_feed(frame, app, chunks[1]);
+    } else {
+        // Narrow vertical split: Top Compact Cockpit (7 rows), Bottom Unified Feed
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(7), Constraint::Min(8)])
+            .split(area);
+
+        render_cockpit_compact(frame, app, chunks[0]);
+        render_unified_feed(frame, app, chunks[1]);
+    }
 }
 
-fn render_agents(frame: &mut Frame, app: &TuiApp, area: Rect) {
-    let agent_chunks = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+fn render_cockpit_sidebar(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(8), // Agents & Model
+            Constraint::Length(7), // Active Task
+            Constraint::Min(6),    // Queue & Repository
+        ])
         .split(area);
 
     let active_task = app.active_tasks.first();
 
-    // Left card: Writer Team
+    // 1. Agents & Model Block
     let writer_profile = app.config.writer.as_str();
-    let mut writer_lines = Vec::new();
+    let critic_profile = app.config.critic.as_str();
     let writer_model_str = app.config.writer_model.as_deref().unwrap_or("default");
-    writer_lines.push(Line::from(vec![
-        Span::styled("Adapter Profile: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            writer_profile,
-            Style::default()
-                .fg(Color::Yellow)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" | Model: "),
-        Span::styled(writer_model_str, Style::default().fg(Color::White)),
-    ]));
+    let critic_model_str = app.config.critic_model.as_deref().unwrap_or("default");
+    let (mode_str, mode_color) = match app.config.orchestration.mode {
+        OrchestrationMode::Pair => ("PAIR", Color::Cyan),
+        OrchestrationMode::Team => ("TEAM", Color::Magenta),
+    };
 
-    if let Some(task) = active_task {
-        writer_lines.push(Line::from(vec![
-            Span::styled("Current Task: ", Style::default().fg(Color::DarkGray)),
+    let agent_lines = vec![
+        Line::from(vec![
+            Span::styled("Writer: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("#{} {}", task.id, task.title),
+                writer_profile,
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" ({})", writer_model_str),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Critic: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                critic_profile,
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(" ({})", critic_model_str),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Mode:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                mode_str,
+                Style::default().fg(mode_color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!(
+                    " (max {} workers)",
+                    app.config.orchestration.max_writer_workers
+                ),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]),
+        Line::from(Span::styled(
+            "Tip: Use /cli <name> to switch",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+
+    let agent_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" 🤖 AI Agents ")
+        .border_style(Style::default().fg(Color::Yellow));
+
+    frame.render_widget(Paragraph::new(agent_lines).block(agent_block), chunks[0]);
+
+    // 2. Active Task Block
+    let task_lines = if let Some(task) = active_task {
+        let (status_color, status_icon) = match task.status {
+            TaskStatus::Queued => (Color::DarkGray, "○"),
+            TaskStatus::Planning => (Color::Cyan, "◐"),
+            TaskStatus::Implementing => (Color::Yellow, "●"),
+            TaskStatus::Reviewing => (Color::Magenta, "●"),
+            TaskStatus::Verifying => (Color::Blue, "●"),
+            TaskStatus::Complete => (Color::Green, "✔"),
+            TaskStatus::Blocked | TaskStatus::Failed => (Color::Red, "✖"),
+        };
+
+        let title_clean = if task.title.len() > 30 {
+            format!("{}...", &task.title[..27])
+        } else {
+            task.title.clone()
+        };
+
+        vec![
+            Line::from(vec![
+                Span::styled(
+                    format!("#{} ", task.id),
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{status_icon} {}", task.status.as_str()),
+                    Style::default()
+                        .fg(status_color)
+                        .add_modifier(Modifier::BOLD),
+                ),
+            ]),
+            Line::from(Span::styled(title_clean, Style::default().fg(Color::White))),
+            Line::from(vec![
+                Span::styled("Worktrees: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{} active", app.worktrees.len()),
+                    Style::default().fg(Color::Cyan),
+                ),
+            ]),
+        ]
+    } else {
+        vec![
+            Line::from(Span::styled(
+                "○ Idle",
+                Style::default()
+                    .fg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD),
+            )),
+            Line::from(Span::styled(
+                "Waiting for runnable tasks",
+                Style::default().fg(Color::DarkGray),
+            )),
+            Line::from(vec![
+                Span::styled("Enqueued: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    format!("{} waiting", app.queue.queued),
+                    Style::default().fg(Color::White),
+                ),
+            ]),
+        ]
+    };
+
+    let task_block = Block::default()
+        .borders(Borders::ALL)
+        .title(" 🎯 Active Task ")
+        .border_style(Style::default().fg(if active_task.is_some() {
+            Color::Cyan
+        } else {
+            Color::DarkGray
+        }));
+
+    frame.render_widget(Paragraph::new(task_lines).block(task_block), chunks[1]);
+
+    // 3. Queue & Repository State Block
+    let git_status_line = if app.dirty_paths.is_empty() {
+        Line::from(vec![
+            Span::styled("Git: ", Style::default().fg(Color::DarkGray)),
+            Span::styled("Clean (HEAD)", Style::default().fg(Color::Green)),
+        ])
+    } else {
+        Line::from(vec![
+            Span::styled("Git: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("⚠️ {} dirty files", app.dirty_paths.total_count),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ])
+    };
+
+    let queue_lines = vec![
+        Line::from(vec![
+            Span::styled("Active:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", app.queue.active),
                 Style::default()
                     .fg(Color::White)
                     .add_modifier(Modifier::BOLD),
             ),
-        ]));
-        writer_lines.push(Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" | Queued: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("● {}", task.status.as_str()),
+                format!("{}", app.queue.queued),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Complete: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{}", app.queue.complete),
                 Style::default().fg(Color::Green),
             ),
-        ]));
-    } else {
-        writer_lines.push(Line::from(vec![Span::styled(
-            "Status: ○ Idle (Waiting for runnable tasks)",
-            Style::default().fg(Color::DarkGray),
-        )]));
-    }
-
-    let active_worktrees = app.worktrees.len();
-    writer_lines.push(Line::from(vec![
-        Span::styled("Worktrees: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!("{active_worktrees} active"),
-            Style::default().fg(Color::Cyan),
-        ),
-    ]));
-
-    let writer_block = Block::default()
-        .borders(Borders::ALL)
-        .title(" 🖊  Writer Team / Worker ")
-        .border_style(Style::default().fg(Color::Yellow));
-
-    frame.render_widget(
-        Paragraph::new(writer_lines).block(writer_block),
-        agent_chunks[0],
-    );
-
-    // Right card: Critic Team
-    let critic_profile = app.config.critic.as_str();
-    let mut critic_lines = Vec::new();
-    let critic_model_str = app.config.critic_model.as_deref().unwrap_or("default");
-    critic_lines.push(Line::from(vec![
-        Span::styled("Adapter Profile: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            critic_profile,
-            Style::default()
-                .fg(Color::Magenta)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::raw(" | Model: "),
-        Span::styled(critic_model_str, Style::default().fg(Color::White)),
-    ]));
-
-    if let Some(task) = active_task {
-        let critic_status = match task.status {
-            TaskStatus::Reviewing => "● Auditing & Reviewing",
-            TaskStatus::Verifying => "● Running Verification Checks",
-            _ => "○ Waiting for revision",
-        };
-        critic_lines.push(Line::from(vec![
-            Span::styled("Status: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(" | Failed: ", Style::default().fg(Color::DarkGray)),
             Span::styled(
-                critic_status,
-                Style::default().fg(if task.status == TaskStatus::Reviewing {
-                    Color::Magenta
+                format!("{}", app.queue.blocked_or_failed),
+                Style::default().fg(if app.queue.blocked_or_failed > 0 {
+                    Color::Red
                 } else {
                     Color::DarkGray
                 }),
             ),
-        ]));
-    } else {
-        critic_lines.push(Line::from(vec![Span::styled(
-            "Status: ○ Ready for audit",
-            Style::default().fg(Color::DarkGray),
-        )]));
-    }
+        ]),
+        git_status_line,
+        Line::from(vec![
+            Span::styled("Checks:   ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                format!("{} configured", app.config.checks.len()),
+                Style::default().fg(Color::White),
+            ),
+        ]),
+    ];
 
-    let checks_count = app.config.checks.len();
-    critic_lines.push(Line::from(vec![
-        Span::styled("Checks Configured: ", Style::default().fg(Color::DarkGray)),
-        Span::styled(
-            format!("{checks_count} verification checks"),
-            Style::default().fg(Color::White),
-        ),
-    ]));
-
-    let critic_block = Block::default()
+    let queue_block = Block::default()
         .borders(Borders::ALL)
-        .title(" 🛡  Critic Audit Team ")
-        .border_style(Style::default().fg(Color::Magenta));
+        .title(" 📊 Repository & Queue ")
+        .border_style(Style::default().fg(Color::DarkGray));
 
-    frame.render_widget(
-        Paragraph::new(critic_lines).block(critic_block),
-        agent_chunks[1],
-    );
+    frame.render_widget(Paragraph::new(queue_lines).block(queue_block), chunks[2]);
 }
 
-fn render_activity(frame: &mut Frame, app: &TuiApp, area: Rect) {
-    let mut items = Vec::new();
+fn render_cockpit_compact(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let mode_str = match app.config.orchestration.mode {
+        OrchestrationMode::Pair => "PAIR",
+        OrchestrationMode::Team => "TEAM",
+    };
 
-    // 1. Render recent milestone SQLite events
+    let active_task_summary = if let Some(task) = app.active_tasks.first() {
+        format!("#{} {} (● {})", task.id, task.title, task.status.as_str())
+    } else {
+        "Idle (No active task)".to_string()
+    };
+
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("Mode: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                mode_str,
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" | Writer: "),
+            Span::styled(
+                app.config.writer.as_str(),
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" | Critic: "),
+            Span::styled(
+                app.config.critic.as_str(),
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("Active: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                active_task_summary,
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" | Worktrees: "),
+            Span::styled(
+                format!("{}", app.worktrees.len()),
+                Style::default().fg(Color::Cyan),
+            ),
+        ]),
+        Line::from(vec![Span::styled(
+            format!(
+                "Queue: {} active, {} queued, {} complete | Git: {} dirty files",
+                app.queue.active, app.queue.queued, app.queue.complete, app.dirty_paths.total_count
+            ),
+            Style::default().fg(Color::Gray),
+        )]),
+    ];
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(" 🎛 Cockpit Summary ")
+        .border_style(Style::default().fg(Color::DarkGray));
+
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn build_unified_feed_lines(app: &TuiApp) -> Vec<Line<'static>> {
+    let mut feed = Vec::new();
+
+    // 1. Convert recent SQLite task events to styled feed lines
     for event in &app.recent_events {
-        let actor_color = match event.actor.as_str() {
-            "writer" | "writer_lead" => Color::Yellow,
-            "critic" => Color::Magenta,
-            "supervisor" => Color::Green,
-            "git" | "worktree" => Color::Cyan,
-            _ => Color::White,
+        let (actor_color, badge) = match event.actor.as_str() {
+            "writer" | "writer_lead" => (Color::Yellow, "[WRITER]"),
+            "critic" | "critic_lead" => (Color::Magenta, "[CRITIC]"),
+            "supervisor" => (Color::Green, "[SUPERVISOR]"),
+            "git" => (Color::LightCyan, "[GIT]"),
+            "worktree" => (Color::Cyan, "[WORKTREE]"),
+            _ => (Color::White, "[TASK]"),
         };
 
-        let reason_preview = if event.reason.len() > 80 {
-            format!("{}...", &event.reason[..77])
+        let time_str = {
+            let secs = (event.occurred_at_ms / 1000) % 86400;
+            let h = secs / 3600;
+            let m = (secs % 3600) / 60;
+            let s = secs % 60;
+            format!("{:02}:{:02}:{:02}", h, m, s)
+        };
+
+        let reason_clean = if event.reason.len() > 72 {
+            format!("{}...", &event.reason[..69])
         } else {
             event.reason.clone()
         };
 
-        items.push(ListItem::new(Line::from(vec![
+        feed.push(Line::from(vec![
+            Span::styled(format!("{time_str} "), Style::default().fg(Color::DarkGray)),
             Span::styled(
-                format!("[Task #{}] ", event.task_id),
-                Style::default().fg(Color::DarkGray),
-            ),
-            Span::styled(
-                format!("[{}] ", event.actor),
+                format!("{:<13} ", badge),
                 Style::default()
                     .fg(actor_color)
                     .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
-                format!("{}: ", event.event_type),
-                Style::default().fg(Color::White),
+                format!("#{} {}: ", event.task_id, event.event_type),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(reason_preview, Style::default().fg(Color::DarkGray)),
-        ])));
+            Span::styled(reason_clean, Style::default().fg(Color::Gray)),
+        ]));
     }
 
-    // 2. Render live supervisor log lines (errors, progress, warnings)
-    for log_line in &app.supervisor_logs {
-        let (color, prefix) = if log_line.to_ascii_lowercase().contains("error") {
-            (Color::Red, "[SUPERVISOR ERROR] ")
-        } else if log_line.starts_with(">>>") {
-            (Color::Cyan, "[SUPERVISOR] ")
+    // 2. Convert supervisor logs to styled feed lines
+    for line in &app.supervisor_logs {
+        let l = line.trim();
+        if l.is_empty() {
+            continue;
+        }
+
+        if l.starts_with(">>> [TALOS Team]") || l.starts_with(">>> [TALOS Auto]") {
+            let style = if l.contains("Phase 1") {
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD)
+            } else if l.contains("Phase 2") {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else if l.contains("Phase 3") {
+                Style::default()
+                    .fg(Color::Magenta)
+                    .add_modifier(Modifier::BOLD)
+            } else if l.contains("Phase 4") {
+                Style::default()
+                    .fg(Color::Blue)
+                    .add_modifier(Modifier::BOLD)
+            } else if l.contains("APPROVED")
+                || l.contains("Deliverable Summary")
+                || l.contains("complete")
+            {
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD)
+            } else if l.contains("request_changes") || l.contains("requested changes") {
+                Style::default()
+                    .fg(Color::Yellow)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Cyan)
+            };
+
+            feed.push(Line::from(vec![
+                Span::styled("LIVE  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "[PHASE]       ",
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(l.to_string(), style),
+            ]));
+        } else if l.to_ascii_lowercase().contains("rate limit") || l.contains("backoff") {
+            feed.push(Line::from(vec![
+                Span::styled("LIVE  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "[RATE-LIMIT]  ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(l.to_string(), Style::default().fg(Color::Yellow)),
+            ]));
+        } else if l.to_ascii_lowercase().contains("error")
+            || l.to_ascii_lowercase().contains("fail")
+        {
+            feed.push(Line::from(vec![
+                Span::styled("LIVE  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "[ERROR]       ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(l.to_string(), Style::default().fg(Color::Red)),
+            ]));
+        } else if l.starts_with("Task #") || l.starts_with("Subtask #") {
+            feed.push(Line::from(vec![
+                Span::styled("LIVE  ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "[TASK]        ",
+                    Style::default()
+                        .fg(Color::LightCyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(l.to_string(), Style::default().fg(Color::White)),
+            ]));
         } else {
-            (Color::DarkGray, "[SUPERVISOR LOG] ")
+            feed.push(Line::from(vec![
+                Span::styled("LOG   ", Style::default().fg(Color::DarkGray)),
+                Span::styled("[SYS]         ", Style::default().fg(Color::DarkGray)),
+                Span::styled(l.to_string(), Style::default().fg(Color::DarkGray)),
+            ]));
+        }
+    }
+
+    if feed.is_empty() {
+        feed.push(Line::from(vec![
+            Span::styled(
+                "⚡ TALOS Unified Feed initialized. ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "Type a task below (e.g. 'Implement binary search in calc.py') or /help for commands.",
+                Style::default().fg(Color::Gray),
+            ),
+        ]));
+    }
+
+    feed
+}
+
+fn render_unified_feed(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let feed_lines = build_unified_feed_lines(app);
+    let total_lines = feed_lines.len();
+
+    let inner_height = area.height.saturating_sub(2) as usize;
+
+    let (visible_lines, title) = if total_lines <= inner_height {
+        (
+            feed_lines,
+            " ⚡ Live Unified Feed (Auto-scroll active) ".to_string(),
+        )
+    } else {
+        let max_scroll = total_lines.saturating_sub(inner_height);
+        let actual_scroll = app.scroll_offset.min(max_scroll);
+
+        let end_idx = total_lines.saturating_sub(actual_scroll);
+        let start_idx = end_idx.saturating_sub(inner_height);
+
+        let title = if actual_scroll > 0 {
+            format!(
+                " ⚡ Live Unified Feed (Viewing earlier lines: -{} | Press 'End' to resume live stream) ",
+                actual_scroll
+            )
+        } else {
+            " ⚡ Live Unified Feed (Live stream • Auto-scroll) ".to_string()
         };
 
-        items.push(ListItem::new(Line::from(vec![
-            Span::styled(
-                prefix,
-                Style::default().fg(color).add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(log_line, Style::default().fg(color)),
-        ])));
-    }
+        (feed_lines[start_idx..end_idx].to_vec(), title)
+    };
 
-    if items.is_empty() {
-        items.push(ListItem::new(Line::from(Span::styled(
-            "No events recorded yet. Describe a task below or type /help for commands.",
-            Style::default().fg(Color::DarkGray),
-        ))));
-    }
-
-    let log_block = Block::default()
+    let block = Block::default()
         .borders(Borders::ALL)
-        .title(" 📜 Live Milestone & Supervisor Activity (Press Tab / 2-4 to switch views) ")
-        .border_style(Style::default().fg(Color::White));
+        .title(title)
+        .border_style(Style::default().fg(Color::Cyan));
 
-    let list = List::new(items).block(log_block);
-    frame.render_widget(list, area);
+    let paragraph = Paragraph::new(visible_lines).block(block);
+    frame.render_widget(paragraph, area);
 }
 
 fn render_dialogue_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
@@ -1272,4 +1639,95 @@ fn render_input(frame: &mut Frame, app: &TuiApp, area: Rect) {
         .border_style(Style::default().fg(Color::Cyan));
 
     frame.render_widget(Paragraph::new(input_line).block(input_block), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicU64, Ordering};
+
+    static NEXT_TUI_DIR: AtomicU64 = AtomicU64::new(0);
+
+    fn test_tui_project() -> Project {
+        let seq = NEXT_TUI_DIR.fetch_add(1, Ordering::Relaxed);
+        let root =
+            std::env::temp_dir().join(format!("talos-tui-test-{}-{seq}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create test project");
+        Project {
+            state_root: root.clone(),
+            root,
+            discovery: crate::project::DiscoveryMethod::CurrentDirectory,
+        }
+    }
+
+    #[test]
+    fn active_tab_navigation_and_titles() {
+        assert_eq!(ActiveTab::Feed.title(), " 1: Unified Feed ");
+        assert_eq!(ActiveTab::Feed.next(), ActiveTab::Dialogue);
+        assert_eq!(ActiveTab::Dialogue.next(), ActiveTab::Diff);
+        assert_eq!(ActiveTab::Diff.next(), ActiveTab::Audit);
+        assert_eq!(ActiveTab::Audit.next(), ActiveTab::Feed);
+    }
+
+    #[test]
+    fn tui_cli_slash_commands_and_feed() {
+        let project = test_tui_project();
+
+        // Create .talos directory with empty database
+        let talos_dir = project.root.join(".talos");
+        std::fs::create_dir_all(&talos_dir).expect("create .talos");
+        let db = Database::open(&project).expect("open db");
+        drop(db);
+
+        let mut app = TuiApp::new(project.clone()).expect("create TuiApp");
+
+        // 1. Test /feed and aliases
+        app.active_tab = ActiveTab::Diff;
+        app.execute_slash_command("/feed").expect("execute /feed");
+        assert_eq!(app.active_tab, ActiveTab::Feed);
+
+        app.active_tab = ActiveTab::Audit;
+        app.execute_slash_command("/фид").expect("execute /фид");
+        assert_eq!(app.active_tab, ActiveTab::Feed);
+
+        // 2. Test /cli without args shows current status
+        app.execute_slash_command("/cli").expect("execute /cli");
+        assert!(app.status_message.is_some());
+        let (msg, _) = app.status_message.as_ref().unwrap();
+        assert!(msg.contains("Current CLI:"));
+
+        // 3. Test /cli <name> sets both Writer and Critic
+        app.execute_slash_command("/cli codex")
+            .expect("set cli codex");
+        assert_eq!(app.config.writer, AdapterKind::Codex);
+        assert_eq!(app.config.critic, AdapterKind::Codex);
+        let (msg, _) = app.status_message.as_ref().unwrap();
+        assert!(msg.contains("Active CLI adapter updated to: codex"));
+
+        // 4. Test /cli <writer> <critic> sets distinct roles
+        app.execute_slash_command("/cli claude agy")
+            .expect("set cli claude agy");
+        assert_eq!(app.config.writer, AdapterKind::Claude);
+        assert_eq!(app.config.critic, AdapterKind::Agy);
+
+        // 5. Test invalid adapter reports error
+        app.execute_slash_command("/cli invalid_name")
+            .expect("execute invalid cli");
+        let (msg, _) = app.status_message.as_ref().unwrap();
+        assert!(msg.contains("Unknown adapter 'invalid_name'"));
+
+        // 6. Test build_unified_feed_lines
+        app.supervisor_logs = vec![
+            ">>> [TALOS Team] Phase 1: Writer Lead analyzing requirements & planning..."
+                .to_string(),
+            ">>> [TALOS Team] Critic Review Verdict: APPROVED (Round 1)".to_string(),
+            "Task #12 calc.py updated successfully".to_string(),
+            "Rate limit backoff 20s".to_string(),
+        ];
+        let feed = build_unified_feed_lines(&app);
+        assert!(feed.len() >= 4);
+
+        let _ = std::fs::remove_dir_all(&project.root);
+    }
 }

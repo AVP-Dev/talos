@@ -186,6 +186,15 @@ Dependency: R6–R8.
 | T14.2 | done | Session timings and execution metrics | Tracks task start timestamp, total duration, active execution time, and pause intervals across Team and Pair orchestration modes. |
 | T14.3 | done | Token economy context truncation | Large diagnostic error texts truncated to 4096 bytes preserving head and tail context (`truncate_for_token_economy`), protecting agent context windows. 2 unit tests passing. |
 
+## R15 — CLI Adapter Pass-Through (/cli <name>) and TUI Unified Feed Redesign
+**Status:** complete. Implemented dynamic CLI adapter configuration via `/cli <name>` (in TUI) and `--cli <name>` (on CLI), and completely redesigned the TUI primary cockpit screen around a responsive, live-scrolling Unified Feed.
+
+| ID | Status | Task | Exit criteria |
+|---|---|---|---|
+| T15.1 | done | Dynamic CLI adapter switching via `/cli <name>` and `--cli` | Added `/cli` slash command in TUI supporting single adapter (sets both Writer and Critic) or pair adapters (`/cli <writer> <critic>`) with Russian aliases (`/кли`, `/адаптер`), persistence to `.talos/config.json`, and global `--cli <name>` CLI argument flag. |
+| T15.2 | done | Redesign TUI primary cockpit view into Unified Feed | Replaced fragmented overview with responsive `ActiveTab::Feed` (" 1: Unified Feed "): 34-col Cockpit Sidebar (AI Agents card, Active Task card, Queue & Repo card) alongside a prominent live Unified Feed stream combining real-time supervisor logs, phase announcements, agent planning, and milestone SQLite events. |
+| T15.3 | done | Interactive auto-scroll and manual history inspection | Feed supports automatic bottom-pinning stream mode (`scroll_offset == 0`) with seamless transition to manual scroll (Up, Down, PageUp, PageDown, Home, End) and live stream status indicator. 2 dedicated TUI unit tests passing. |
+
 ## Required end-to-end scenarios from the original request
 
 First launch/repeat `up`; Writer/Critic success and justified rejection; child task; independent parallel work; adding a task while work is running; manual takeover; CLI recovery; orchestrator crash; SSH disconnect/reconnect; Linux reboot autostart; PR without merge; duplicate-execution prevention; and rechecking original acceptance criteria before closeout. Keep separate evidence for each scenario; do not combine them into a misleading test.

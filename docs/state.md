@@ -516,9 +516,35 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
   - `cargo clippy --locked --all-targets --all-features -- -D warnings` passed (0 warnings).
   - `cargo test --locked --all-targets` passed (**149 passed**, 0 failed, 2 ignored).
 
+## R15 progress and verification — CLI Adapter Pass-Through (/cli) and TUI Unified Feed Redesign
+
+- **Implemented:**
+  - `src/cli.rs`: Added global `--cli <CLI>` argument to `Cli` allowing ad-hoc adapter override (`agy`, `codex`, `claude`, `omp`, `pi`, `kilo`, `opencode`) on any invocation. Added unit test `cli_flag_parses_global_adapter_override`.
+  - `src/app.rs`: Added global `--cli` handling during project dispatch, automatically updating `.talos/config.json`. Supported `cli` setting key in `ConfigCommand::Set`.
+  - `src/tui.rs`:
+    - Added `/cli` slash command (with aliases `/кли`, `/adapter`, `/адаптер`):
+      - `/cli` displays active Writer and Critic adapters and supported options.
+      - `/cli <name>` sets both Writer and Critic to `<name>`, persisting directly to `.talos/config.json`.
+      - `/cli <writer> <critic>` sets distinct roles for Writer and Critic.
+    - Redesigned the primary TUI view around a **Unified Feed** (`ActiveTab::Feed`, titled `" 1: Unified Feed "`), with aliases `/feed`, `/фид`, `/лента`, `/overview`, `/обзор`.
+    - Responsive layout: 34-column Cockpit Sidebar (AI Agents card, Active Task card, Queue & Repo card) alongside a prominent live Unified Feed on wide viewports (>= 100 cols); compact stacked card on narrow screens.
+    - Merged stream interleaving real-time supervisor logs, planning phases, worker assignments, review verdicts, and milestone SQLite events with color-coded badges (`[PHASE]`, `[WRITER]`, `[CRITIC]`, `[SUPERVISOR]`, `[TASK]`, `[RATE-LIMIT]`, `[ERROR]`, etc.).
+    - Interactive auto-scroll (pinned to newest lines at `scroll_offset == 0`) and manual history navigation (`Up`, `Down`, `PageUp`, `PageDown`, `Home`, `End`) with dynamic status indicator.
+    - Increased supervisor log buffer to 500 lines for substantial history inspection.
+    - Added 2 dedicated unit tests: `active_tab_navigation_and_titles` and `tui_cli_slash_commands_and_feed`.
+  - `README.md`: Updated test badge to `152 passed`.
+  - `docs/decisions.md`: Recorded `ADR-048`.
+  - `docs/tasks.md` & `docs/plan.md`: Added and closed R15 tasks.
+  - `docs/backlog.md`: Created development, optimization, and test harness backlog.
+- **Verification results:**
+  - `cargo fmt --all -- --check` passed.
+  - `cargo clippy --locked --all-targets --all-features -- -D warnings` passed (0 warnings).
+  - `cargo test --locked --all-targets` passed (**152 passed**, 0 failed, 2 ignored).
+  - `./scripts/verify-project.sh` passed: all 5 profile checks clean (format, clippy, tests, release build, security scan).
+
 ## Next action
 
-All planned rounds (R0 through R14) are fully implemented and verified. Release v0.1.0 is published on GitHub. Maintain local clean tree on `master`; do not push to remote or publish PR without explicit user instruction.
+All planned rounds (R0 through R15) are fully implemented and verified. Release v0.1.0 is published on GitHub. Maintain local clean tree on `master`; do not push to remote or publish PR without explicit user instruction.
 
 ## Session close checklist
 

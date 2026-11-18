@@ -265,13 +265,23 @@ Deliver transparent artifact reporting for autonomous choices, session metrics, 
 
 **Exit criteria:** `TALOS_SUMMARY.md` is generated upon task completion; error context is bounded; all tests pass.
 
+### R15 — CLI Adapter Pass-Through (/cli <name>) and TUI Unified Feed Redesign
+
+Deliver dynamic CLI adapter configuration and redesign the terminal interface around a live-streaming Unified Feed.
+
+- **Dynamic Adapter Pass-Through:** In-TUI command `/cli <name>` (with aliases `/кли`, `/adapter`, `/адаптер`) to switch active CLI adapters on the fly, with persistence to `.talos/config.json`. Global `--cli <name>` flag on `talos` CLI.
+- **Unified Feed Cockpit:** Redesigned primary cockpit screen (`ActiveTab::Feed`) featuring a 34-col sidebar (AI Agents card, Active Task card, Queue & Repo card) alongside a prominent live Unified Feed.
+- **Auto-Scroll & History Navigation:** Bottom-pinned auto-scroll during live execution with manual history inspection (`Up`, `PageUp`, `Home`, `End`) and stream status indicator.
+
+**Exit criteria:** `/cli <name>` dynamically switches adapters and updates config; primary TUI view renders the Unified Feed with responsive layouts; scroll navigation functions cleanly; all tests pass.
+
 ## 6. Dependency order
 
 ```text
 R0 → R1 → R2 → R3 → R4 → R5
                          └──→ R6
 R5 + R6 → R7 → R8 → R9
-R6 + R7 + R8 + R9 → R10 → R11 → R12 → R13 → R14
+R6 + R7 + R8 + R9 → R10 → R11 → R12 → R13 → R14 → R15
 ```
 
 Implementation details may change based on experiments. Preserve invariants and acceptance checks; update `docs/decisions.md`, `docs/tasks.md`, and `docs/state.md` when scope changes materially.

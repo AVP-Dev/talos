@@ -36,6 +36,7 @@ scripts/                    verification profile, scanner, and macOS/Linux packa
 docs/
   plan.md                  product direction and delivery rounds
   tasks.md                 status-tracked implementation backlog
+  backlog.md               development, optimization, and test harness backlog
   state.md                 current handoff/checkpoint for new sessions
   decisions.md             decision log and user-approved direction
   architecture.md          target boundaries and data flow

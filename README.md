@@ -7,7 +7,7 @@
     <img src="https://img.shields.io/badge/Status-Beta%20%2F%20Preview-yellow?style=for-the-badge" alt="Status: Beta" />
     <img src="https://img.shields.io/badge/Platform-macOS%20%7C%20Linux-black?style=for-the-badge&logo=apple" alt="macOS and Linux" />
     <img src="https://img.shields.io/badge/Rust-1.100%2B-orange?style=for-the-badge&logo=rust" alt="Rust" />
-    <img src="https://img.shields.io/badge/Tests-149%20passed-brightgreen?style=for-the-badge" alt="Tests" />
+    <img src="https://img.shields.io/badge/Tests-152%20passed-brightgreen?style=for-the-badge" alt="Tests" />
   </p>
 
   <p>
