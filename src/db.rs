@@ -12,7 +12,9 @@ use sha2::{Digest, Sha256};
 use crate::{
     checks::{CheckExecution, ProjectCheck, validate_project_checks},
     project::Project,
-    revision::RevisionFacts,
+    revision::{
+        MAX_CHANGED_PATH_BYTES, MAX_CHANGED_PATHS, MAX_CHANGED_PATHS_JSON_BYTES, RevisionFacts,
+    },
     secrets::contains_sensitive,
 };
 
@@ -5796,15 +5798,18 @@ fn validate_sha256_digest(value: &str, label: &str) -> Result<()> {
 fn validate_changed_paths_json(value: &str) -> Result<()> {
     use std::path::{Component, Path};
 
+    if value.len() > MAX_CHANGED_PATHS_JSON_BYTES {
+        bail!("Changed path metadata exceeds the {MAX_CHANGED_PATHS_JSON_BYTES}-byte limit");
+    }
     let paths: Vec<String> =
         serde_json::from_str(value).context("Changed project paths must be valid JSON")?;
-    if paths.is_empty() || paths.len() > 4096 {
-        bail!("Changed project paths must contain 1 to 4096 entries");
+    if paths.is_empty() || paths.len() > MAX_CHANGED_PATHS {
+        bail!("Changed project paths must contain 1 to {MAX_CHANGED_PATHS} entries");
     }
     let mut unique = std::collections::HashSet::new();
     for path_value in &paths {
         let path = Path::new(path_value);
-        if path_value.len() > 1024
+        if path_value.len() > MAX_CHANGED_PATH_BYTES
             || path_value.chars().any(char::is_control)
             || path.is_absolute()
             || path

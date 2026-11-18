@@ -9,9 +9,10 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 const MAX_REVIEW_PATCH_BYTES: usize = 64 * 1024;
-const MAX_CHANGED_PATHS: usize = 4096;
-const MAX_CHANGED_PATH_BYTES: usize = 1024;
-const MAX_CHANGED_PATH_OUTPUT_BYTES: usize = MAX_CHANGED_PATHS * (MAX_CHANGED_PATH_BYTES + 1);
+pub(crate) const MAX_CHANGED_PATHS: usize = 4096;
+pub(crate) const MAX_CHANGED_PATH_BYTES: usize = 1024;
+const MAX_CHANGED_PATH_OUTPUT_BYTES: usize = 128 * 1024;
+pub(crate) const MAX_CHANGED_PATHS_JSON_BYTES: usize = 256 * 1024;
 const PROJECT_PATHS: [&str; 3] = [".", ":(exclude).git", ":(exclude).talos"];
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -160,6 +161,9 @@ impl RevisionSnapshot {
 
         changed_paths.sort();
         changed_paths.dedup();
+        if serde_json::to_vec(&changed_paths)?.len() > MAX_CHANGED_PATHS_JSON_BYTES {
+            bail!("Changed path metadata exceeds the {MAX_CHANGED_PATHS_JSON_BYTES}-byte limit");
+        }
         let patch = String::from_utf8(patch)
             .context("The Git patch is not valid UTF-8 and cannot be sent to the Critic")?;
         let head_commit = git_head(project_root)?
