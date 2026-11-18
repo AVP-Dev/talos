@@ -33,12 +33,12 @@ brew install AVP-Dev/apps/talos
 To update:
 
 ```sh
-brew update && brew upgrade talos
+brew update && brew upgrade AVP-Dev/apps/talos
 ```
 
 ### 3. From Source (Cargo)
 
-Rust 1.94 or newer is required to compile from source:
+Rust 1.100 or newer is required to compile from source:
 
 ```sh
 cargo install --locked --path .
@@ -130,7 +130,7 @@ talos config set checks '[{"id":"unit","argv":["pytest"]}]'
    ```sh
    talos doctor
    ```
-   *Note: TALOS automatically appends `.talos/` to `.gitignore` on first launch if not already ignored.*
+   *Note: TALOS adds a local rule to Git’s `info/exclude` when needed. Existing uncommitted project edits still need to be reviewed before launch.*
 
 2. **Queue a task with verifiable criteria:**
    ```sh
@@ -170,8 +170,22 @@ The initial `v0.1.0` release established:
 - Automated verification gates requiring exit code 0 on project checks.
 
 Key enhancements introduced in the current pre-release cycle:
-1. **Zero-friction `.gitignore` auto-injection:** Eliminates manual `.gitignore` errors by automatically appending `.talos/` on first launch.
+1. **Local runtime exclusion:** TALOS keeps startup state and per-task reports outside version control through the local Git exclude file.
 2. **Interactive 3-pane workspace:** Launching `talos` without arguments opens a split tmux workspace with live Writer/Critic monitors and a focused console.
 3. **Dynamic `talos config` CLI:** Built-in subcommands (`talos config` and `talos config set <KEY> <VAL>`) to manage roles and settings cleanly.
 4. **Automated multi-platform CI/CD releases:** GitHub Actions builds native release tarballs and checksums for both macOS and Ubuntu Linux on every release dispatch.
 5. **Standardized Homebrew tap:** Migrated to `AVP-Dev/apps/talos` with formula documentation.
+
+
+## Cockpit workflow
+
+- **Settings** opens with F2 or `/config`. Select a role or mode with the arrow keys. Save with Enter. If a CLI is missing, install it through its vendor and press R to check again. Detection does not establish authentication.
+- **Review task** lists the draft, selected roles, models, and configured checks. Press Enter to dispatch that task. Press Esc to edit. Press D to inspect existing Git changes if they block the run, then F5 to return to the draft.
+- **History** opens with F3 or `/history`. Select a task and press Enter to see its result and details. A queued task offers Retry and Cancel.
+- **New session** opens with F4 or `/new`. The cockpit resets to an empty task view and uses fresh agent conversations for the next run. The session can be reset while work is idle. Existing project settings, reports, and task history stay available. Reports are stored as `.talos/reports/task-<id>.md`.
+
+## Homebrew release handoff
+
+The release workflow checks that the Git tag matches the binary version, builds and launches the four platform binaries, and generates a formula using the checksums of the release archives. The generated `talos.rb` is available as a release asset for new releases and as a workflow artifact. Apply it to the `AVP-Dev/homebrew-apps` tap before telling users to upgrade.
+
+To propose the formula automatically, provide a repository secret named `TALOS_HOMEBREW_TAP_TOKEN` with contents and pull request write access limited to the tap. Enable the `propose_tap_update` workflow dispatch option for one tag or set `TALOS_AUTO_PROPOSE_TAP` to `true` for all releases. The workflow opens a PR for review. The tap serves the new version after that PR is merged.

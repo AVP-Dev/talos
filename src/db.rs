@@ -8708,6 +8708,44 @@ mod tests {
     }
 
     #[test]
+    fn selected_dispatch_and_cancellation_do_not_change_other_tasks() {
+        let project = temp_project();
+        let mut database = Database::open(&project).expect("open database");
+        let first = database
+            .add_task("Earlier task", "Keep queued")
+            .expect("queue earlier");
+        let selected = database
+            .add_task("Selected task", "Cancel explicitly")
+            .expect("queue selected");
+        assert_eq!(
+            database
+                .runnable_task(Some(selected.id))
+                .expect("selected task")
+                .expect("runnable")
+                .id,
+            selected.id
+        );
+        database
+            .cancel_queued_task(selected.id)
+            .expect("cancel queued task");
+        assert!(
+            database
+                .runnable_task(Some(selected.id))
+                .expect("select cancelled")
+                .is_none()
+        );
+        assert!(database.cancel_queued_task(selected.id).is_err());
+        assert_eq!(
+            database
+                .first_runnable_queued_task()
+                .expect("next task")
+                .expect("runnable")
+                .id,
+            first.id
+        );
+    }
+
+    #[test]
     fn task_transitions_update_state_and_append_a_reasoned_event() {
         let project = temp_project();
         let mut database = Database::open(&project).expect("initialize database");

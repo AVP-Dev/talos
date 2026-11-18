@@ -163,4 +163,4 @@ fi
 printf "\nInstalled version: "
 "$INSTALL_DIR/talos" --version
 
-printf "\nRun ${BOLD}talos doctor${RESET} inside any project to get started!\n"
+printf "\nOpen a terminal in your Git project and run ${BOLD}talos${RESET} to get started.\n"

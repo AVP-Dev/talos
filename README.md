@@ -21,7 +21,7 @@
 ---
 
 > [!NOTE]
-> **Beta / Early Access:** TALOS is currently in active preview (`v0.1.0`). Core multi-CLI orchestration, worktree isolation, automated verification gates, and Team/Pair recovery loops are functional and verified end-to-end. Community feedback and issue reports are welcome!
+> **Beta / Early Access:** TALOS is currently in active preview. Core multi-CLI orchestration, worktree isolation, automated verification gates, and Team/Pair recovery loops are functional and verified end-to-end. Community feedback and issue reports are welcome!
 
 ## ⚡ What is TALOS?
 
@@ -38,7 +38,7 @@
   - **Pair Mode (`pair`, default):** Sequential Writer → Critic → Verify → Complete pipeline.
 - **Reasoned Deliberation & Rebuttal:** Writer Lead can provide structured technical justification or code fixes upon review feedback. Passing tests inform discussion but do not automatically excuse architectural flaws.
 - **Adaptive Task Triage:** Pre-flight advisory triage evaluates task complexity and recommends depth without rigid workflow lock-in.
-- **Backlog Curation:** Deferred non-critical observations (`Minor`, `Note`, cross-cutting findings) are preserved in SQLite and surfaced in `TALOS_SUMMARY.md`.
+- **Backlog Curation:** Deferred non-critical observations (`Minor`, `Note`, cross-cutting findings) are preserved in SQLite and surfaced in per-task reports under `.talos/reports/`.
 - **Anti-Stagnation Protection:** Automatically detects identical diffs across fix iterations and halts futile loops early to conserve tokens.
 - **7 AI CLI Adapters:** Native headless runners for `codex`, `agy` (Antigravity), `claude` (Claude Code), `omp`, `pi`, `kilo`, and `opencode`.
 - **Deterministic Rust Core:** SQLite WAL (`.talos/state.sqlite3`, schema v19). No Docker, no Kubernetes, no Python runtime, and no separate local server required.
@@ -49,18 +49,23 @@
 
 ## 📦 Installation
 
-### One-Line Installer (macOS & Linux)
-
-```sh
-curl -fsSL https://talos.avpdev.com/install.sh | bash
-```
-*Installs the native release binary to `~/.local/bin/talos` without requiring Apple Developer ID signing or root privileges.*
-
-### Homebrew (macOS)
+### macOS (Homebrew)
 
 ```sh
 brew install AVP-Dev/apps/talos
 ```
+
+To update a Homebrew installation, run `brew update && brew upgrade AVP-Dev/apps/talos`.
+If your shell still picks an earlier copy, run `type -a talos` to see the search order.
+`talos doctor` reports the version and path of the running binary.
+
+### Linux (release installer)
+
+```sh
+curl -fsSL https://talos.avpdev.com/install.sh | bash
+```
+
+The installer places the binary in `~/.local/bin/talos`.
 
 ### From Source (Cargo)
 
@@ -70,50 +75,16 @@ cargo install --locked --path .
 
 ---
 
-## ⚡ Quick Start (30 Seconds)
+## Quick Start
 
-1. **Launch the Terminal Orchestrator Cockpit:**
-   ```sh
-   cd /path/to/your/project
-   talos
-   ```
-   *Opens the full-screen terminal dashboard with real-time Writer and Critic team status, live activity log, and an interactive task prompt.*
+1. Open a terminal in an existing Git project and run `talos`. From another folder, enter the project path when prompted.
+2. TALOS suggests installed agent CLIs for **Writes code** and **Reviews changes**. Press **F2** or enter `/config` to change either role, its model, or the mode.
+3. Describe your task and press **Enter** to review it. Check the roles and project checks, then press **Enter** again to run it. A blocked draft explains what to fix and keeps the task description.
+4. Open the result in **History** with **F3**. Enter `/new` or press **F4** to start a fresh session in the same window. Project settings and earlier results remain available.
 
-   *(Optional) To check local readiness first:*
-   ```sh
-   talos doctor
-   ```
+**Editing:** Use the arrow keys and Backspace to edit, **Ctrl+W** or **Alt+Backspace** to delete a word, and **Esc** to clear the input. The terminal can paste multiline descriptions.
 
-2. **Configure AI CLI roles and mode:**
-   ```sh
-   talos config set writer codex
-   talos config set critic claude
-   talos config set mode team
-   ```
-
-3. **Configure automated project checks (optional):**
-   ```sh
-   # Python
-   talos config set checks '[{"id":"unit","argv":["pytest"]}]'
-   # Rust
-   talos config set checks '[{"id":"test","argv":["cargo","test"]}]'
-   # Node.js
-   talos config set checks '[{"id":"test","argv":["npm","test"]}]'
-   ```
-
-4. **Add a task with acceptance criteria:**
-   ```sh
-   talos task add "Add safe_eval function" --criteria "calc.py defines safe_eval(expr). Disallow eval/exec. Add unit tests."
-   ```
-
-5. **Run autonomously:**
-   ```sh
-   # Team mode (parallel workers in worktrees + lead integration):
-   talos up --auto --mode team
-
-   # Pair mode (classic writer -> critic):
-   talos up --auto
-   ```
+The [Operator Runbook](docs/operator-runbook.md) covers terminal commands, setting up project checks, and recovery.
 
 ---
 
