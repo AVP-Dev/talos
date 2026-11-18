@@ -2870,180 +2870,206 @@ async fn run_one_shot_auto(
         bail!("`up --auto` requires a Git project so TALOS can report actual changed files");
     }
     validate_project_scope(project)?;
-    let task = database.first_runnable_queued_task()?;
-    let Some(task) = task else {
-        let has_queued_tasks = database.has_queued_tasks()?;
-        let waiting_tasks = database.queued_tasks_waiting_on_dependencies()?;
-        if json_output {
-            print_json(&json!({
-                "mode": "auto",
-                "result": if has_queued_tasks {
-                    "waiting_on_dependencies"
+    let mut tasks_processed = 0;
+    loop {
+        let task = database.first_runnable_queued_task()?;
+        let Some(task) = task else {
+            if tasks_processed == 0 {
+                let has_queued_tasks = database.has_queued_tasks()?;
+                let waiting_tasks = database.queued_tasks_waiting_on_dependencies()?;
+                if json_output {
+                    print_json(&json!({
+                        "mode": "auto",
+                        "result": if has_queued_tasks {
+                            "waiting_on_dependencies"
+                        } else {
+                            "no_queued_tasks"
+                        },
+                        "waiting_task_count": waiting_tasks.waiting_task_count,
+                        "waiting_tasks_preview": waiting_tasks.waiting_tasks,
+                        "waiting_tasks_truncated": waiting_tasks.waiting_tasks_truncated,
+                        "writer_launched": false,
+                        "automatic_retry": false,
+                    }))?;
+                } else if has_queued_tasks {
+                    print_waiting_task_summary(&waiting_tasks);
                 } else {
-                    "no_queued_tasks"
-                },
-                "waiting_task_count": waiting_tasks.waiting_task_count,
-                "waiting_tasks_preview": waiting_tasks.waiting_tasks,
-                "waiting_tasks_truncated": waiting_tasks.waiting_tasks_truncated,
-                "writer_launched": false,
-                "automatic_retry": false,
-            }))?;
-        } else if has_queued_tasks {
-            print_waiting_task_summary(&waiting_tasks);
+                    println!("No queued tasks; no Writer was started.");
+                }
+            } else {
+                println!(
+                    "\n>>> [TALOS Auto] Queue completed: successfully finished {} task(s).",
+                    tasks_processed
+                );
+            }
+            return Ok(());
+        };
+
+        tasks_processed += 1;
+        println!(
+            "\n=======================================================\n>>> [TALOS Auto] Processing Task #{} ({}): {}\n=======================================================",
+            task.id,
+            task.status.as_str(),
+            task.title
+        );
+
+        let execution_project = execution_project_for_task(project, database, task.id)?;
+        let is_in_progress = task.status == crate::db::TaskStatus::Implementing
+            || task.status == crate::db::TaskStatus::Reviewing
+            || task.status == crate::db::TaskStatus::Verifying;
+
+        let before = git_status_paths(project)?;
+        if !before.is_empty() && !is_in_progress {
+            bail!(
+                "`up --auto` requires a clean Git worktree; inspect or commit these existing paths first: {}",
+                before.display_preview()
+            );
+        }
+        let execution_before = git_status_paths(&execution_project)?;
+        if !execution_before.is_empty() && !is_in_progress {
+            bail!(
+                "`up --auto` requires a clean task execution worktree; inspect or commit these existing paths first: {}",
+                execution_before.display_preview()
+            );
+        }
+
+        if task.status != crate::db::TaskStatus::Verifying
+            && task.status != crate::db::TaskStatus::Reviewing
+        {
+            let execution =
+                execute_writer_task(json_output, &execution_project, database, task.id, None).await;
+            let changed_files = git_status_paths(&execution_project)?;
+            let report = execution?;
+            print_writer_report(json_output, &report, Some(&changed_files))?;
+            ensure_writer_succeeded(&report)?;
+        }
+
+        let has_worktree = database.task_worktree(task.id)?.is_some();
+        if has_worktree && database.task_worktree_integration(task.id)?.is_none() {
+            println!(
+                "\n>>> [TALOS Auto] Integrating task #{} worktree into primary project before review...",
+                task.id
+            );
+            match crate::worktree::integrate(project, database, task.id) {
+                Ok(_) => {
+                    let commit_msg = format!("talos: task #{}: {}", task.id, task.title);
+                    let _ = git_command(project, &["add", "."]);
+                    let _ = git_command(project, &["commit", "-m", &commit_msg]);
+                    println!(
+                        ">>> [TALOS Auto] Task #{} worktree patch integrated and committed in primary project.",
+                        task.id
+                    );
+                }
+                Err(e) => {
+                    println!(">>> [TALOS Auto] Notice during worktree integration: {e}");
+                }
+            }
+        }
+
+        let review_project = if has_worktree {
+            project
         } else {
-            println!("No queued tasks; no Writer was started.");
+            &execution_project
+        };
+
+        // Step 2: Critic Review & Automated Fix Loop
+        if task.status != crate::db::TaskStatus::Verifying {
+            const MAX_REVIEW_FIX_CYCLES: usize = 3;
+            let mut cycles = 0;
+            loop {
+                cycles += 1;
+                println!(
+                    "\n>>> [TALOS Auto] Starting Critic review for task #{} (round {cycles})...",
+                    task.id
+                );
+                let critic_report = execute_critic_review(review_project, database, task.id).await?;
+                print_critic_report(json_output, &critic_report)?;
+
+                if critic_report.review.decision == "approve" {
+                    println!(
+                        "\n>>> [TALOS Auto] Critic approved changes for task #{}.",
+                        task.id
+                    );
+                    break;
+                }
+
+                if cycles >= MAX_REVIEW_FIX_CYCLES {
+                    println!(
+                        "\n>>> [TALOS Auto] Critic requested changes, but maximum review/fix rounds ({MAX_REVIEW_FIX_CYCLES}) reached. Task remains in implementing for review."
+                    );
+                    return Ok(());
+                }
+
+                println!(
+                    "\n>>> [TALOS Auto] Critic requested changes. Launching Writer fix iteration..."
+                );
+                let fix_execution =
+                    execute_writer_task(json_output, &execution_project, database, task.id, None)
+                        .await?;
+                let fix_changed = git_status_paths(&execution_project)?;
+                print_writer_report(json_output, &fix_execution, Some(&fix_changed))?;
+                ensure_writer_succeeded(&fix_execution)?;
+            }
         }
-        return Ok(());
-    };
 
-    let execution_project = execution_project_for_task(project, database, task.id)?;
-    let is_in_progress = task.status == crate::db::TaskStatus::Implementing
-        || task.status == crate::db::TaskStatus::Reviewing
-        || task.status == crate::db::TaskStatus::Verifying;
+        // Step 3: Project Verification / Tests
+        let checks = database.task_verification_checks(task.id)?;
+        if checks.is_empty() {
+            let config = ProjectConfig::load(project)?;
+            if !config.checks.is_empty() {
+                println!(
+                    "\n>>> [TALOS Auto] Attaching {} configured project check(s) to task #{}...",
+                    config.checks.len(),
+                    task.id
+                );
+                database.add_task_verification_checks(task.id, &config.checks)?;
+            }
+        }
 
-    let before = git_status_paths(project)?;
-    if !before.is_empty() && !is_in_progress {
-        bail!(
-            "`up --auto` requires a clean Git worktree; inspect or commit these existing paths first: {}",
-            before.display_preview()
-        );
-    }
-    let execution_before = git_status_paths(&execution_project)?;
-    if !execution_before.is_empty() && !is_in_progress {
-        bail!(
-            "`up --auto` requires a clean task execution worktree; inspect or commit these existing paths first: {}",
-            execution_before.display_preview()
-        );
-    }
-
-    if task.status != crate::db::TaskStatus::Verifying
-        && task.status != crate::db::TaskStatus::Reviewing
-    {
-        let execution =
-            execute_writer_task(json_output, &execution_project, database, task.id, None).await;
-        let changed_files = git_status_paths(&execution_project)?;
-        let report = execution?;
-        print_writer_report(json_output, &report, Some(&changed_files))?;
-        ensure_writer_succeeded(&report)?;
-    }
-
-    let has_worktree = database.task_worktree(task.id)?.is_some();
-    if has_worktree && database.task_worktree_integration(task.id)?.is_none() {
         println!(
-            "\n>>> [TALOS Auto] Integrating task #{} worktree into primary project before review...",
+            "\n>>> [TALOS Auto] Running project verification for task #{}...",
             task.id
         );
-        match crate::worktree::integrate(project, database, task.id) {
-            Ok(_) => {
-                let commit_msg = format!("talos: task #{}: {}", task.id, task.title);
-                let _ = git_command(project, &["add", "."]);
-                let _ = git_command(project, &["commit", "-m", &commit_msg]);
-                println!(
-                    ">>> [TALOS Auto] Task #{} worktree patch integrated and committed in primary project.",
-                    task.id
-                );
-            }
-            Err(e) => {
-                println!(">>> [TALOS Auto] Notice during worktree integration: {e}");
-            }
-        }
-    }
+        run_task_verification(json_output, project, database, task.id).await?;
+        println!(
+            "\n>>> [TALOS Auto] Task #{} verified and completed successfully!",
+            task.id
+        );
 
-    let review_project = if has_worktree {
-        project
-    } else {
-        &execution_project
-    };
-
-    // Step 2: Critic Review & Automated Fix Loop
-    if task.status != crate::db::TaskStatus::Verifying {
-        const MAX_REVIEW_FIX_CYCLES: usize = 3;
-        let mut cycles = 0;
-        loop {
-            cycles += 1;
+        // Step 4: Finalize Worktree Integration (if task executed in a worktree)
+        if has_worktree {
             println!(
-                "\n>>> [TALOS Auto] Starting Critic review for task #{} (round {cycles})...",
+                "\n>>> [TALOS Auto] Finalizing task #{} worktree...",
                 task.id
             );
-            let critic_report = execute_critic_review(review_project, database, task.id).await?;
-            print_critic_report(json_output, &critic_report)?;
-
-            if critic_report.review.decision == "approve" {
-                println!(
-                    "\n>>> [TALOS Auto] Critic approved changes for task #{}.",
-                    task.id
-                );
-                break;
+            match crate::worktree::finalize(project, database, task.id) {
+                Ok(_) => {
+                    println!(
+                        ">>> [TALOS Auto] Task #{} worktree finalized successfully!",
+                        task.id
+                    );
+                }
+                Err(e) => {
+                    println!(">>> [TALOS Auto] Worktree finalization note: {e}");
+                }
             }
-
-            if cycles >= MAX_REVIEW_FIX_CYCLES {
-                println!(
-                    "\n>>> [TALOS Auto] Critic requested changes, but maximum review/fix rounds ({MAX_REVIEW_FIX_CYCLES}) reached. Task remains in implementing for review."
-                );
-                return Ok(());
-            }
-
-            println!(
-                "\n>>> [TALOS Auto] Critic requested changes. Launching Writer fix iteration..."
-            );
-            let fix_execution =
-                execute_writer_task(json_output, &execution_project, database, task.id, None)
-                    .await?;
-            let fix_changed = git_status_paths(&execution_project)?;
-            print_writer_report(json_output, &fix_execution, Some(&fix_changed))?;
-            ensure_writer_succeeded(&fix_execution)?;
         }
-    }
 
-    // Step 3: Project Verification / Tests
-    let checks = database.task_verification_checks(task.id)?;
-    if checks.is_empty() {
+        // Commit task changes locally if primary worktree is dirty
+        let dirty = git_status_paths(project)?;
+        if !dirty.is_empty() {
+            let commit_msg = format!("talos: task #{}: {}", task.id, task.title);
+            let _ = git_command(project, &["add", "."]);
+            let _ = git_command(project, &["commit", "-m", &commit_msg]);
+            println!(">>> [TALOS Auto] Committed task #{} changes locally in Git.", task.id);
+        }
+
+        // Step 5: Optional GitHub Draft PR creation (if enabled by policy)
         let config = ProjectConfig::load(project)?;
-        if !config.checks.is_empty() {
-            println!(
-                "\n>>> [TALOS Auto] Attaching {} configured project check(s) to task #{}...",
-                config.checks.len(),
-                task.id
-            );
-            database.add_task_verification_checks(task.id, &config.checks)?;
-        }
-    }
-
-    println!(
-        "\n>>> [TALOS Auto] Running project verification for task #{}...",
-        task.id
-    );
-    run_task_verification(json_output, project, database, task.id).await?;
-    println!(
-        "\n>>> [TALOS Auto] Task #{} verified and completed successfully!",
-        task.id
-    );
-
-    // Step 4: Finalize Worktree Integration (if task executed in a worktree)
-    if has_worktree {
-        println!(
-            "\n>>> [TALOS Auto] Finalizing task #{} worktree...",
-            task.id
-        );
-        match crate::worktree::finalize(project, database, task.id) {
-            Ok(_) => {
-                println!(
-                    ">>> [TALOS Auto] Task #{} worktree finalized successfully!",
-                    task.id
-                );
-            }
-            Err(e) => {
-                println!(">>> [TALOS Auto] Worktree finalization note: {e}");
-            }
-        }
-    }
-
-    // Step 5: Optional GitHub Draft PR creation (if enabled by policy)
-    let config = ProjectConfig::load(project)?;
-    if let Some(policy) = &config.github
-        && policy.allow_push
-        && policy.allow_pull_request
-    {
+        if let Some(policy) = &config.github
+            && policy.allow_push
+            && policy.allow_pull_request
+        {
             println!(
                 "\n>>> [TALOS Auto] GitHub publication policy is enabled. Preparing Draft PR for task #{}...",
                 task.id
@@ -3076,8 +3102,7 @@ async fn run_one_shot_auto(
                 println!(">>> [TALOS Auto] Note: GitHub publication was skipped or failed: {e}");
             }
         }
-
-    Ok(())
+    }
 }
 
 async fn run_one_shot_semi(
