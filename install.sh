@@ -4,12 +4,12 @@
 
 set -euo pipefail
 
-BOLD="\033[1m"
-GREEN="\033[0;32m"
-BLUE="\033[0;34m"
-YELLOW="\033[0;33m"
-RED="\033[0;31m"
-RESET="\033[0m"
+BOLD="$(printf '\033[1m')"
+GREEN="$(printf '\033[0;32m')"
+BLUE="$(printf '\033[0;34m')"
+YELLOW="$(printf '\033[0;33m')"
+RED="$(printf '\033[0;31m')"
+RESET="$(printf '\033[0m')"
 
 log_info() {
   printf "${BLUE}==>${RESET} ${BOLD}%s${RESET}\n" "$1"
