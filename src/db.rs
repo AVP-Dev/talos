@@ -295,6 +295,10 @@ pub struct VerificationEvidenceRecord {
 #[derive(Clone, Debug, Serialize)]
 pub struct LatestVerificationSummary {
     pub run: VerificationRunRecord,
+    pub base_revision: String,
+    pub head_commit: String,
+    pub patch_sha256: String,
+    pub changed_paths_json: String,
     pub check_count: usize,
 }
 
@@ -2326,17 +2330,26 @@ impl Database {
         &self,
         task_id: i64,
     ) -> Result<Option<LatestVerificationSummary>> {
-        let run = self
+        let latest: Option<(VerificationRunRecord, String, String, String, String)> = self
             .connection
             .query_row(
                 "SELECT id, task_id, critic_review_id, status, revision_id, started_at_ms,
-                        finished_at_ms
+                        finished_at_ms, base_revision, head_commit, patch_sha256, changed_paths_json
                  FROM verification_runs WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
                 [task_id],
-                map_verification_run_record,
+                |row| {
+                    Ok((
+                        map_verification_run_record(row)?,
+                        row.get(7)?,
+                        row.get(8)?,
+                        row.get(9)?,
+                        row.get(10)?,
+                    ))
+                },
             )
             .optional()?;
-        let Some(run) = run else {
+        let Some((run, base_revision, head_commit, patch_sha256, changed_paths_json)) = latest
+        else {
             return Ok(None);
         };
         let check_count: i64 = self.connection.query_row(
@@ -2346,7 +2359,14 @@ impl Database {
         )?;
         let check_count = usize::try_from(check_count)
             .context("Verification check count is outside the supported range")?;
-        Ok(Some(LatestVerificationSummary { run, check_count }))
+        Ok(Some(LatestVerificationSummary {
+            run,
+            base_revision,
+            head_commit,
+            patch_sha256,
+            changed_paths_json,
+            check_count,
+        }))
     }
 
     pub fn begin_writer_attempt(

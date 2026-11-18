@@ -334,7 +334,7 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 
 - Extended `docs/verification.md` with separate database growth, migration-fault, process-limit, worktree-recovery, GitHub-recovery, CI-storage, backup/restore, and reproducible-build scenarios.
 - No database growth threshold or compaction/retention policy has been selected. Record actual size/memory measurements; keep archival and pruning decisions under F1 rather than claiming bounded long-term database size.
-- Changed `talos stop` polling to query the requested Writer attempt by primary key. Before this, each 100 ms poll loaded the full project-wide attempt history. The large-history measurement remains pending; no retention or compaction policy is implied.
+- Changed `talos stop` polling, Writer review, child-task reports, worktree routing/removal/finalization, and explicit attempt resolution to use primary-key or latest-row queries instead of materializing full histories. The large-history measurement remains pending; no retention or compaction policy is implied.
 - This is a test plan only. No long-running, fault-injection, or database-growth tests were run.
 
 ## R9.4 closure — documentation alignment

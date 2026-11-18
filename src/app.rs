@@ -2056,18 +2056,14 @@ fn print_child_task_report(json_output: bool, database: &Database, task_id: i64)
     let contract = database
         .child_task_contract(task_id)?
         .with_context(|| format!("Task #{task_id} has no bounded child-task contract"))?;
-    let latest_attempt = database
-        .writer_attempts(Some(task_id))?
-        .into_iter()
-        .last()
-        .map(|attempt| {
-            json!({
-                "attempt_id": attempt.id,
-                "state": attempt.state,
-                "error_code": attempt.error_code,
-                "exit_code": attempt.exit_code,
-            })
-        });
+    let latest_attempt = database.latest_writer_attempt(task_id)?.map(|attempt| {
+        json!({
+            "attempt_id": attempt.id,
+            "state": attempt.state,
+            "error_code": attempt.error_code,
+            "exit_code": attempt.exit_code,
+        })
+    });
     let latest_review = database.latest_critic_review(task_id)?.map(|review| {
         json!({
             "review_id": review.id,
@@ -2077,15 +2073,13 @@ fn print_child_task_report(json_output: bool, database: &Database, task_id: i64)
         })
     });
     let latest_verification = database
-        .verification_history(task_id)?
-        .into_iter()
-        .last()
+        .latest_verification_summary(task_id)?
         .map(|evidence| {
             json!({
                 "run_id": evidence.run.id,
                 "status": evidence.run.status,
                 "revision_id": evidence.run.revision_id,
-                "check_count": evidence.checks.len(),
+                "check_count": evidence.check_count,
             })
         });
     let report = json!({
@@ -3167,9 +3161,7 @@ fn resolve_writer_attempt(
 
     let resolution = (|| {
         let attempt = database
-            .writer_attempts(None)?
-            .into_iter()
-            .find(|attempt| attempt.id == attempt_id)
+            .get_writer_attempt(attempt_id)?
             .with_context(|| format!("Writer attempt #{attempt_id} does not exist"))?;
         if attempt.state != "unknown" || attempt.operator_resolution.is_some() {
             bail!("Writer attempt #{attempt_id} is not an unresolved unknown attempt");

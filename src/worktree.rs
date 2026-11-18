@@ -100,7 +100,7 @@ pub fn execution_project(project: &Project, database: &Database, task_id: i64) -
     };
     if record.state == TaskWorktreeState::Active
         && record.writer_routed_at_ms.is_none()
-        && !database.writer_attempts(Some(task_id))?.is_empty()
+        && database.latest_writer_attempt(task_id)?.is_some()
     {
         return Ok(project.clone());
     }
@@ -288,7 +288,7 @@ pub fn remove(
         .find(|task| task.id == task_id)
         .with_context(|| format!("Task #{task_id} does not exist"))?;
     if task.status != TaskStatus::Queued
-        || !database.writer_attempts(Some(task_id))?.is_empty()
+        || database.latest_writer_attempt(task_id)?.is_some()
         || database.task_worktree_integration(task_id)?.is_some()
     {
         bail!("Only an unused queued task worktree with no integration history can be removed");
@@ -492,9 +492,7 @@ pub fn finalize(
         );
     }
     let verification = database
-        .verification_history(task_id)?
-        .into_iter()
-        .last()
+        .latest_verification_summary(task_id)?
         .with_context(|| format!("Task #{task_id} has no verification evidence"))?;
     if verification.run.status != "passed"
         || verification.run.critic_review_id != review.id

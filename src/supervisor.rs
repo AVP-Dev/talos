@@ -206,9 +206,8 @@ pub async fn run_critic_review(
         );
     }
 
-    let attempts = database.writer_attempts(Some(task_id))?;
-    let writer = attempts
-        .last()
+    let writer = database
+        .latest_writer_attempt(task_id)?
         .context("Task has no saved Writer attempt to review")?;
     if writer.state != "succeeded" {
         bail!("Critic review requires the latest Writer attempt to have succeeded");
