@@ -306,8 +306,11 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             TaskCommand::Worktree { command } => match command {
                 TaskWorktreeCommand::Create { task_id } => {
-                    let record = worktree::create(&project, &mut database, task_id)?;
-                    print_task_worktree(cli.json, "created", &record)?;
+                    let record =
+                        with_worktree_supervisor_lease(&mut database, "create", |database| {
+                            worktree::create(&project, database, task_id)
+                        })?;
+                    print_task_worktree(cli.json, "created", &record, &database)?;
                 }
                 TaskWorktreeCommand::List => {
                     let worktrees = worktree::list(&database)?;
@@ -317,17 +320,37 @@ pub async fn run(cli: Cli) -> Result<()> {
                         println!("No TALOS-managed task worktrees.");
                     } else {
                         for record in worktrees {
-                            print_task_worktree(false, "", &record)?;
+                            print_task_worktree(false, "", &record, &database)?;
                         }
                     }
                 }
                 TaskWorktreeCommand::Reconcile { task_id } => {
-                    let record = worktree::reconcile(&project, &mut database, task_id)?;
-                    print_task_worktree(cli.json, "reconciled", &record)?;
+                    let record =
+                        with_worktree_supervisor_lease(&mut database, "reconcile", |database| {
+                            worktree::reconcile(&project, database, task_id)
+                        })?;
+                    print_task_worktree(cli.json, "reconciled", &record, &database)?;
                 }
                 TaskWorktreeCommand::Remove { task_id } => {
-                    let record = worktree::remove(&project, &mut database, task_id)?;
-                    print_task_worktree(cli.json, "retired", &record)?;
+                    let record =
+                        with_worktree_supervisor_lease(&mut database, "remove", |database| {
+                            worktree::remove(&project, database, task_id)
+                        })?;
+                    print_task_worktree(cli.json, "retired", &record, &database)?;
+                }
+                TaskWorktreeCommand::Integrate { task_id } => {
+                    let integration =
+                        with_worktree_supervisor_lease(&mut database, "integrate", |database| {
+                            worktree::integrate(&project, database, task_id)
+                        })?;
+                    print_task_worktree_integration(cli.json, "pending_review", &integration)?;
+                }
+                TaskWorktreeCommand::Finalize { task_id } => {
+                    let integration =
+                        with_worktree_supervisor_lease(&mut database, "finalize", |database| {
+                            worktree::finalize(&project, database, task_id)
+                        })?;
+                    print_task_worktree_integration(cli.json, "integrated", &integration)?;
                 }
             },
             TaskCommand::List => {
@@ -735,9 +758,66 @@ async fn run_queued_task(
     database: &mut Database,
     task_id: i64,
 ) -> Result<()> {
-    let report = execute_writer_task(json_output, project, database, task_id, None).await?;
+    let execution_project = execution_project_for_task(project, database, task_id)?;
+    let report =
+        execute_writer_task(json_output, &execution_project, database, task_id, None).await?;
     print_writer_report(json_output, &report, None)?;
     ensure_writer_succeeded(&report)
+}
+
+fn execution_project_for_task(
+    project: &Project,
+    database: &Database,
+    task_id: i64,
+) -> Result<Project> {
+    worktree::execution_project(project, database, task_id)
+}
+
+fn ensure_execution_root_current(
+    execution_project: &Project,
+    database: &Database,
+    task_id: i64,
+) -> Result<()> {
+    let primary_project = execution_project.primary_project();
+    let current = worktree::execution_project(&primary_project, database, task_id)?;
+    if current.root != execution_project.root {
+        bail!(
+            "Task #{task_id} execution worktree changed before the operation acquired its supervisor lease; retry after inspecting the task worktree"
+        );
+    }
+    Ok(())
+}
+
+fn ensure_task_worktree_integrated_before_review(database: &Database, task_id: i64) -> Result<()> {
+    if let Some(worktree) = database.task_worktree(task_id)?
+        && worktree.state == crate::db::TaskWorktreeState::Active
+        && worktree.writer_routed_at_ms.is_some()
+        && database.task_worktree_integration(task_id)?.is_none()
+    {
+        bail!(
+            "Task #{task_id} has an active worktree; run its Writer, then `talos task worktree integrate {task_id}` before Critic review or verification"
+        );
+    }
+    Ok(())
+}
+
+fn with_worktree_supervisor_lease<T>(
+    database: &mut Database,
+    operation: &str,
+    action: impl FnOnce(&mut Database) -> Result<T>,
+) -> Result<T> {
+    let now = now_ms()?;
+    let owner_id = format!("talos-worktree-{operation}-{}-{now}", std::process::id());
+    let lease_duration_ms = i64::try_from(SUPERVISOR_LEASE.as_millis())
+        .context("Supervisor lease duration is out of range")?;
+    let lease = database
+        .acquire_supervisor_lease(&owner_id, now, lease_duration_ms)?
+        .context("Another TALOS supervisor currently owns the project lease")?;
+    let result = action(database);
+    if !database.release_supervisor_lease(&lease)? {
+        bail!("TALOS lost its supervisor lease during task worktree {operation}");
+    }
+    result
 }
 
 fn ensure_queue_running(database: &Database) -> Result<()> {
@@ -848,8 +928,15 @@ async fn continue_task(
         conversation_id,
         project_inspected_attested,
     };
-    let report =
-        execute_writer_task(json_output, project, database, task_id, Some(continuation)).await?;
+    let execution_project = execution_project_for_task(project, database, task_id)?;
+    let report = execute_writer_task(
+        json_output,
+        &execution_project,
+        database,
+        task_id,
+        Some(continuation),
+    )
+    .await?;
     print_writer_report(json_output, &report, None)?;
     ensure_writer_succeeded(&report)
 }
@@ -860,7 +947,10 @@ async fn run_task_review(
     database: &mut Database,
     task_id: i64,
 ) -> Result<()> {
-    let report = execute_critic_review(project, database, task_id).await?;
+    ensure_task_worktree_integrated_before_review(database, task_id)?;
+    let execution_project = execution_project_for_task(project, database, task_id)?;
+    validate_project_scope(&execution_project)?;
+    let report = execute_critic_review(&execution_project, database, task_id).await?;
     print_critic_report(json_output, &report)?;
     Ok(())
 }
@@ -872,7 +962,7 @@ struct VerificationReport {
     critic_review_id: i64,
     revision_id: String,
     status: String,
-    task_status: &'static str,
+    task_status: String,
     checks: Vec<CheckExecution>,
 }
 
@@ -880,11 +970,14 @@ fn print_task_worktree(
     json_output: bool,
     action: &str,
     record: &crate::db::TaskWorktreeRecord,
+    database: &Database,
 ) -> Result<()> {
+    let integration = database.task_worktree_integration(record.task_id)?;
     if json_output {
         print_json(&json!({
             "action": if action.is_empty() { None } else { Some(action) },
             "worktree": record,
+            "integration": integration,
         }))?;
     } else {
         if !action.is_empty() {
@@ -901,6 +994,37 @@ fn print_task_worktree(
             redact_sensitive(&record.worktree_path),
             record.base_commit
         );
+        if let Some(integration) = integration {
+            println!("  Integration: {}", integration.state);
+        }
+    }
+    Ok(())
+}
+
+fn print_task_worktree_integration(
+    json_output: bool,
+    action: &str,
+    record: &crate::db::TaskWorktreeIntegrationRecord,
+) -> Result<()> {
+    if json_output {
+        print_json(&json!({ "action": action, "integration": record }))?;
+    } else {
+        println!(
+            "Task #{} worktree integration is {}.",
+            record.task_id, record.state
+        );
+        println!(
+            "  Base: {}; source revision: {}",
+            record.base_commit, record.revision_id
+        );
+        if let Some(commit) = &record.integration_commit {
+            println!("  Primary commit: {commit}");
+        } else if record.state == "pending" {
+            println!(
+                "  Review and verification must pass after integration, then commit the changes in the primary project and run `talos task worktree finalize {}`.",
+                record.task_id
+            );
+        }
     }
     Ok(())
 }
@@ -999,6 +1123,9 @@ async fn run_task_verification(
     if task.status != crate::db::TaskStatus::Verifying {
         bail!("Task #{task_id} must have an approved Critic review before verification");
     }
+    ensure_task_worktree_integrated_before_review(database, task_id)?;
+    let execution_project = execution_project_for_task(project, database, task_id)?;
+    validate_project_scope(&execution_project)?;
     let checks = database.task_verification_checks(task_id)?;
     if checks.is_empty() {
         bail!("Task #{task_id} has no saved project checks; it cannot be completed");
@@ -1014,7 +1141,8 @@ async fn run_task_verification(
     if review.decision != "approve" {
         bail!("Task #{task_id} does not have an approved Critic review");
     }
-    let before = RevisionSnapshot::capture(project.root.as_path(), &review.base_revision)?;
+    let before =
+        RevisionSnapshot::capture(execution_project.root.as_path(), &review.base_revision)?;
     let facts = before.facts();
     let now = now_ms()?;
     let owner_id = format!("talos-task-verify-{}-{now}", std::process::id());
@@ -1025,6 +1153,7 @@ async fn run_task_verification(
         .context("Another TALOS supervisor currently owns the project lease")?;
 
     let verification = async {
+        ensure_execution_root_current(&execution_project, database, task_id)?;
         let run = database.begin_verification_run(task_id, review.id, &facts, &lease)?;
         let started = tokio::time::Instant::now();
         let mut results = Vec::with_capacity(checks.len());
@@ -1037,7 +1166,7 @@ async fn run_task_verification(
             } else if remaining.is_zero() {
                 failed_check_execution(check, "verification_budget_exhausted")
             } else {
-                match run_project_check(&project.root, check, remaining).await {
+                match run_project_check(&execution_project.root, check, remaining).await {
                     Ok(result) => result,
                     Err(_) => failed_check_execution(check, "check_runner_failed"),
                 }
@@ -1046,9 +1175,10 @@ async fn run_task_verification(
             database.record_verification_result(run.id, &result, &lease)?;
             results.push(result);
         }
-        let snapshot_matches = RevisionSnapshot::capture(&project.root, &facts.base_commit)
-            .map(|snapshot| snapshot.facts() == facts)
-            .unwrap_or(false);
+        let snapshot_matches =
+            RevisionSnapshot::capture(&execution_project.root, &facts.base_commit)
+                .map(|snapshot| snapshot.facts() == facts)
+                .unwrap_or(false);
         let completed = database.finish_verification_run(run.id, snapshot_matches, &lease)?;
         Ok::<_, anyhow::Error>((completed, results))
     }
@@ -1064,11 +1194,12 @@ async fn run_task_verification(
         critic_review_id: run.critic_review_id,
         revision_id: run.revision_id,
         status: run.status.clone(),
-        task_status: if run.status == "passed" {
-            "complete"
-        } else {
-            "verifying"
-        },
+        task_status: database
+            .list_tasks()?
+            .into_iter()
+            .find(|task| task.id == task_id)
+            .map(|task| task.status.as_str().to_owned())
+            .context("Task disappeared after verification")?,
         checks,
     };
     if json_output {
@@ -1164,14 +1295,18 @@ async fn execute_critic_review(
     let lease = database
         .acquire_supervisor_lease(&owner_id, now, lease_duration_ms)?
         .context("Another TALOS supervisor currently owns the project lease")?;
-    let review = run_critic_review(
-        project,
-        database,
-        task_id,
-        executable,
-        &version,
-        WRITER_TIMEOUT,
-    )
+    let review = async {
+        ensure_execution_root_current(project, database, task_id)?;
+        run_critic_review(
+            project,
+            database,
+            task_id,
+            executable,
+            &version,
+            WRITER_TIMEOUT,
+        )
+        .await
+    }
     .await;
     let lease_released = database.release_supervisor_lease(&lease)?;
     if !lease_released {
@@ -1226,28 +1361,33 @@ async fn execute_writer_task(
         .acquire_supervisor_lease(&owner_id, now, lease_duration_ms)?
         .context("Another TALOS supervisor currently owns the project lease")?;
 
-    let execution = if let Some(continuation) = continuation {
-        continue_writer_attempt(
-            project,
-            database,
-            task_id,
-            executable,
-            &version,
-            WRITER_TIMEOUT,
-            continuation,
-        )
-        .await
-    } else {
-        run_writer_attempt(
-            project,
-            database,
-            task_id,
-            executable,
-            &version,
-            WRITER_TIMEOUT,
-        )
-        .await
-    };
+    let execution = async {
+        ensure_execution_root_current(project, database, task_id)?;
+        database.mark_task_worktree_writer_routed(task_id)?;
+        if let Some(continuation) = continuation {
+            continue_writer_attempt(
+                project,
+                database,
+                task_id,
+                executable,
+                &version,
+                WRITER_TIMEOUT,
+                continuation,
+            )
+            .await
+        } else {
+            run_writer_attempt(
+                project,
+                database,
+                task_id,
+                executable,
+                &version,
+                WRITER_TIMEOUT,
+            )
+            .await
+        }
+    }
+    .await;
     let lease_released = database.release_supervisor_lease(&lease)?;
     if !lease_released {
         bail!("TALOS lost its supervisor lease while running the Writer");
@@ -1425,6 +1565,7 @@ async fn run_one_shot_auto(
         return Ok(());
     };
 
+    let execution_project = execution_project_for_task(project, database, task.id)?;
     let before = git_status_paths(project)?;
     if !before.is_empty() {
         bail!(
@@ -1432,9 +1573,17 @@ async fn run_one_shot_auto(
             before.join(", ")
         );
     }
+    let execution_before = git_status_paths(&execution_project)?;
+    if !execution_before.is_empty() {
+        bail!(
+            "`up --auto` requires a clean task execution worktree; inspect or commit these existing paths first: {}",
+            execution_before.join(", ")
+        );
+    }
 
-    let execution = execute_writer_task(json_output, project, database, task.id, None).await;
-    let changed_files = git_status_paths(project)?;
+    let execution =
+        execute_writer_task(json_output, &execution_project, database, task.id, None).await;
+    let changed_files = git_status_paths(&execution_project)?;
     let report = execution?;
     print_writer_report(json_output, &report, Some(&changed_files))?;
     ensure_writer_succeeded(&report)
@@ -1496,6 +1645,7 @@ async fn run_one_shot_semi(
         }
         return Ok(());
     };
+    let execution_project = execution_project_for_task(project, database, task.id)?;
     let before = git_status_paths(project)?;
     if !before.is_empty() {
         bail!(
@@ -1503,12 +1653,20 @@ async fn run_one_shot_semi(
             before.join(", ")
         );
     }
+    let execution_before = git_status_paths(&execution_project)?;
+    if !execution_before.is_empty() {
+        bail!(
+            "`up --semi` requires a clean task execution worktree; inspect or commit these existing paths first: {}",
+            execution_before.join(", ")
+        );
+    }
     request_operator_approval(&format!(
         "Start the configured Writer for task #{} ({})?",
         task.id, task.title
     ))?;
-    let execution = execute_writer_task(json_output, project, database, task.id, None).await;
-    let changed_files = git_status_paths(project)?;
+    let execution =
+        execute_writer_task(json_output, &execution_project, database, task.id, None).await;
+    let changed_files = git_status_paths(&execution_project)?;
     let report = execution?;
     print_writer_report(json_output, &report, Some(&changed_files))?;
     ensure_writer_succeeded(&report)
@@ -1970,6 +2128,7 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create temporary project");
         Project {
+            state_root: root.clone(),
             root,
             discovery: DiscoveryMethod::CurrentDirectory,
         }
@@ -2007,6 +2166,7 @@ mod tests {
         init_git(&project.root);
         let git_project = Project {
             root: project.root.clone(),
+            state_root: project.root.clone(),
             discovery: DiscoveryMethod::Git,
         };
         let error = ensure_talos_ignored(&git_project).expect_err("missing ignore must fail");
@@ -2034,6 +2194,7 @@ mod tests {
         assert!(staged.success());
         let git_project = Project {
             root: project.root.clone(),
+            state_root: project.root.clone(),
             discovery: DiscoveryMethod::Git,
         };
         let error = ensure_talos_ignored(&git_project).expect_err("tracked runtime must fail");

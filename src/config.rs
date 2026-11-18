@@ -151,6 +151,7 @@ mod tests {
         let root = temp_dir();
         let project = Project {
             root: root.clone(),
+            state_root: root.clone(),
             discovery: crate::project::DiscoveryMethod::ProjectMarker("Cargo.toml".to_owned()),
         };
         let config = ProjectConfig::load(&project).expect("load defaults");
@@ -164,6 +165,7 @@ mod tests {
         let root = temp_dir();
         let project = Project {
             root: root.clone(),
+            state_root: root.clone(),
             discovery: crate::project::DiscoveryMethod::ProjectMarker("Cargo.toml".to_owned()),
         };
         project
@@ -184,6 +186,7 @@ mod tests {
         let root = temp_dir();
         let project = Project {
             root: root.clone(),
+            state_root: root.clone(),
             discovery: crate::project::DiscoveryMethod::ProjectMarker("Cargo.toml".to_owned()),
         };
         project
@@ -205,6 +208,7 @@ mod tests {
         let root = temp_dir();
         let project = Project {
             root: root.clone(),
+            state_root: root.clone(),
             discovery: crate::project::DiscoveryMethod::ProjectMarker("Cargo.toml".to_owned()),
         };
         project

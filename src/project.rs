@@ -19,6 +19,7 @@ pub enum DiscoveryMethod {
 #[derive(Clone, Debug, Serialize)]
 pub struct Project {
     pub root: PathBuf,
+    pub state_root: PathBuf,
     pub discovery: DiscoveryMethod,
 }
 
@@ -30,6 +31,7 @@ impl Project {
 
         if let Some(root) = git_root(&start)? {
             return Ok(Self {
+                state_root: root.clone(),
                 root,
                 discovery: DiscoveryMethod::Git,
             });
@@ -40,6 +42,7 @@ impl Project {
             if talos_dir.is_dir() {
                 return Ok(Self {
                     root: ancestor.to_path_buf(),
+                    state_root: ancestor.to_path_buf(),
                     discovery: DiscoveryMethod::ExistingTalosDirectory,
                 });
             }
@@ -62,19 +65,40 @@ impl Project {
             {
                 return Ok(Self {
                     root: ancestor.to_path_buf(),
+                    state_root: ancestor.to_path_buf(),
                     discovery: DiscoveryMethod::ProjectMarker((*marker).to_owned()),
                 });
             }
         }
 
         Ok(Self {
+            state_root: start.clone(),
             root: start,
             discovery: DiscoveryMethod::CurrentDirectory,
         })
     }
 
+    pub fn execution_at(&self, root: &Path) -> Result<Self> {
+        let root = root
+            .canonicalize()
+            .with_context(|| format!("Cannot resolve execution worktree {}", root.display()))?;
+        Ok(Self {
+            root,
+            state_root: self.state_root.clone(),
+            discovery: self.discovery.clone(),
+        })
+    }
+
+    pub fn primary_project(&self) -> Self {
+        Self {
+            root: self.state_root.clone(),
+            state_root: self.state_root.clone(),
+            discovery: self.discovery.clone(),
+        }
+    }
+
     pub fn runtime_dir(&self) -> PathBuf {
-        self.root.join(".talos")
+        self.state_root.join(".talos")
     }
 
     pub fn database_path(&self) -> PathBuf {
@@ -281,6 +305,7 @@ mod tests {
         symlink(&external, root.join(".talos")).expect("create runtime symlink");
         let project = Project {
             root: root.clone(),
+            state_root: root.clone(),
             discovery: DiscoveryMethod::CurrentDirectory,
         };
 
@@ -300,6 +325,7 @@ mod tests {
         let root = temp_dir();
         let project = Project {
             root: root.clone(),
+            state_root: root.clone(),
             discovery: DiscoveryMethod::CurrentDirectory,
         };
         project

@@ -206,6 +206,16 @@ pub enum TaskWorktreeCommand {
         /// ID of the task whose clean worktree should be removed.
         task_id: i64,
     },
+    /// Apply a task worktree patch to the clean primary project for independent review.
+    Integrate {
+        /// ID of the task whose patch should be integrated.
+        task_id: i64,
+    },
+    /// Mark a task complete after its integrated changes are committed and verified.
+    Finalize {
+        /// ID of the task whose committed integration should be finalized.
+        task_id: i64,
+    },
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]

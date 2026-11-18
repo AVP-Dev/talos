@@ -914,6 +914,7 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create temporary project");
         Project {
+            state_root: root.clone(),
             root,
             discovery: DiscoveryMethod::ExistingTalosDirectory,
         }
@@ -1058,6 +1059,7 @@ mod tests {
     fn filesystem_root_is_not_a_writer_workspace() {
         let project = Project {
             root: PathBuf::from("/"),
+            state_root: PathBuf::from("/"),
             discovery: DiscoveryMethod::CurrentDirectory,
         };
         assert!(validate_project_scope(&project).is_err());
@@ -1067,6 +1069,7 @@ mod tests {
     fn current_directory_fallback_is_not_a_writer_workspace() {
         let project = Project {
             root: PathBuf::from("/tmp/unclassified-writer-root"),
+            state_root: PathBuf::from("/tmp/unclassified-writer-root"),
             discovery: DiscoveryMethod::CurrentDirectory,
         };
         assert!(validate_project_scope(&project).is_err());
@@ -1082,12 +1085,14 @@ mod tests {
             .expect("canonicalize home");
         let project = Project {
             root: home.clone(),
+            state_root: home.clone(),
             discovery: DiscoveryMethod::ExistingTalosDirectory,
         };
         assert!(validate_project_scope(&project).is_err());
         if let Some(parent) = home.parent() {
             let project = Project {
                 root: parent.to_path_buf(),
+                state_root: parent.to_path_buf(),
                 discovery: DiscoveryMethod::Git,
             };
             assert!(validate_project_scope(&project).is_err());

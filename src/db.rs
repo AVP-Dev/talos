@@ -15,7 +15,7 @@ use crate::{
     secrets::contains_sensitive,
 };
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 14;
 const MAX_CHILD_TASK_ALLOWED_PATHS: usize = 64;
 const MAX_CHILD_TASK_SCOPE_BYTES: usize = 16 * 1024;
 const MIN_CHILD_TASK_TIMEOUT_MS: i64 = 1_000;
@@ -64,6 +64,7 @@ pub struct TaskDependencyRecord {
     pub task_id: i64,
     pub prerequisite_task_id: i64,
     pub prerequisite_status: TaskStatus,
+    pub prerequisite_integration_state: Option<String>,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -107,6 +108,22 @@ pub struct TaskWorktreeRecord {
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
     pub retired_at_ms: Option<i64>,
+    pub writer_routed_at_ms: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct TaskWorktreeIntegrationRecord {
+    pub task_id: i64,
+    pub state: String,
+    pub base_commit: String,
+    pub source_head_commit: String,
+    pub revision_id: String,
+    pub patch_sha256: String,
+    pub changed_paths: Vec<String>,
+    pub integration_commit: Option<String>,
+    pub started_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub integrated_at_ms: Option<i64>,
 }
 
 impl ChildTaskContract {
@@ -619,11 +636,19 @@ impl Database {
         if task_status != TaskStatus::Queued.as_str() {
             bail!("A task worktree can only be created for a queued task");
         }
+        let prior_attempt_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM writer_attempts WHERE task_id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        if prior_attempt_count != 0 {
+            bail!("A task worktree must be created before the first Writer attempt");
+        }
 
         let existing: Option<TaskWorktreeRecord> = transaction
             .query_row(
                 "SELECT task_id, worktree_path, branch_name, base_commit, state,
-                        created_at_ms, updated_at_ms, retired_at_ms
+                        created_at_ms, updated_at_ms, retired_at_ms, writer_routed_at_ms
                  FROM task_worktrees WHERE task_id = ?1",
                 [task_id],
                 map_task_worktree,
@@ -680,7 +705,7 @@ impl Database {
         self.connection
             .query_row(
                 "SELECT task_id, worktree_path, branch_name, base_commit, state,
-                        created_at_ms, updated_at_ms, retired_at_ms
+                        created_at_ms, updated_at_ms, retired_at_ms, writer_routed_at_ms
                  FROM task_worktrees WHERE task_id = ?1",
                 [task_id],
                 map_task_worktree,
@@ -692,7 +717,7 @@ impl Database {
     pub fn task_worktrees(&self) -> Result<Vec<TaskWorktreeRecord>> {
         let mut statement = self.connection.prepare(
             "SELECT task_id, worktree_path, branch_name, base_commit, state,
-                    created_at_ms, updated_at_ms, retired_at_ms
+                    created_at_ms, updated_at_ms, retired_at_ms, writer_routed_at_ms
              FROM task_worktrees ORDER BY task_id",
         )?;
         statement
@@ -718,7 +743,7 @@ impl Database {
         let current = transaction
             .query_row(
                 "SELECT task_id, worktree_path, branch_name, base_commit, state,
-                        created_at_ms, updated_at_ms, retired_at_ms
+                        created_at_ms, updated_at_ms, retired_at_ms, writer_routed_at_ms
                  FROM task_worktrees WHERE task_id = ?1",
                 [task_id],
                 map_task_worktree,
@@ -782,6 +807,389 @@ impl Database {
             .context("Cannot commit task worktree state")?;
         self.task_worktree(task_id)?
             .context("Task worktree disappeared after state update")
+    }
+
+    pub fn mark_task_worktree_writer_routed(&mut self, task_id: i64) -> Result<bool> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot record task worktree Writer routing")?;
+        let record: Option<(String, Option<i64>)> = transaction
+            .query_row(
+                "SELECT state, writer_routed_at_ms FROM task_worktrees WHERE task_id = ?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((state, routed_at_ms)) = record else {
+            transaction.commit()?;
+            return Ok(false);
+        };
+        if state == TaskWorktreeState::Retired.as_str() {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        if state != TaskWorktreeState::Active.as_str() {
+            bail!("Task #{task_id} worktree is {state}; it cannot become a Writer workspace");
+        }
+        if routed_at_ms.is_some() {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let prior_attempt_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM writer_attempts WHERE task_id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        if prior_attempt_count != 0 {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        let task_status: Option<String> = transaction
+            .query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if task_status.as_deref() != Some(TaskStatus::Queued.as_str()) {
+            bail!("Task #{task_id} must be queued before first Writer routing to its worktree");
+        }
+        let now = now_ms()?;
+        transaction.execute(
+            "UPDATE task_worktrees SET writer_routed_at_ms = ?1, updated_at_ms = ?1
+             WHERE task_id = ?2 AND state = 'active' AND writer_routed_at_ms IS NULL",
+            params![now, task_id],
+        )?;
+        transaction.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, 'talos', 'task.worktree_writer_routed', 'The first Writer attempt was routed to the active task worktree', '{}')",
+            params![task_id, now],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot record task worktree Writer route")?;
+        Ok(true)
+    }
+
+    pub fn begin_task_worktree_integration(
+        &mut self,
+        task_id: i64,
+        base_commit: &str,
+        source_head_commit: &str,
+        revision_id: &str,
+        patch_sha256: &str,
+        changed_paths_json: &str,
+    ) -> Result<TaskWorktreeIntegrationRecord> {
+        validate_git_revision(base_commit)?;
+        validate_git_revision(source_head_commit)?;
+        validate_review_revision_id(revision_id)?;
+        validate_sha256_id(patch_sha256, "Worktree integration patch digest")?;
+        validate_changed_paths_json(changed_paths_json)?;
+        let changed_paths: Vec<String> = serde_json::from_str(changed_paths_json)?;
+        if changed_paths.is_empty() {
+            bail!("Cannot integrate an empty task worktree revision");
+        }
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot start task worktree integration")?;
+        let task_status: Option<String> = transaction
+            .query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if task_status.as_deref() != Some(TaskStatus::Reviewing.as_str()) {
+            bail!("Task #{task_id} must have a successful Writer result before integration");
+        }
+        let worktree: Option<(String, Option<i64>)> = transaction
+            .query_row(
+                "SELECT state, writer_routed_at_ms FROM task_worktrees WHERE task_id = ?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if worktree.as_ref().map(|(state, _)| state.as_str())
+            != Some(TaskWorktreeState::Active.as_str())
+            || worktree
+                .as_ref()
+                .is_none_or(|(_, routed_at_ms)| routed_at_ms.is_none())
+        {
+            bail!("Task #{task_id} does not have an active managed worktree");
+        }
+        let latest_writer: Option<(String, Option<String>)> = transaction
+            .query_row(
+                "SELECT state, base_revision FROM writer_attempts
+                 WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if latest_writer != Some(("succeeded".to_owned(), Some(base_commit.to_owned()))) {
+            bail!("Worktree integration must match the latest successful Writer base revision");
+        }
+        let now = now_ms()?;
+        transaction.execute(
+            "INSERT INTO task_worktree_integrations
+                 (task_id, state, base_commit, source_head_commit, revision_id, patch_sha256,
+                  changed_paths_json, started_at_ms, updated_at_ms)
+             VALUES (?1, 'applying', ?2, ?3, ?4, ?5, ?6, ?7, ?7)",
+            params![
+                task_id,
+                base_commit,
+                source_head_commit,
+                revision_id,
+                patch_sha256,
+                changed_paths_json,
+                now
+            ],
+        )?;
+        let event_data = serde_json::to_string(&serde_json::json!({
+            "base_commit": base_commit,
+            "source_head_commit": source_head_commit,
+            "revision_id": revision_id,
+            "patch_sha256": patch_sha256,
+            "changed_paths": changed_paths,
+        }))?;
+        transaction.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, 'talos', 'task.worktree_integration_started', 'Operator explicitly requested integration of the reviewed task workspace into the primary project tree', ?3)",
+            params![task_id, now, event_data],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot record task worktree integration start")?;
+        self.task_worktree_integration(task_id)?
+            .context("Task worktree integration record disappeared")
+    }
+
+    pub fn set_task_worktree_integration_state(
+        &mut self,
+        task_id: i64,
+        target_state: &str,
+        reason: &str,
+    ) -> Result<TaskWorktreeIntegrationRecord> {
+        if !matches!(target_state, "pending" | "needs_attention") {
+            bail!("Unsupported task worktree integration state");
+        }
+        validate_record_text("Worktree integration reason", reason, 1_000)?;
+        if contains_sensitive(reason) {
+            bail!("Worktree integration reason must not contain credentials or private keys");
+        }
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot update task worktree integration state")?;
+        let current: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM task_worktree_integrations WHERE task_id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let valid_transition = match (current.as_deref(), target_state) {
+            (Some("applying"), "pending" | "needs_attention")
+            | (Some("pending"), "needs_attention")
+            | (Some("needs_attention"), "pending") => true,
+            _ => false,
+        };
+        if !valid_transition {
+            bail!("Task #{task_id} has no worktree integration in progress");
+        }
+        let now = now_ms()?;
+        transaction.execute(
+            "UPDATE task_worktree_integrations SET state = ?1, updated_at_ms = ?2
+             WHERE task_id = ?3 AND state = ?4",
+            params![target_state, now, task_id, current],
+        )?;
+        let data_json = serde_json::to_string(&serde_json::json!({
+            "state": target_state,
+        }))?;
+        let event_type = if target_state == "pending" {
+            "task.worktree_integration_pending"
+        } else {
+            "task.worktree_integration_needs_attention"
+        };
+        transaction.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, 'talos', ?3, ?4, ?5)",
+            params![task_id, now, event_type, reason, data_json],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot commit worktree integration state")?;
+        self.task_worktree_integration(task_id)?
+            .context("Task worktree integration record disappeared")
+    }
+
+    pub fn task_worktree_integration(
+        &self,
+        task_id: i64,
+    ) -> Result<Option<TaskWorktreeIntegrationRecord>> {
+        self.connection
+            .query_row(
+                "SELECT task_id, state, base_commit, source_head_commit, revision_id, patch_sha256,
+                        changed_paths_json, integration_commit, started_at_ms, updated_at_ms, integrated_at_ms
+                 FROM task_worktree_integrations WHERE task_id = ?1",
+                [task_id],
+                map_task_worktree_integration,
+            )
+            .optional()
+            .context("Cannot read task worktree integration")
+    }
+
+    pub fn complete_task_worktree_integration(
+        &mut self,
+        task_id: i64,
+        integration_commit: &str,
+    ) -> Result<TaskWorktreeIntegrationRecord> {
+        validate_git_revision(integration_commit)?;
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot finalize task worktree integration")?;
+        let integration: Option<(String, String, String, String, String, i64)> = transaction
+            .query_row(
+                "SELECT state, base_commit, source_head_commit, revision_id, patch_sha256,
+                        updated_at_ms
+                 FROM task_worktree_integrations WHERE task_id = ?1",
+                [task_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            state,
+            base_commit,
+            source_head_commit,
+            revision_id,
+            patch_sha256,
+            integration_updated_at_ms,
+        )) = integration
+        else {
+            bail!("Task #{task_id} has no worktree integration record");
+        };
+        if state != "pending" {
+            bail!("Task #{task_id} integration is {state}, not pending");
+        }
+        let task_status: Option<String> = transaction
+            .query_row("SELECT status FROM tasks WHERE id = ?1", [task_id], |row| {
+                row.get(0)
+            })
+            .optional()?;
+        if task_status.as_deref() != Some(TaskStatus::Verifying.as_str()) {
+            bail!("Task #{task_id} must remain verifying until integration is finalized");
+        }
+        let review: Option<(i64, String, String, String, Option<String>, Option<String>)> = transaction
+                .query_row(
+                    "SELECT id, decision, base_revision, revision_id, patch_sha256, changed_paths_json
+                     FROM critic_reviews WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+                    [task_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
+                )
+                .optional()?;
+        let Some((review_id, decision, review_base, review_revision, review_patch, review_paths)) =
+            review
+        else {
+            bail!("Task #{task_id} has no Critic review for integration");
+        };
+        if decision != "approve" || review_base != base_commit {
+            bail!(
+                "Task #{task_id} latest Critic approval is not based on the integrated project base"
+            );
+        }
+        let verification: Option<(i64, String, String, String, String, String, i64)> = transaction
+            .query_row(
+                "SELECT critic_review_id, status, base_revision, revision_id, patch_sha256,
+                        changed_paths_json, started_at_ms
+                 FROM verification_runs WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
+                [task_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                        row.get(6)?,
+                    ))
+                },
+            )
+            .optional()?;
+        let Some((
+            verification_review,
+            verification_status,
+            verification_base,
+            verification_revision,
+            verification_patch,
+            verification_paths,
+            verification_started_at_ms,
+        )) = verification
+        else {
+            bail!("Task #{task_id} has no verification record for integration");
+        };
+        if verification_review != review_id
+            || verification_status != "passed"
+            || verification_base != review_base
+            || verification_revision != review_revision
+            || Some(verification_patch.as_str()) != review_patch.as_deref()
+            || Some(verification_paths.as_str()) != review_paths.as_deref()
+            || verification_started_at_ms < integration_updated_at_ms
+        {
+            bail!(
+                "Task #{task_id} latest verification does not match the approved post-integration revision"
+            );
+        }
+
+        let now = now_ms()?;
+        transaction.execute(
+            "UPDATE task_worktree_integrations
+             SET state = 'integrated', integration_commit = ?1, updated_at_ms = ?2, integrated_at_ms = ?2
+             WHERE task_id = ?3 AND state = 'pending'",
+            params![integration_commit, now, task_id],
+        )?;
+        let data_json = serde_json::to_string(&serde_json::json!({
+            "integration_commit": integration_commit,
+            "source_head_commit": source_head_commit,
+            "revision_id": revision_id,
+            "patch_sha256": patch_sha256,
+        }))?;
+        transaction.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, 'talos', 'task.worktree_integrated', 'The operator committed the exact reviewed and verified task patch into the primary project tree', ?3)",
+            params![task_id, now, data_json],
+        )?;
+        let updated = transaction.execute(
+            "UPDATE tasks SET status = 'complete', updated_at_ms = ?1
+             WHERE id = ?2 AND status = 'verifying'",
+            params![now, task_id],
+        )?;
+        if updated != 1 {
+            bail!("Task #{task_id} changed before integration could complete it");
+        }
+        let transition_data = serde_json::to_string(&serde_json::json!({
+            "from": "verifying",
+            "to": "complete",
+            "integration_commit": integration_commit,
+        }))?;
+        transaction.execute(
+            "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+             VALUES (?1, ?2, 'talos', 'task.status_changed', 'Exact verified changes were committed to the primary project tree', ?3)",
+            params![task_id, now, transition_data],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot commit completed task worktree integration")?;
+        self.task_worktree_integration(task_id)?
+            .context("Task worktree integration disappeared after finalization")
     }
 
     pub fn add_task_dependency(&mut self, task_id: i64, prerequisite_task_id: i64) -> Result<bool> {
@@ -860,9 +1268,11 @@ impl Database {
 
     pub fn task_dependencies(&self, task_id: i64) -> Result<Vec<TaskDependencyRecord>> {
         let mut statement = self.connection.prepare(
-            "SELECT edges.task_id, edges.depends_on_task_id, tasks.status
+            "SELECT edges.task_id, edges.depends_on_task_id, tasks.status, integrations.state
              FROM task_dependencies AS edges
              JOIN tasks ON tasks.id = edges.depends_on_task_id
+             LEFT JOIN task_worktree_integrations AS integrations
+               ON integrations.task_id = tasks.id
              WHERE edges.task_id = ?1 ORDER BY edges.depends_on_task_id",
         )?;
         statement
@@ -881,6 +1291,7 @@ impl Database {
                             )),
                         )
                     })?,
+                    prerequisite_integration_state: row.get(3)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()
@@ -893,7 +1304,12 @@ impl Database {
             "SELECT EXISTS(
                  SELECT 1 FROM task_dependencies AS edges
                  JOIN tasks AS prerequisite ON prerequisite.id = edges.depends_on_task_id
-                 WHERE edges.task_id = ?1 AND prerequisite.status <> 'complete'
+                 WHERE edges.task_id = ?1 AND (
+                     prerequisite.status <> 'complete'
+                     OR EXISTS(SELECT 1 FROM task_worktree_integrations AS integrations
+                               WHERE integrations.task_id = prerequisite.id
+                                 AND integrations.state <> 'integrated')
+                 )
              )",
         )?;
         let mut runnable = Vec::new();
@@ -915,7 +1331,12 @@ impl Database {
              FROM tasks
              JOIN task_dependencies AS edges ON edges.task_id = tasks.id
              JOIN tasks AS prerequisite ON prerequisite.id = edges.depends_on_task_id
-             WHERE tasks.status = 'queued' AND prerequisite.status <> 'complete'
+             WHERE tasks.status = 'queued' AND (
+                 prerequisite.status <> 'complete'
+                 OR EXISTS(SELECT 1 FROM task_worktree_integrations AS integrations
+                           WHERE integrations.task_id = prerequisite.id
+                             AND integrations.state <> 'integrated')
+             )
              ORDER BY tasks.id, edges.depends_on_task_id",
         )?;
         let rows = statement
@@ -1540,11 +1961,72 @@ impl Database {
         let Some(current_status) = current_status else {
             bail!("Task #{task_id} does not exist");
         };
+        let worktree_record: Option<(String, Option<i64>)> = transaction
+            .query_row(
+                "SELECT state, writer_routed_at_ms FROM task_worktrees WHERE task_id = ?1",
+                [task_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((state, _)) = worktree_record.as_ref()
+            && state != TaskWorktreeState::Active.as_str()
+            && state != TaskWorktreeState::Retired.as_str()
+        {
+            bail!(
+                "Task #{task_id} has a managed worktree in state {state}; reconcile or inspect it before running a Writer"
+            );
+        }
+        let integration_state: Option<String> = transaction
+            .query_row(
+                "SELECT state FROM task_worktree_integrations WHERE task_id = ?1",
+                [task_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if matches!(
+            integration_state.as_deref(),
+            Some("applying" | "needs_attention")
+        ) {
+            bail!(
+                "Task #{task_id} worktree integration needs reconciliation before another Writer can run"
+            );
+        }
+        let prior_attempt_count: i64 = transaction.query_row(
+            "SELECT COUNT(*) FROM writer_attempts WHERE task_id = ?1",
+            [task_id],
+            |row| row.get(0),
+        )?;
+        if worktree_record
+            .as_ref()
+            .is_some_and(|(state, _)| state == TaskWorktreeState::Retired.as_str())
+        {
+            if integration_state.is_some() {
+                bail!(
+                    "Task #{task_id} has integration history for its retired worktree and requires reconciliation"
+                );
+            }
+        }
+        if worktree_record
+            .as_ref()
+            .is_some_and(|(state, routed_at_ms)| {
+                state == TaskWorktreeState::Active.as_str() && routed_at_ms.is_none()
+            })
+            && prior_attempt_count == 0
+        {
+            bail!(
+                "Task #{task_id} active worktree must be marked as the Writer workspace before the first attempt"
+            );
+        }
         let unmet_dependencies: i64 = transaction.query_row(
             "SELECT COUNT(*)
              FROM task_dependencies AS edges
              JOIN tasks AS prerequisite ON prerequisite.id = edges.depends_on_task_id
-             WHERE edges.task_id = ?1 AND prerequisite.status <> 'complete'",
+             WHERE edges.task_id = ?1 AND (
+                 prerequisite.status <> 'complete'
+                 OR EXISTS(SELECT 1 FROM task_worktree_integrations AS integrations
+                           WHERE integrations.task_id = prerequisite.id
+                             AND integrations.state <> 'integrated')
+             )",
             [task_id],
             |row| row.get(0),
         )?;
@@ -2982,6 +3464,13 @@ impl Database {
         } else {
             "passed"
         };
+        let worktree_integration_required: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM task_worktrees
+                           WHERE task_id = ?1 AND state <> 'retired'
+                             AND writer_routed_at_ms IS NOT NULL)",
+            [task_id],
+            |row| row.get(0),
+        )?;
         let finished_at_ms = now_ms()?;
         let changed = transaction.execute(
             "UPDATE verification_runs SET status = ?1, finished_at_ms = ?2
@@ -2991,7 +3480,7 @@ impl Database {
         if changed != 1 {
             bail!("Verification run #{run_id} changed before it could finish");
         }
-        if status == "passed" {
+        if status == "passed" && !worktree_integration_required {
             let updated = transaction.execute(
                 "UPDATE tasks SET status = 'complete', updated_at_ms = ?1
                  WHERE id = ?2 AND status = 'verifying'",
@@ -3001,9 +3490,14 @@ impl Database {
                 bail!("Task #{task_id} changed before evidence could complete it");
             }
         }
-        let reason = match status {
-            "passed" => "All saved project checks passed for the exact approved Git revision",
-            "stale" => {
+        let reason = match (status, worktree_integration_required) {
+            ("passed", true) => {
+                "All saved project checks passed; task worktree still requires explicit integration and finalization"
+            }
+            ("passed", false) => {
+                "All saved project checks passed for the exact approved Git revision"
+            }
+            ("stale", _) => {
                 "Git facts or review authority changed while project checks were running; task remains open"
             }
             _ => "One or more saved project checks failed or did not produce complete evidence",
@@ -3013,6 +3507,7 @@ impl Database {
             "critic_review_id": critic_review_id,
             "revision_id": revision_id,
             "status": status,
+            "worktree_integration_required": worktree_integration_required,
             "required_checks": required_count,
             "recorded_checks": result_count,
             "passed_checks": passed_count,
@@ -3023,7 +3518,7 @@ impl Database {
              VALUES (?1, ?2, 'talos', 'verification.finished', ?3, ?4)",
             params![task_id, finished_at_ms, reason, event_data],
         )?;
-        if status == "passed" {
+        if status == "passed" && !worktree_integration_required {
             let transition = serde_json::to_string(&serde_json::json!({
                 "from": "verifying",
                 "to": "complete",
@@ -3617,6 +4112,64 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .context("Cannot add task worktree lifecycle records")?;
         migrated_version = 12;
     }
+    if migrated_version == 12 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE task_worktree_integrations (
+                     task_id INTEGER PRIMARY KEY REFERENCES tasks(id) ON DELETE RESTRICT,
+                     state TEXT NOT NULL CHECK(state IN ('applying', 'pending', 'needs_attention', 'integrated')),
+                     base_commit TEXT NOT NULL CHECK(length(base_commit) IN (40, 64)),
+                     source_head_commit TEXT NOT NULL CHECK(length(source_head_commit) IN (40, 64)),
+                     revision_id TEXT NOT NULL CHECK(length(revision_id) = 71),
+                     patch_sha256 TEXT NOT NULL CHECK(length(patch_sha256) = 71),
+                     changed_paths_json TEXT NOT NULL,
+                     integration_commit TEXT,
+                     started_at_ms INTEGER NOT NULL,
+                     updated_at_ms INTEGER NOT NULL,
+                     integrated_at_ms INTEGER,
+                     CHECK(updated_at_ms >= started_at_ms),
+                     CHECK((state = 'integrated' AND integration_commit IS NOT NULL AND integrated_at_ms IS NOT NULL)
+                           OR (state <> 'integrated' AND integration_commit IS NULL AND integrated_at_ms IS NULL))
+                 );
+                 CREATE TRIGGER task_worktree_integrations_identity_immutable
+                     BEFORE UPDATE OF task_id, base_commit, source_head_commit, revision_id,
+                                      patch_sha256, changed_paths_json, started_at_ms
+                     ON task_worktree_integrations BEGIN
+                         SELECT RAISE(ABORT, 'task worktree integration identity is immutable');
+                     END;
+                 CREATE TRIGGER task_worktree_integrations_state_transition
+                     BEFORE UPDATE OF state ON task_worktree_integrations
+                     WHEN NOT (
+                         (OLD.state = 'applying' AND NEW.state IN ('pending', 'needs_attention'))
+                         OR (OLD.state = 'pending' AND NEW.state IN ('needs_attention', 'integrated'))
+                         OR (OLD.state = 'needs_attention' AND NEW.state = 'pending')
+                     ) BEGIN
+                         SELECT RAISE(ABORT, 'invalid task worktree integration transition');
+                     END;
+                 CREATE TRIGGER task_worktree_integrations_no_delete
+                     BEFORE DELETE ON task_worktree_integrations BEGIN
+                         SELECT RAISE(ABORT, 'task worktree integration history is append-only');
+                     END;
+                 PRAGMA user_version = 13;",
+            )
+            .context("Cannot add task worktree integration records")?;
+        migrated_version = 13;
+    }
+    if migrated_version == 13 {
+        transaction
+            .execute_batch(
+                "ALTER TABLE task_worktrees ADD COLUMN writer_routed_at_ms INTEGER;
+                 CREATE TRIGGER task_worktrees_route_marker_immutable
+                     BEFORE UPDATE OF writer_routed_at_ms ON task_worktrees
+                     WHEN OLD.writer_routed_at_ms IS NOT NULL
+                          AND NEW.writer_routed_at_ms IS NOT OLD.writer_routed_at_ms BEGIN
+                         SELECT RAISE(ABORT, 'task worktree execution route is immutable once recorded');
+                     END;
+                 PRAGMA user_version = 14;",
+            )
+            .context("Cannot record task worktree Writer routing")?;
+        migrated_version = 14;
+    }
     if migrated_version != SCHEMA_VERSION {
         bail!("Cannot migrate database from unsupported schema version {migrated_version}");
     }
@@ -3789,6 +4342,36 @@ fn map_task_worktree(row: &rusqlite::Row<'_>) -> rusqlite::Result<TaskWorktreeRe
         created_at_ms: row.get(5)?,
         updated_at_ms: row.get(6)?,
         retired_at_ms: row.get(7)?,
+        writer_routed_at_ms: row.get(8)?,
+    })
+}
+
+fn map_task_worktree_integration(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<TaskWorktreeIntegrationRecord> {
+    let changed_paths_json: String = row.get(6)?;
+    let changed_paths = serde_json::from_str(&changed_paths_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            6,
+            rusqlite::types::Type::Text,
+            Box::new(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!("invalid task worktree integration paths: {error}"),
+            )),
+        )
+    })?;
+    Ok(TaskWorktreeIntegrationRecord {
+        task_id: row.get(0)?,
+        state: row.get(1)?,
+        base_commit: row.get(2)?,
+        source_head_commit: row.get(3)?,
+        revision_id: row.get(4)?,
+        patch_sha256: row.get(5)?,
+        changed_paths,
+        integration_commit: row.get(7)?,
+        started_at_ms: row.get(8)?,
+        updated_at_ms: row.get(9)?,
+        integrated_at_ms: row.get(10)?,
     })
 }
 
@@ -4097,6 +4680,7 @@ mod tests {
             std::env::temp_dir().join(format!("talos-db-test-{}-{sequence}", std::process::id()));
         fs::create_dir_all(&root).expect("create temporary project");
         Project {
+            state_root: root.clone(),
             root,
             discovery: DiscoveryMethod::CurrentDirectory,
         }
@@ -4196,7 +4780,7 @@ mod tests {
     fn initialization_is_idempotent_and_uses_wal() {
         let project = temp_project();
         let first = Database::open(&project).expect("initialize database");
-        assert_eq!(first.schema_version().expect("read schema version"), 12);
+        assert_eq!(first.schema_version().expect("read schema version"), 14);
         assert_eq!(
             first
                 .journal_mode()
@@ -4207,19 +4791,20 @@ mod tests {
         drop(first);
 
         let second = Database::open(&project).expect("open database again");
-        assert_eq!(second.schema_version().expect("read schema version"), 12);
+        assert_eq!(second.schema_version().expect("read schema version"), 14);
         drop(second);
         cleanup(&project);
     }
 
     #[test]
-    fn schema_v5_migrates_to_v12_with_optional_check_durations_and_control_state() {
+    fn schema_v5_migrates_to_v14_with_optional_check_durations_and_control_state() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
         database
             .connection
             .execute_batch(
-                "DROP TABLE task_worktrees;
+                "DROP TABLE task_worktree_integrations;
+                 DROP TABLE task_worktrees;
                  DROP TABLE child_task_contracts;
                  DROP TABLE task_dependencies;
                  ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
@@ -4233,7 +4818,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema-v5 duration fields");
-        assert_eq!(migrated.schema_version().unwrap(), 12);
+        assert_eq!(migrated.schema_version().unwrap(), 14);
         let columns: (i64, i64) = migrated
             .connection
             .query_row(
@@ -4250,7 +4835,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v6_migrates_to_v12_without_losing_tasks() {
+    fn schema_v6_migrates_to_v14_without_losing_tasks() {
         let project = temp_project();
         let mut database = Database::open(&project).expect("initialize current database");
         let task = database
@@ -4259,7 +4844,8 @@ mod tests {
         database
             .connection
             .execute_batch(
-                "DROP TABLE task_worktrees;
+                "DROP TABLE task_worktree_integrations;
+                 DROP TABLE task_worktrees;
                  DROP TABLE child_task_contracts;
                  DROP TABLE task_dependencies;
                  ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
@@ -4271,7 +4857,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v6");
-        assert_eq!(migrated.schema_version().unwrap(), 12);
+        assert_eq!(migrated.schema_version().unwrap(), 14);
         assert_eq!(migrated.list_tasks().unwrap()[0].id, task.id);
         assert!(!migrated.project_control_state().unwrap().queue_paused);
         cleanup(&project);
@@ -4284,7 +4870,8 @@ mod tests {
         database
             .connection
             .execute_batch(
-                "DROP TABLE task_worktrees;
+                "DROP TABLE task_worktree_integrations;
+                 DROP TABLE task_worktrees;
                  DROP TABLE child_task_contracts;
                  DROP TABLE task_dependencies;
                  ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
@@ -4295,7 +4882,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v7");
-        assert_eq!(migrated.schema_version().unwrap(), 12);
+        assert_eq!(migrated.schema_version().unwrap(), 14);
         assert_eq!(
             migrated
                 .project_control_state()
@@ -4313,7 +4900,8 @@ mod tests {
         database
             .connection
             .execute_batch(
-                "DROP TABLE task_worktrees;
+                "DROP TABLE task_worktree_integrations;
+                 DROP TABLE task_worktrees;
                  DROP TABLE child_task_contracts;
                  DROP TABLE task_dependencies;
                  ALTER TABLE writer_attempts DROP COLUMN process_identity_fingerprint;
@@ -4323,7 +4911,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v8");
-        assert_eq!(migrated.schema_version().unwrap(), 12);
+        assert_eq!(migrated.schema_version().unwrap(), 14);
         assert!(
             migrated
                 .writer_attempts(None)
@@ -4335,13 +4923,14 @@ mod tests {
     }
 
     #[test]
-    fn schema_v9_migrates_to_v12_with_dependency_tables() {
+    fn schema_v9_migrates_to_v14_with_dependency_tables() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
         database
             .connection
             .execute_batch(
-                "DROP TABLE task_worktrees;
+                "DROP TABLE task_worktree_integrations;
+                 DROP TABLE task_worktrees;
                  DROP TABLE child_task_contracts;
                  DROP TABLE task_dependencies;
                  PRAGMA user_version = 9;",
@@ -4350,7 +4939,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v9");
-        assert_eq!(migrated.schema_version().unwrap(), 12);
+        assert_eq!(migrated.schema_version().unwrap(), 14);
         let dependencies_table_exists: bool = migrated
             .connection
             .query_row(
@@ -4364,13 +4953,14 @@ mod tests {
     }
 
     #[test]
-    fn schema_v10_migrates_to_v12_with_child_task_contracts() {
+    fn schema_v10_migrates_to_v14_with_child_task_contracts() {
         let project = temp_project();
         let database = Database::open(&project).expect("initialize current database");
         database
             .connection
             .execute_batch(
-                "DROP TABLE task_worktrees;
+                "DROP TABLE task_worktree_integrations;
+                 DROP TABLE task_worktrees;
                  DROP TABLE child_task_contracts;
                  PRAGMA user_version = 10;",
             )
@@ -4378,7 +4968,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v10");
-        assert_eq!(migrated.schema_version().unwrap(), 12);
+        assert_eq!(migrated.schema_version().unwrap(), 14);
         let contracts_table_exists: bool = migrated
             .connection
             .query_row(
@@ -4721,6 +5311,7 @@ mod tests {
                  ALTER TABLE critic_reviews DROP COLUMN head_commit;
                  ALTER TABLE critic_reviews DROP COLUMN patch_sha256;
                  ALTER TABLE critic_reviews DROP COLUMN changed_paths_json;
+                 DROP TABLE task_worktree_integrations;
                  DROP TABLE task_worktrees;
                  DROP TABLE child_task_contracts;
                  DROP TABLE task_dependencies;
@@ -4733,7 +5324,7 @@ mod tests {
         drop(database);
 
         let mut migrated = Database::open(&project).expect("migrate the v4 approval");
-        assert_eq!(migrated.schema_version().unwrap(), 12);
+        assert_eq!(migrated.schema_version().unwrap(), 14);
         assert_eq!(
             migrated.list_tasks().unwrap()[0].status,
             TaskStatus::Reviewing
@@ -4875,7 +5466,7 @@ mod tests {
     }
 
     #[test]
-    fn schema_v1_migrates_to_v12_without_losing_tasks() {
+    fn schema_v1_migrates_to_v14_without_losing_tasks() {
         let project = temp_project();
         project
             .ensure_runtime_dir()
@@ -4917,7 +5508,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate existing database");
-        assert_eq!(database.schema_version().expect("read schema version"), 12);
+        assert_eq!(database.schema_version().expect("read schema version"), 14);
         let tasks = database.list_tasks().expect("read preserved tasks");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Existing v1 task");
@@ -5213,7 +5804,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate v2 database");
-        assert_eq!(database.schema_version().expect("read schema version"), 12);
+        assert_eq!(database.schema_version().expect("read schema version"), 14);
         assert!(
             database
                 .has_unresolved_writer_attempts()

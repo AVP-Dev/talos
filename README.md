@@ -2,7 +2,7 @@
 
 TALOS is a Rust CLI-first orchestrator for local AI coding CLIs. It stores tasks, Writer attempts, and events in a durable local SQLite database, supervises one verified Antigravity Writer at a time, and preserves ambiguous work for operator review.
 
-> **Current status:** R6 implementation is in progress, with macOS reconnect, process-recovery behavior, interactive handoff, and Linux server acceptance still open. R7.1 dependency scheduling and R7.2 bounded child contracts are implemented but still need behavior/migration verification. T7.3 reports native subagent invocation as untested until a configured agent and harmless live invocation are verified; manual child tasks remain available. T7.4 adds opt-in worktree lifecycle commands; task execution is not routed through those worktrees yet. Linux-specific checks are deferred to the user's server; Linux support remains unverified. No Docker or VM is required. Antigravity 1.5.10 is the only Writer- and Critic-verified adapter. Critic approval moves a task to `verifying`; TALOS completes it only after saved project checks pass for the same approved Git revision. `up --auto` runs at most one task per explicit call. `up --semi` prompts before a Writer launch and requires an interactive terminal.
+> **Current status:** R6 remains in progress: macOS SSH reconnect, process-recovery behavior, interactive handoff, and Linux server acceptance are open. R7.1–R7.5 implementation is in progress; dependency scheduling, bounded child contracts, explicit worktree lifecycle, automatic task-worktree routing, and guarded integration are implemented, with behavior and migration acceptance still open. Native Agy subagent delegation remains disabled until its public invocation interface and configured roster pass a live probe. Linux-specific checks wait for the user's server; Linux support remains unverified. No Docker or VM is required. Antigravity 1.5.10 is the only Writer- and Critic-verified adapter. Critic approval moves a task to `verifying`; managed-worktree tasks also require explicit integration, post-integration checks, a user-created commit, and finalization. `up --auto` runs at most one task per explicit call. `up --semi` prompts before a Writer launch and requires an interactive terminal.
 
 ## Start here
 
@@ -25,6 +25,12 @@ talos task dependencies 12
 talos task child 12 "Add parser support" --criteria "Parser handles the documented format" --allow src/parser.rs --timeout-seconds 900
 talos task children 12
 talos task child-report 13
+talos task worktree create 13
+talos task run 13
+talos task worktree integrate 13
+talos task review 13
+talos task verify 13
+talos task worktree finalize 13
 talos task list
 talos up --auto
 talos status
@@ -41,7 +47,7 @@ talos resume
 
 `talos stop` records an operator stop request for the active Writer and waits up to 10 seconds for confirmation. The Writer polls the durable request and terminates its process group with a bounded TERM-to-KILL sequence. A timeout means shutdown was not confirmed; inspect `talos status`, the process, and project changes, then use `talos task recover` before any retry. A hard kill of TALOS cannot send a graceful request; recovery keeps the Writer outcome unknown and requires operator inspection. Project checks also terminate their process group on timeout or interrupt. After any child leader has been reaped, TALOS does not signal its numeric process-group ID because the ID may have been reused; descendants detached from a normally exiting CLI may therefore outlive that CLI.
 
-`up --auto` requires a clean Git worktree with `.talos/` ignored and processes the first queued task once. It reports the Writer response and changed Git paths. A successful attempt remains `reviewing`. Use the independent Critic for a structured review:
+`up --auto` requires a clean primary Git worktree with `.talos/` ignored and processes the first queued task once. If the selected task has an active managed worktree, the Writer runs there while TALOS keeps SQLite and project configuration in the primary project. A successful attempt remains `reviewing`. For a task without a managed worktree, use the independent Critic for a structured review:
 
 ```sh
 talos task review <ID>
@@ -53,9 +59,9 @@ Tasks can be linked into a directed acyclic graph. `task depends <TASK> --on <PR
 
 `talos doctor` reports native subagent invocation as advertised only when the installed CLI help exposes its public invocation tool. Otherwise the capability remains untested and native delegation stays disabled until the configured agent roster and a harmless invocation are verified. Manual child tasks remain available.
 
-`task worktree create <ID>` explicitly creates a private linked worktree for a queued task, under a sibling `.talos-worktrees/<project-hash>` directory. TALOS records its branch, base commit, path, and lifecycle in SQLite. `task worktree reconcile <ID>` inspects an interrupted creation without deleting files. `task worktree remove <ID>` only removes an active worktree after checking that it has no tracked, untracked, or ignored files; it never force-removes the worktree or deletes its branch. Worktree creation does not route Writer execution into that directory yet.
+`task worktree create <ID>` explicitly creates a private linked worktree for an unused queued task, under a sibling `.talos-worktrees/<project-hash>` directory. TALOS records its branch, base commit, path, lifecycle, and first Writer-routing event in SQLite. When an active worktree is selected, `task run` routes Writer attempts there; Critic review and verification are refused until the operator integrates the patch. `task worktree integrate <ID>` requires the primary tree to be clean and still at the recorded base, checks the child path scope, then applies and stages the exact saved patch. It does not commit. Critic review and project checks then use the primary tree. A rejection routes the next Writer fix to that primary tree. After the approved revision passes checks, commit it manually in the primary project and run `task worktree finalize <ID>`; finalization checks the commit, latest review, and latest passing check evidence before marking the task complete. Prerequisites remain blocked until this finalization succeeds. `task worktree reconcile <ID>` inspects interrupted creation or integration and may reapply an exact recorded patch only when the primary tree is still clean at its saved base. `task worktree remove <ID>` only removes an active, unused queued worktree after checking that it has no tracked, untracked, or ignored files; it never force-removes the worktree or deletes its branch. The task then runs in the primary project. Integrated Writer worktrees remain dirty and are preserved for manual cleanup. Migrated worktrees with earlier Writer history keep their existing primary-tree route.
 
-The Critic uses a fresh read-only process. A rejection moves the task to `implementing`; run the task again to start a linked Writer fix, then review the new revision. Approval moves the task to `verifying`. Configure named project checks in `.talos/config.json` and save them to a task:
+The Critic uses a fresh read-only process. A rejection moves the task to `implementing`; run the task again to start a linked Writer fix, then review the new revision. Approval moves the task to `verifying`. For a managed-worktree task, checks must run after integration in the primary project; passing checks leave the task `verifying` until the user commits and explicitly finalizes the integration. Configure named project checks in `.talos/config.json` and save them to a task:
 
 ```sh
 talos task add "Describe the change" --criteria "Describe how to verify it" --check unit

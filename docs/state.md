@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R6 — Runtime and resumption remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. T6.5 implementation adds schema-v9 Linux `/proc` fingerprints and recovery reporting; Linux-native checks are deferred until server access. R7 code slices T7.1–T7.4 are implemented or in progress while behavior checks and external acceptance gates remain documented. Backlog count: 40 of 61 scheduled tasks done (65.6% by task count, unweighted); two unscheduled ideas are recorded separately.
+**R6 and R7 implementation remain in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. T6.5 implementation adds schema-v9 Linux `/proc` fingerprints and recovery reporting; Linux-native checks are deferred until server access. R7.1–R7.5 code is implemented or in progress, with behavior/migration acceptance still open; native subagent delegation and three-agent acceptance remain unavailable until verified. Backlog count: 40 of 61 scheduled tasks done (65.6% by task count, unweighted); two unscheduled ideas are recorded separately.
 
 ## Goal and fixed direction
 
@@ -278,11 +278,21 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - Added schema-v12 task worktree records and append-only lifecycle events. Explicit `task worktree create/list/reconcile/remove` commands create a linked branch from a clean base, track interrupted creation, and preserve the branch after worktree removal.
 - Worktrees use a private sibling `.talos-worktrees/<project-hash>` directory so Git metadata and `.talos` state stay outside the checked-out source. Removal refuses any tracked changes, untracked files, or ignored files; there is no force option or automatic deletion.
 - Writer/Critic/verification still operate on the primary project root. T7.5 must separate the agent execution root from the shared project state/config root before worktree execution is enabled.
-- `cargo fmt --all && cargo check --all-targets --all-features && git diff --check` passed on macOS. T7.4 implementation is uncommitted; lifecycle behavior is unverified. No worktree was created, no Linux host was contacted, and no tests were run.
+- `cargo fmt --all && cargo check --all-targets --all-features && git diff --check` passed on macOS. Lifecycle behavior is unverified. No worktree was created, no Linux host was contacted, and no tests were run.
+- T7.4 was committed locally as `2b672ea` (`feat: manage task worktree lifecycle`) on `master`.
+
+## R7.5 progress — 2026-11-18
+
+- Added `Project.state_root` so task execution can use a linked worktree while SQLite and `.talos/config.json` remain in the primary project. The runtime state is still one local database per primary project.
+- Advanced SQLite to schema v14. Schema v13 stores durable task-worktree integration identity/state and append-only task events. Schema v14 records the first Writer-routing timestamp, so worktrees with preexisting Writer history keep the primary-tree flow after migration. Integration intent is recorded before Git applies the patch; `reconcile` checks an interrupted operation and only reapplies the exact source patch when the primary tree is still clean at the saved base.
+- Active managed worktrees route Writer attempts, Critic review, and checks to their proper execution root. `task worktree integrate` requires a clean primary base, checks child scope, applies/stages the exact patch, and leaves review to the Critic on the primary tree. A post-integration Writer fix runs in the primary tree.
+- A passing post-integration verification leaves the task `verifying`. The user commits the primary changes manually; `task worktree finalize` verifies the current committed revision against the latest Critic approval and passing checks, then marks the task complete. Dependency scheduling requires integrated completion for prerequisites with a managed worktree.
+- The existing supervisor lease serializes TALOS Writer, Critic, verification, and all mutating worktree lifecycle operations. Review/verification are refused before integration. An unused queued worktree may be removed, after which the task runs in the primary project. Native Agy subagent delegation remains disabled because public invocation and agent roster have not been verified; three-agent acceptance remains open.
+- `cargo fmt --all && cargo check --all-targets --all-features && git diff --check` passed on macOS. No tests or Linux-native checks were run. T7.1–T7.5 migration/behavior acceptance remains pending. No task worktree was created and no primary project files were integrated during implementation.
 
 ## Next action
 
-Proceed to T7.5 bounded worktree integration. T7.1–T7.4 still need behavior/migration checks, and T7.3 needs a harmless native-delegation probe. R6 acceptance gates also remain open: T6.3 behavior/full-profile checks, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6's TUI trust/handoff scenario. No Linux connection or trust-setting change has been made. Continue R7–R9 implementation locally while keeping these checks unclaimed. Keep all work on `master`; the user will create the hosted repository later.
+Proceed to T8.1 GitHub capability diagnostics, then continue R8–R9 implementation in order. Do not create a GitHub repository, add a remote, push, or open a PR until the user creates the repository and explicitly authorizes that external action. R6 acceptance gates remain open: T6.3 behavior/full-profile checks, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6's TUI trust/handoff scenario. R7.1–R7.5 behavior/migration checks and T7.3 native delegation acceptance remain open. No Linux connection or trust-setting change has been made. Keep all work local on `master`.
 
 ## Session close checklist
 
