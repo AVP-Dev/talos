@@ -14,7 +14,7 @@ src/
   cli.rs                    Clap argument and subcommand definitions
   config.rs                 project configuration and GitHub policy
   db.rs                     SQLite schema, migrations, task state, events, and leases
-  adapter/                  Agy capability probe and headless process protocol
+  adapter/                  currently Agy only; R10 adds one provider profile at a time
   checks.rs                 project check execution and evidence
   github.rs                 GitHub CLI probes and policy-gated operations
   policy.rs                 Writer authority and execution-mode rules

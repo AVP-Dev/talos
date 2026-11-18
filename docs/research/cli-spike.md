@@ -129,3 +129,29 @@ The official [Antigravity headless CLI documentation](https://antigravity.google
 - [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/cli-reference)
 - [OpenCode CLI](https://opencode.ai/docs/cli/)
 - [Pi CLI](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md)
+
+## R10 profile implementation inventory — 2026-11-18
+
+This inventory distinguishes discovery from a runnable TALOS profile. The R1 notes below are historical installed-version observations. The new provider profiles are not implemented, and help output is not permission or runtime evidence.
+
+| Requested profile | Current discovery evidence | Implementation gate |
+|---|---|---|
+| Codex | `codex` executable is present. R1 captured version 0.169.0 and `codex exec --json` / resume flags; the live request stopped before inference. | Use public JSONL events and task-specific session identity. Verify workspace-write and read-only boundaries without any unrestricted approval or sandbox bypass. |
+| OMP | `omp` executable is present. R1 captured version 18.8.7, print/JSON/RPC flags, and Bun 1.4.2 as the runtime that displayed help; an inference attempt was blocked before a response. | Prove the exact runtime, structured protocol, session ownership, process shutdown, and separate Writer/Critic permissions. Do not reuse Pi's adapter. |
+| Pi | `pi` executable is present. R1 captured version 0.82.1 and JSON/RPC flags; the isolated call stopped because no API key was configured. | Run an authenticated task in a disposable project. Prove tool restrictions, public result parsing, session behavior, and cleanup for each enabled role. |
+| Kilo | `kilo` is present at `/Users/AVP-Dev/.kilo/bin/kilo`. In the managed environment, both `kilo --version` and `kilo --help` failed before output because writes to `/Users/AVP-Dev/.local/state/kilo` and `/Users/AVP-Dev/.local/share/kilo/state` were denied. No Kilo version is known. | First find and use a documented isolated-state mechanism; then record exact version/help and run live Writer and Critic boundary probes. Do not retry against the user's existing Kilo state. |
+| OpenCode | `opencode` executable is present. R1 captured version 2.3.0 and JSON/session flags; no model request ran. | Prove a complete explicit tool policy. The broad `--auto` behavior is not sufficient as a Writer authority boundary. |
+| Claude Code | `claude` executable is present. R1 captured version 2.1.296 and JSON/stream-JSON/resume flags; an isolated profile reported `Not logged in`. | Run an authenticated disposable task. Prove output parsing, session identity, process cleanup, and read-only Critic behavior. |
+
+A fresh release-binary `doctor` run in the TALOS repository reported Agy 1.5.10 and selected Agy for both roles. In a disposable Git project, a config with `writer: "codex"` was rejected as unavailable. A separate fresh Agy `task run` in a disposable Cargo project exited 1; TALOS saved `agy_exit_nonzero`, blocked the task, and left the Git tree unchanged. TALOS does not persist raw CLI output, so this run does not identify the cause and is not a successful live acceptance.
+
+Current documentation pointers used to shape the adapter contracts:
+
+- [Codex CLI source and exec/resume interface](https://github.com/openai/codex/blob/main/codex-rs/exec/src/cli.rs) — JSONL events, `exec resume`, and sandbox options are documented; validate the installed version and permissions locally.
+- [OMP CLI modes](https://omp.sh/docs/cli), [RPC](https://omp.sh/docs/rpc), and [sessions](https://omp.sh/docs/sessions) — print JSON, newline-delimited RPC, and directory-based continue are distinct protocols.
+- [Pi CLI reference](https://github.com/earendil-works/pi/blob/main/packages/coding-agent/docs/cli.md) — installed-version behavior still requires local confirmation.
+- [Kilo CLI](https://github.com/kilo-org/kilo/blob/main/packages/kilo-docs/pages/code-with-ai/platforms/cli.md) — documented `--continue` resumes the latest workspace session and cannot be combined with autonomous mode or a prompt; it is not task-specific continuation evidence.
+- [OpenCode CLI](https://opencode.ai/docs/cli/) — verify JSON output, session selection, and the installed permission-policy interface before enabling either role.
+- [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/cli-reference) — installed-version help and an authenticated behavior probe remain required.
+
+The broader product requirements and per-provider gates are in `docs/plan.md`, R10 tasks and current status are in `docs/tasks.md` / `docs/state.md`, and ADR-043 records the user's accepted scope and safety limits.

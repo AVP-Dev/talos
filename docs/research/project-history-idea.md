@@ -1,6 +1,6 @@
 # Local project history idea
 
-**Status:** Unscheduled. Revisit after the current R0–R9 roadmap is complete. Backlog ID: F1.
+**Status:** Unscheduled. Revisit after the current R0–R10 roadmap is complete. Backlog ID: F1.
 
 ## Current TALOS behavior
 

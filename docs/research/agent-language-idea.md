@@ -1,6 +1,6 @@
 # Agent handoff and controlled-language idea
 
-**Status:** Unscheduled exploration only. Revisit after R9. Backlog ID: F2.
+**Status:** Unscheduled exploration only. Revisit after R10. Backlog ID: F2.
 
 ## Question
 

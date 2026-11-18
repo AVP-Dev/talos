@@ -1,6 +1,6 @@
 # TALOS Project Plan
 
-**Status:** R1–R5 are complete for the locally verified macOS path. R5 adds project-check snapshots, exact Git-revision evidence, evidence-gated completion, deterministic secret handling, and an interactive Semi Writer gate. Linux-specific implementation remains in scope; Linux-native build/runtime/sandbox acceptance is deferred to the user's server under T6.5/T9.3, so Linux remains unverified. No Docker or VM setup is required.
+**Status:** R1–R5 delivered the initial macOS workflow around Antigravity (`agy`) only. Role selection exists, but the original multi-CLI goal and per-vendor profile architecture are not delivered; six additional CLI profiles are now explicit R10 scope. R6–R9 code is in progress with acceptance still open. Linux-specific implementation remains in scope; Linux-native build/runtime/sandbox acceptance is deferred to the user's server under T6.5/T9.3. No Docker or VM setup is required.
 
 ## 1. Goal
 
@@ -83,12 +83,13 @@ Each round ends with a usable, verifiable result, an updated backlog, and a sess
 | R1 | CLI spike | Headless JSON and same-ID resume verified for Antigravity; TUI handoff and native delegation remain deferred. R1 is complete; R3 later verified the write boundary. |
 | R2 | Core and durable state | Buildable Rust CLI, project discovery, SQLite WAL, schema migration, task queue/transitions, event journal, leases, status/doctor. Complete. |
 | R3 | One autonomous Writer | One verified adapter completes one safe local task per explicit `up --auto` invocation from a clean temporary Git project. Complete for the initial macOS target. |
-| R4 | Independent Critic | Read-only review, real blocker finding, denied write probe, linked Writer fix, immutable review history, and per-project role selection. Complete for verified macOS Antigravity 1.5.10. |
+| R4 | Independent Critic | Read-only review, real blocker finding, denied write probe, linked Writer fix, immutable review history, and role fields. Only `agy` is implemented and accepted; the role fields do not constitute multi-CLI support. |
 | R5 | Verification and permissions | Configured checks, exact Git facts, Auto/Semi policy, redaction, and evidence-gated completion. Complete on macOS; see R5 acceptance below. |
 | R6 | Persistent runtime and recovery | In progress: T6.1 adds a project-scoped tmux control shell; T6.2 adds durable pause/resume and manual-change reconciliation; T6.3 adds cooperative stop and safer recovery; T6.6 adds a bounded new-context packet. Process/recovery and macOS SSH behavior acceptance remain open. T6.5 Linux implementation exists; native server acceptance is deferred until access is available. |
 | R7 | Decomposition and parallel work | T7.1–T7.5 implementation includes schema-v18 durable Writer slots and opt-in concurrency up to three distinct managed worktrees. Migration and behavior acceptance remain open; native delegation stays disabled and the three-agent scenario is unverified. |
 | R8 | GitHub workflow | In progress: T8.1 adds local `gh` capability reporting and an explicitly requested aggregate auth check. T8.2 implements policy-gated exact branch push, durable reconciliation, and draft PR creation. T8.3 records commit-bound CI snapshots with bounded polling. Remote behavior awaits the user's repository. No automatic merge. |
-| R9 | Hardening and release | In progress: T9.1 has a 15-scenario inventory; T9.2 has a separate hardening matrix and bounded package-script clean checks; T9.3 has Cargo lifecycle guidance and native macOS/Linux package scripts; T9.4 documentation is complete; T9.5 has a current ARM64 macOS artifact from source commit `b4ac9ef`. Final-schema runtime scenarios, install lifecycle, reproducibility, binary smoke, SSH/TUI continuity, and Linux server acceptance remain open. |
+| R9 | Hardening and release | In progress: T9.1 has a 15-scenario inventory; T9.2 has a separate hardening matrix and bounded package-script clean checks; T9.3 has Cargo lifecycle guidance and native macOS/Linux package scripts; T9.4 documentation is present; T9.5's existing ARM64 artifact is stale relative to current source. Final-schema runtime scenarios, install lifecycle, reproducibility, SSH/TUI continuity, and Linux server acceptance remain open. |
+| R10 | Multi-CLI adapter profiles | Started by the user. Add Codex, OMP, Pi, Kilo, OpenCode, and Claude Code profiles in that order. Only Agy is implemented today; each new profile must pass role-specific live checks before it can launch a Writer or Critic. |
 
 ### R0 — completed foundation
 
@@ -203,12 +204,32 @@ Current preparation includes the 15-scenario inventory, a distinct hardening mat
 
 **Exit criteria:** clean install on supported systems; acceptance scenarios pass with evidence; documentation matches actual supported CLI versions; no unverified feature is enabled.
 
+### R10 — Multi-CLI adapter profiles
+
+The original goal and proposed architecture explicitly call for multiple local coding CLIs and per-vendor capability profiles. R1 compared several CLIs, but selected only Agy for the first implementation. R4 added separate `writer` and `critic` fields without adding another executable adapter. This round closes that product gap in the user-requested order: Codex, OMP, Pi, Kilo, OpenCode, then Claude Code.
+
+T10.1 defines the shared contract before provider work: stable adapter IDs; bounded executable/version discovery; fixed argument builders; structured event/result parsers; optional public session IDs and resume capability; cancellation and process cleanup; per-role permission evidence; and selected adapter/version saved with Writer attempts and Critic reviews. The project config must not become an arbitrary command or shell passthrough. Credentials remain in each CLI's own supported login/configuration; TALOS must not read private session stores or credential files.
+
+Each provider task is a separate vertical slice. Help output and parser fixtures establish interface shape only. A profile may be detected but remains disabled for a role until a disposable-project run proves structured success, the actual Writer write boundary or Critic read-only boundary, and correct cleanup. Session resume is an optional measured capability; a profile that cannot resume must report that limit and use a fresh task context rather than imply continuity. Writer and Critic may select different providers once both role-specific gates pass.
+
+| Order | CLI | R1 / current evidence | Known compromise to resolve |
+|---|---|---|---|
+| 1 | Codex | R1 recorded Codex 0.169.0 and JSONL/resume flags; the live call stopped before inference in the managed macOS environment. Current config rejects `codex`. | Prove public `codex exec` protocol and actual workspace-write/read-only behavior without dangerous bypasses. |
+| 2 | OMP | R1 recorded OMP 18.8.7 and print/JSON/RPC modes; its live call stopped before inference. | Version/runtime compatibility was observed to differ between Bun 1.3.8 and 1.4.2; select and verify the actual installed runtime, and bound RPC lifecycle. |
+| 3 | Pi | R1 recorded Pi 0.82.1 and JSON/RPC modes; the live call lacked a model API key. | Prove role-specific tool restrictions and session identity with an authenticated isolated run. |
+| 4 | Kilo | Executable is present at `/Users/AVP-Dev/.kilo/bin/kilo`; the current `--version` and `--help` probes failed before output because sandbox permissions denied writes under the user's Kilo state directories. Version and command behavior remain unknown. | Find a documented isolated-state mode, then discover and verify; do not change the user's Kilo state or claim support from the executable's presence. |
+| 5 | OpenCode | R1 recorded OpenCode 2.3.0 and JSON output/session flags; no model call was attempted. | Its broad `--auto` behavior is not a safe authority boundary; prove an explicit complete permission policy before Writer enablement. |
+| 6 | Claude Code | R1 recorded Claude Code 2.1.296 and structured output/session flags; its isolated profile returned `Not logged in`. | Prove authenticated headless behavior and actual deny rules for Critic and Writer modes. |
+
+**Exit criteria:** all six IDs are accepted by config as named profiles; `doctor` reports detected, verified, unsupported, and untested capabilities without conflating them; attempt/review records retain the selected profile and version; each profile is enabled only for roles that passed live disposable-project checks; cross-provider Writer/Critic selection works; failed or unavailable profiles fail closed. Linux-native checks remain deferred to the user's server and do not block macOS implementation.
+
 ## 6. Dependency order
 
 ```text
 R0 → R1 → R2 → R3 → R4 → R5
                          └──→ R6
 R5 + R6 → R7 → R8 → R9
+R6 + R7 + R8 + R9 → R10
 ```
 
 Implementation details may change based on experiments. Preserve invariants and acceptance checks; update `docs/decisions.md`, `docs/tasks.md`, and `docs/state.md` when scope changes materially.
@@ -225,4 +246,4 @@ Implementation details may change based on experiments. Preserve invariants and 
 
 ## 8. Current continuation point
 
-R3–R5 are closed. R6–R9 scheduled code and documentation are present locally; their remaining open tasks are acceptance gates recorded in `docs/state.md` and `docs/tasks.md`. Complete macOS install/update/uninstall and final-schema behavior/migration/fault acceptance when verification work resumes. T6.4/T6.6 continuity, reproducible release checks, and binary smoke also remain open. T6.5/T9.3 Linux-native checks and artifacts wait for the user's server. T8.1–T8.3 live publication/CI acceptance waits for the user's repository; T8.4 keeps merge/deletion manual. Do not create a repository, add a remote, or invoke GitHub before it is provided.
+R1–R5 delivered the initial Agy-only path; R6–R9 still have implementation acceptance gates. The current handoff records fresh binary and live Writer outcomes. Finish the current R9.5 local artifact batch, then continue T10.1 and implement the six requested profiles in the listed provider order. Native Linux checks remain deferred to the user's server; do not create a remote or contact GitHub until a repository is provided.
