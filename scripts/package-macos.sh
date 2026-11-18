@@ -12,7 +12,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 PROJECT_ROOT="$(dirname "$SCRIPT_DIR")"
 cd "$PROJECT_ROOT"
 
-TARGET="${1:-$(rustc -vV | awk '/^host:/ { print $2; exit }')}"
+TARGET="${1:-$(rustc -vV | awk '/^host:/ { print $2 }')}"
 case "$TARGET" in
   aarch64-apple-darwin|x86_64-apple-darwin) ;;
   *) fail "target must be a macOS target triple (got '$TARGET')" ;;

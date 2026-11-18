@@ -355,6 +355,7 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - Set `rust-version = "1.94"` in `Cargo.toml`; the installed compiler is Rust 1.94.0. An exact `rust-toolchain.toml` pin was removed because rustup tried to sync into the sandbox-protected `~/.rustup` directory. Cargo works with the existing installed toolchain.
 - The macOS package script records the inputs needed to compare builds. One native ARM64 artifact now exists, but byte-for-byte reproducibility has not been checked. The binary was not run, and Cargo install/update/uninstall behavior was not exercised. Linux artifacts wait for T6.5/T9.3 acceptance.
 - Script syntax, formatting, Clippy, `cargo check`, and `git diff --check` passed. Automated tests and Linux-native checks were not run.
+- Packaging the new T6.6 commit first exited with status 141 before compilation: `awk` stopped reading `rustc -vV` early under `pipefail`. The host extraction now reads the full output; the fixed script has not yet been rerun.
 
 ## R6.6 progress — compact task handoff
 
@@ -362,10 +363,11 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - Added targeted database queries for one task, latest Writer attempt, latest verification summary, and a capped prerequisite summary. Handoff generation no longer loads the entire task list or full attempt/verification histories. Text values are redacted and capped at 4 KiB each. Prompts, patches, transcripts, raw check output, and the current Git diff are omitted; no report is persisted.
 - The packet recommends an explicit next command based on saved state. It does not launch a process, authorize an operation, or prove continuity of the interactive CLI conversation. The live TUI→headless probe remains pending because the workspace-trust decision has not been made.
 - Updated README, runbook, architecture, plan, task backlog, project structure, agent-routing guide, and ADR-038. `cargo fmt --all` and `cargo check --locked --all-features --lib --bin talos` passed on macOS. No tests were added or run, and no Linux host was contacted.
+- Local implementation/documentation commit: `8bd5b49` (`feat: add compact task handoff packet`).
 
 ## Next action
 
-Commit the T6.6 implementation and documentation locally, then regenerate the ARM64 macOS artifact from that commit so it includes `task handoff`. Continue the R9.4 docs audit and R9.3 packaging work in plan order. Keep behavior/migration tests, fault injection, install/uninstall acceptance, byte-for-byte reproducibility, GitHub live acceptance, and Linux-native acceptance pending. R8 code is locally implemented; live CLI and remote acceptance await a user-provided repository. T8.2 commits are `efaaa75` and `8728ce4`; T8.3 is `877ae10`; T8.4 is `6c6ba78`; previous macOS artifact prep is `9fafb4c`/`ea73675`. Do not create a repository, add a remote, or invoke GitHub operations. Skip Linux connection/setup and defer Linux-native checks/artifacts until the server is available. Keep all work local on `master`.
+Commit the package script's pipefail fix locally, then regenerate the ARM64 macOS artifact from the T6.6 source so it includes `task handoff`. Continue remaining R9.3 installation/package preparation. Keep behavior/migration tests, fault injection, install/uninstall acceptance, byte-for-byte reproducibility, GitHub live acceptance, and Linux-native acceptance pending. R8 code is locally implemented; live CLI and remote acceptance await a user-provided repository. T6.6 is committed as `8bd5b49`; T8.2 commits are `efaaa75` and `8728ce4`; T8.3 is `877ae10`; T8.4 is `6c6ba78`; previous macOS artifact prep is `9fafb4c`/`ea73675`. Do not create a repository, add a remote, or invoke GitHub operations. Skip Linux connection/setup and defer Linux-native checks/artifacts until the server is available. Keep all work local on `master`.
 
 ## Session close checklist
 
