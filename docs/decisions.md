@@ -315,3 +315,12 @@ No schema change for process identity is selected or implemented. The separate s
 - **Invariants:** the index is derived acceleration only; task rows, dependencies, worktree integration state, and task events remain authoritative. The migration changes no task data or state. It runs inside the existing schema transaction, so a failure leaves the database at its prior complete version. No task history is deleted or compacted.
 - **Reason:** repeatedly loading every task and checking dependencies one by one makes a long-running project slower and increases memory use as completed history grows.
 - **Acceptance:** migrate a populated v16 database, confirm v17 and all task/event/dependency rows remain intact, compare runnable selection for queued tasks with and without prerequisites, and fault-inject the migration transaction. These checks remain pending.
+
+## ADR-040 — Reconcile paused task approvals with bounded memory
+
+- **Status:** implementation in progress; transactional behavior acceptance pending.
+- **Invariants:** resume holds an immediate SQLite transaction while it counts verifying tasks, captures at most 50 preview IDs, reopens every verifying task for a fresh Critic review, and appends exactly one task event per changed task. The task update and all task/project control events commit together. The complete count remains available even when the ID preview is truncated.
+- **Decision:** perform the status change and task-event insertion with set-based SQL. Choose a timestamp greater than every existing task `updated_at_ms`, then use that unique timestamp to select exactly the rows changed by the set-based update. Do not materialize all reopened task IDs in Rust memory.
+- **Failure handling:** reject count or timestamp overflow. Compare the update row count with the prior verifying count and the inserted event count with the update count. Any mismatch or SQL/serialization error aborts the transaction; the paused queue and prior task states remain intact.
+- **Reason:** project history may contain a large number of tasks awaiting verification. Manual reconciliation must preserve per-task audit rows without allocating a full in-memory ID list or producing an unbounded event payload.
+- **Acceptance:** reconcile zero, one, and many verifying tasks; verify each task moves to `reviewing` with one matching event, the preview stays capped at 50 with a full count, and injected transaction failures leave task state/events and pause state unchanged. These checks remain pending.

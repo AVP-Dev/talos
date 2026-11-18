@@ -40,7 +40,6 @@ use crate::{
 const WRITER_TIMEOUT: Duration = Duration::from_secs(30 * 60);
 const SUPERVISOR_LEASE: Duration = Duration::from_secs(35 * 60);
 const VERIFICATION_BUDGET: Duration = Duration::from_secs(25 * 60);
-const MAX_RESUME_TASK_ID_PREVIEW: usize = 50;
 
 #[derive(Serialize)]
 struct StatusReport {
@@ -728,35 +727,31 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
                 ResumeProjectOutcome::Resumed {
                     reconciled_manual_changes,
-                    reopened_task_ids,
+                    reopened_task_count,
+                    reopened_task_ids_preview,
                 } => {
-                    let reopened_task_ids_preview = reopened_task_ids
-                        .iter()
-                        .take(MAX_RESUME_TASK_ID_PREVIEW)
-                        .copied()
-                        .collect::<Vec<_>>();
                     if cli.json {
                         print_json(&json!({
                             "queue_paused": false,
                             "reconciled_manual_changes": reconciled_manual_changes,
-                            "reopened_task_count": reopened_task_ids.len(),
+                            "reopened_task_count": reopened_task_count,
                             "reopened_task_ids_preview": reopened_task_ids_preview,
-                            "reopened_task_ids_truncated": reopened_task_ids.len() > MAX_RESUME_TASK_ID_PREVIEW,
+                            "reopened_task_ids_truncated": reopened_task_count > reopened_task_ids_preview.len(),
                         }))?;
                     } else {
                         if reconciled_manual_changes {
                             println!(
                                 "Manual project changes reconciled; affected tasks require a fresh Critic review."
                             );
-                            if reopened_task_ids.is_empty() {
+                            if reopened_task_count == 0 {
                                 println!("No verifying tasks needed to be reopened.");
                             } else {
                                 println!(
                                     "Reopened {} task(s); first IDs: {}",
-                                    reopened_task_ids.len(),
+                                    reopened_task_count,
                                     format_task_ids(&reopened_task_ids_preview)
                                 );
-                                if reopened_task_ids.len() > MAX_RESUME_TASK_ID_PREVIEW {
+                                if reopened_task_count > reopened_task_ids_preview.len() {
                                     println!(
                                         "ID list is truncated; use `talos task list` for task summaries."
                                     );

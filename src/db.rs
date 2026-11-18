@@ -413,7 +413,8 @@ pub enum ResumeProjectOutcome {
     },
     Resumed {
         reconciled_manual_changes: bool,
-        reopened_task_ids: Vec<i64>,
+        reopened_task_count: usize,
+        reopened_task_ids_preview: Vec<i64>,
     },
 }
 
@@ -2537,47 +2538,67 @@ impl Database {
             });
         }
 
-        let now = now_ms()?;
-        let mut reopened_task_ids = Vec::new();
+        let latest_task_update: i64 = transaction.query_row(
+            "SELECT COALESCE(MAX(updated_at_ms), 0) FROM tasks",
+            [],
+            |row| row.get(0),
+        )?;
+        let now = now_ms()?.max(
+            latest_task_update
+                .checked_add(1)
+                .context("Task update timestamp is out of range")?,
+        );
+        let mut reopened_task_count = 0;
+        let mut reopened_task_ids_preview = Vec::new();
         if !snapshots_match {
+            let reopened_count: i64 = transaction.query_row(
+                "SELECT COUNT(*) FROM tasks WHERE status = 'verifying'",
+                [],
+                |row| row.get(0),
+            )?;
+            reopened_task_count = usize::try_from(reopened_count)
+                .context("Reopened task count is outside the supported range")?;
+            let preview_limit = i64::try_from(MAX_REOPENED_TASK_IDS_IN_EVENT + 1)
+                .context("Reopened task ID preview limit is out of range")?;
             let mut statement = transaction
-                .prepare("SELECT id FROM tasks WHERE status = 'verifying' ORDER BY id")?;
-            reopened_task_ids = statement
-                .query_map([], |row| row.get(0))?
+                .prepare("SELECT id FROM tasks WHERE status = 'verifying' ORDER BY id LIMIT ?1")?;
+            let mut preview = statement
+                .query_map([preview_limit], |row| row.get::<_, i64>(0))?
                 .collect::<rusqlite::Result<Vec<i64>>>()?;
             drop(statement);
-            for task_id in &reopened_task_ids {
-                let changed = transaction.execute(
-                    "UPDATE tasks SET status = 'reviewing', updated_at_ms = ?1
-                     WHERE id = ?2 AND status = 'verifying'",
-                    params![now, task_id],
-                )?;
-                if changed != 1 {
-                    bail!("Task #{task_id} changed during manual project reconciliation");
-                }
-                let data_json = serde_json::to_string(&serde_json::json!({
-                    "from": "verifying",
-                    "to": "reviewing",
-                    "cause": "manual_project_reconciliation",
-                }))?;
-                transaction.execute(
-                    "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
-                     VALUES (?1, ?2, 'talos', 'task.status_changed',
-                             'Manual project changes invalidated the approved revision; a fresh Critic review is required', ?3)",
-                    params![task_id, now, data_json],
-                )?;
+            if preview.len() > MAX_REOPENED_TASK_IDS_IN_EVENT {
+                preview.pop();
             }
-            let reopened_task_ids_preview = reopened_task_ids
-                .iter()
-                .take(MAX_REOPENED_TASK_IDS_IN_EVENT)
-                .copied()
-                .collect::<Vec<_>>();
+            reopened_task_ids_preview = preview;
+            let changed = transaction.execute(
+                "UPDATE tasks SET status = 'reviewing', updated_at_ms = ?1
+                 WHERE status = 'verifying'",
+                [now],
+            )?;
+            if changed != reopened_task_count {
+                bail!("Task set changed during manual project reconciliation");
+            }
+            let task_event_data = serde_json::to_string(&serde_json::json!({
+                "from": "verifying",
+                "to": "reviewing",
+                "cause": "manual_project_reconciliation",
+            }))?;
+            let event_count = transaction.execute(
+                "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
+                 SELECT id, ?1, 'talos', 'task.status_changed',
+                        'Manual project changes invalidated the approved revision; a fresh Critic review is required', ?2
+                 FROM tasks WHERE status = 'reviewing' AND updated_at_ms = ?1",
+                params![now, task_event_data],
+            )?;
+            if event_count != changed {
+                bail!("Task events do not match the reconciled task set");
+            }
             let data_json = serde_json::to_string(&serde_json::json!({
                 "pause_revision_id": pause_revision_id,
                 "current_revision_id": current_revision_id,
-                "reopened_task_count": reopened_task_ids.len(),
+                "reopened_task_count": reopened_task_count,
                 "reopened_task_ids_preview": reopened_task_ids_preview,
-                "reopened_task_ids_truncated": reopened_task_ids.len() > MAX_REOPENED_TASK_IDS_IN_EVENT,
+                "reopened_task_ids_truncated": reopened_task_count > MAX_REOPENED_TASK_IDS_IN_EVENT,
             }))?;
             insert_project_control_event(
                 &transaction,
@@ -2596,13 +2617,9 @@ impl Database {
         )?;
         let data_json = serde_json::to_string(&serde_json::json!({
             "reconciled_manual_changes": !snapshots_match,
-            "reopened_task_count": reopened_task_ids.len(),
-            "reopened_task_ids_preview": reopened_task_ids
-                .iter()
-                .take(MAX_REOPENED_TASK_IDS_IN_EVENT)
-                .copied()
-                .collect::<Vec<_>>(),
-            "reopened_task_ids_truncated": reopened_task_ids.len() > MAX_REOPENED_TASK_IDS_IN_EVENT,
+            "reopened_task_count": reopened_task_count,
+            "reopened_task_ids_preview": reopened_task_ids_preview,
+            "reopened_task_ids_truncated": reopened_task_count > MAX_REOPENED_TASK_IDS_IN_EVENT,
         }))?;
         insert_project_control_event(
             &transaction,
@@ -2614,7 +2631,8 @@ impl Database {
         transaction.commit().context("Cannot commit queue resume")?;
         Ok(ResumeProjectOutcome::Resumed {
             reconciled_manual_changes: !snapshots_match,
-            reopened_task_ids,
+            reopened_task_count,
+            reopened_task_ids_preview,
         })
     }
 
@@ -6395,7 +6413,8 @@ mod tests {
                 .unwrap(),
             ResumeProjectOutcome::Resumed {
                 reconciled_manual_changes: false,
-                reopened_task_ids: Vec::new(),
+                reopened_task_count: 0,
+                reopened_task_ids_preview: Vec::new(),
             }
         );
         assert_eq!(reopened.project_control_events().unwrap().len(), 2);
@@ -6478,7 +6497,8 @@ mod tests {
                 .unwrap(),
             ResumeProjectOutcome::Resumed {
                 reconciled_manual_changes: true,
-                reopened_task_ids: vec![task_id],
+                reopened_task_count: 1,
+                reopened_task_ids_preview: vec![task_id],
             }
         );
         assert!(!database.project_control_state().unwrap().queue_paused);
