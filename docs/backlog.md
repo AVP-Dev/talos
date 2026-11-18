@@ -1,53 +1,73 @@
-# TALOS Development, Optimization & Test Harness Backlog
+# TALOS Development, Usability & Optimization Backlog
 
-> This document tracks strategic architectural ideas, optimization opportunities, and test harness enhancements identified during TALOS development.
-
-## 1. Architecture & Feature Enhancements
-
-### IDEA-01: Low-Latency IPC Streaming for TUI Feed
-- **Observation:** Currently, the background supervisor (`talos up --auto`) spawned by the TUI redirects stdout/stderr into `.talos/supervisor.log`, and the TUI polls the log file every 250ms via standard file reading.
-- **Proposal:** Replace disk file polling with an in-memory Unix domain socket or shared Tokio broadcast ring buffer between supervisor daemon and the Ratatui Cockpit.
-- **Benefits:** Sub-millisecond stream rendering, zero disk I/O churn, and live character-by-character streaming of model responses and planner thoughts.
-
-### IDEA-02: Live Token & Cost Budget Meter in TUI Cockpit
-- **Observation:** Users working with multiple CLIs (OpenAI Codex, Anthropic Claude, Gemini Antigravity) want clear visibility of session costs and token consumption.
-- **Proposal:** Introduce a live gauge widget in the AI Agents Cockpit Sidebar displaying estimated token consumption against model context limits (e.g., `[████████░░] 82% 105k / 128k tokens`) and accumulated session cost ($).
-- **Benefits:** Prevents unexpected context window overflows and gives transparent cost visibility.
-
-### IDEA-03: Interactive Hunk & Patch Staging in TUI Git Diff Tab
-- **Observation:** When reviewing agent contributions in Tab 3 (`Git Diff`), the operator currently inspects the unified diff read-only, but may want to selectively accept or reject specific files or hunks.
-- **Proposal:** Add interactive commands in Tab 3: `/stage <path>`, `/unstage <path>`, `/discard <path>`, allowing fine-grained operator curation before triggering verification checks.
-- **Benefits:** Greater operator control when an agent produces a good implementation alongside minor unwanted modifications.
-
-### IDEA-04: Multi-Model Ensemble Reviews
-- **Observation:** In Team Mode, Critic Workers are spawned sequentially or in parallel under the Critic profile.
-- **Proposal:** Allow Critic Workers to be sharded across multiple *different* AI CLI vendors simultaneously (e.g. Claude audits security, Codex audits algorithms, Antigravity audits test completeness), with Critic Lead synthesizing all three perspectives into the final verdict.
-- **Benefits:** Eliminates single-vendor blind spots and leverages specialized model strengths.
+> Pragmatic, high-value ideas for TALOS development, developer ergonomics (DX/UX), and engine optimization.
 
 ---
 
-## 2. Optimization & Performance
+## 1. Ergonomics & Usability (Удобство и UX/DX)
 
-### OPT-01: SQLite WAL Vacuum & Event Journal Pruning
-- **Observation:** For long-running projects with hundreds of tasks, SQLite WAL and `task_events` accumulate thousands of rows.
-- **Proposal:** Introduce periodic automatic truncation of old task events older than 30 days (while preserving task definitions, attempts, and verification evidence), accompanied by an explicit `talos vacuum` command.
-- **Benefits:** Keeps database size under 500 KB and ensures cursor pagination queries remain instantaneous.
+### IDEA-01: Tab-Completion & Argument Hints in TUI Command Bar
+- **Value**: High
+- **Context**: Currently, the TUI command bar requires full manual typing for commands (`/cli codex`, `/commit <msg>`, `/mode team`) and project file paths.
+- **Proposal**: Implement Crossterm/Ratatui inline completion on `Tab`:
+  - Slash command completion (`/c<Tab>` -> `/cli`, `/commit`, `/critic`).
+  - Adapter argument completion (`/cli c<Tab>` -> `codex`, `claude`).
+  - Relative file path completion based on repository tree (`tests/t<Tab>` -> `tests/test_calc.py`).
+- **Impact**: Makes TUI interaction as fast and fluid as modern shells (Fish/Zsh), eliminating typos.
 
-### OPT-02: In-Memory Worktree Git Object Sharing
-- **Observation:** Creating Git worktrees currently creates linked working directories on disk (`.talos-worktrees/`).
-- **Proposal:** Evaluate whether transient subtasks can use ephemeral worktrees or in-memory Git object indices (`git write-tree`) for rapid parallel subtask diffing, writing to disk only upon integration.
-- **Benefits:** Speeds up worker spawn and cleanup times from hundreds of milliseconds to under 20ms.
+### IDEA-02: Task Presets & Archetypes (`/task:test`, `/task:refactor`, `/task:fix`)
+- **Value**: High
+- **Context**: Developers frequently submit recurring patterns: adding test suites, fixing defects, or optimizing existing functions.
+- **Proposal**: Add parameterized task shortcuts:
+  - `/task:test <file>`: Automatically constructs criteria *"Add comprehensive unit tests for <file> without altering production logic. Ensure 100% test pass."*
+  - `/task:refactor <file>`: Automatically sets `--criteria "Refactor <file> to improve readability and structure. All existing checks must pass."*
+  - `/task:bench <func>`: Creates benchmark tasks.
+- **Impact**: Saves time on prompt crafting and guarantees strict, deterministic acceptance criteria.
+
+### IDEA-03: Interactive Hunk & File Staging in TUI Git Diff View
+- **Value**: High
+- **Context**: An AI agent may implement a requested feature correctly, but accidentally touch whitespace or leave temporary debug statements in another file.
+- **Proposal**: In Tab 3 (`Git Diff`), allow arrow-key navigation through modified files with single-key actions:
+  - `s`: Stage file.
+  - `d`: Discard / revert file changes immediately (`git checkout -- <file>`).
+  - `c`: Commit staged files with prompt.
+- **Impact**: Operator can curate the agent's work directly in TUI without switching to an external terminal.
 
 ---
 
-## 3. Test Harness & Verification Improvements
+## 2. Real-Time Performance & Streaming (Оптимизация и скорость)
 
-### HARN-01: Dedicated Process-Signal Test Binary
-- **Observation:** `cargo test --locked --all-targets` runs 154 tests concurrently. Several process-group signal tests (`ctrl_c_and_sigterm_interrupt_the_supervisor_and_reap_the_writer`, `operator_stop_request_terminates_and_reaps_the_writer_group`, `timeout_terminates_and_reaps_the_process_group`) spawn actual subprocess groups and send `SIGTERM`/`SIGKILL`. Under heavy test runner thread contention, OS process group scheduling can occasionally introduce test runner jitter.
-- **Proposal:** Move process-signal integration tests into a dedicated integration test file under `tests/process_signals.rs` with `#[serial]`, keeping `cargo test --lib` blazing fast (<1.5s) and completely deterministic.
-- **Benefits:** Eliminates risk of test port or PID reuse contention in CI environments.
+### OPT-01: In-Memory Low-Latency IPC Streaming (PTY / Tokio Channel)
+- **Value**: High
+- **Context**: Currently, the background supervisor (`talos up --auto`) redirects stdout/stderr into `.talos/supervisor.log`, and TUI reads it every 250ms from disk.
+- **Proposal**: Connect the supervisor and Cockpit via an in-memory Tokio broadcast channel or local Unix domain socket.
+- **Impact**: Sub-millisecond stream rendering, zero disk I/O churn, and live character-by-character streaming ("typewriter effect") of agent planning and thoughts.
 
-### HARN-02: Deterministic Mock Adapter Matrix for Offline Verification
-- **Observation:** Real CLI end-to-end testing requires installed and authenticated CLIs (`codex`, `agy`, etc.).
-- **Proposal:** Add a test-only `MockAdapter` module that simulates CLI responses, JSON streaming, process exits, and rate limits without network or credential dependencies.
-- **Benefits:** Enables running complete 10-step Team and Pair scenarios on unauthenticated headless CI servers in seconds.
+### OPT-02: AST & Interface Slicing for Token Economy
+- **Value**: High
+- **Context**: Sending full 2,000-line dependency files to AI CLIs consumes prompt budgets and dilutes attention.
+- **Proposal**: When a task targets a specific file, generate a compact symbol outline (AST function signatures, public types, and docstrings) for referenced files rather than their full implementation.
+- **Impact**: Reduces token usage by 50–70% and speeds up agent response times by 2–3x.
+
+### OPT-03: Live Token Consumption & Session Cost Meter in Cockpit
+- **Value**: Medium-High
+- **Context**: Operators running multiple concurrent LLMs need visibility into quota consumption.
+- **Proposal**: Add a compact gauge widget in the AI Agents Cockpit Sidebar:
+  `[████████░░] 82% (105k / 128k tokens) | Est. Cost: $0.42`
+- **Impact**: Prevents sudden context overflows and provides real-time economic transparency.
+
+---
+
+## 3. Test Harness & Quality Assurance (Харнес и надежность)
+
+### HARN-01: Dedicated Process-Signal Test Isolation (`tests/process_signals.rs`)
+- **Value**: High
+- **Context**: Tests that spawn child process groups and test `SIGTERM`/`SIGKILL` run concurrently with the 152-test unit test suite. Under heavy CPU thread contention, process scheduling can introduce test runner jitter.
+- **Proposal**: Separate process-signal integration tests into `tests/process_signals.rs` with `#[serial]`.
+- **Impact**: Keeps `cargo test --lib` blazing fast (<1.5s) and 100% deterministic on all platforms.
+
+### HARN-02: Deterministic MockAdapter Matrix for Offline CI Verification
+- **Value**: High
+- **Context**: Testing multi-round Team delegation and Critic rejections currently requires installed, authenticated AI CLIs or network calls.
+- **Proposal**: Implement a test-only `MockAdapter` capable of replaying scripted NDJSON streams, emulating rate limits, and simulating process exits.
+- **Impact**: Enables verifying complete 10-step Team orchestration and worktree integration in CI without API keys or external tools.
