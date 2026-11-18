@@ -25,8 +25,8 @@ use crate::{
     checks::ProjectCheck,
     config::{OrchestrationMode, ProjectConfig},
     db::{
-        CriticReviewRecord, Database, QueueSummary, TaskEvent, TaskRecord, TaskStatus,
-        TaskWorktreeRecord,
+        CriticReviewRecord, Database, QueueSummary, StopRequestOutcome, TaskEvent, TaskRecord,
+        TaskStatus, TaskWorktreeRecord,
     },
     project::Project,
     tmux::{TmuxClient, project_session_name},
@@ -84,6 +84,7 @@ pub struct TuiApp {
     dirty_paths: GitStatusPaths,
     reconnect_notice: Option<String>,
     is_in_tmux: bool,
+    pub should_exit: bool,
 }
 
 impl TuiApp {
@@ -126,6 +127,7 @@ impl TuiApp {
             dirty_paths,
             reconnect_notice: None,
             is_in_tmux,
+            should_exit: false,
         };
 
         app.refresh_state()?;
@@ -272,26 +274,97 @@ impl TuiApp {
         let arg = parts.get(1).copied().unwrap_or("").trim();
 
         match cmd.as_str() {
-            "/help" => {
+            "/help" | "/помощь" | "/справка" => {
                 self.status_message = Some((
-                    "Navigation: /overview, /dialogue, /diff, /audit | Config: /writer, /critic, /model, /mode, /commit, /run, /tmux".to_string(),
+                    "Commands: /stop, /pause, /resume, /run, /commit <msg>, /diff, /dialogue, /audit, /writer, /critic, /model, /mode, /exit".to_string(),
                     Instant::now(),
                 ));
             }
-            "/overview" => {
+            "/overview" | "/обзор" => {
                 self.active_tab = ActiveTab::Overview;
             }
-            "/dialogue" | "/chat" => {
+            "/dialogue" | "/chat" | "/диалог" | "/чат" => {
                 self.active_tab = ActiveTab::Dialogue;
             }
-            "/diff" => {
+            "/diff" | "/дифф" => {
                 self.active_tab = ActiveTab::Diff;
                 self.load_git_diff();
             }
-            "/audit" | "/review" => {
+            "/audit" | "/review" | "/аудит" | "/ревью" => {
                 self.active_tab = ActiveTab::Audit;
             }
-            "/writer" => {
+            "/stop" | "/стоп" => {
+                let mut database = Database::open(&self.project)?;
+                match database.request_writer_stop()? {
+                    StopRequestOutcome::NoActiveWriter => {
+                        self.status_message = Some((
+                            "No active Writer process running to stop.".to_string(),
+                            Instant::now(),
+                        ));
+                    }
+                    StopRequestOutcome::Requested { attempt_id } => {
+                        self.status_message = Some((
+                            format!("Graceful stop requested for Writer attempt #{attempt_id}."),
+                            Instant::now(),
+                        ));
+                    }
+                }
+            }
+            "/pause" | "/пауза" => {
+                let mut database = Database::open(&self.project)?;
+                let revision_id = current_project_revision_id(&self.project);
+                let _ = database
+                    .pause_project("Operator paused queue via /pause", revision_id.as_deref());
+                self.queue_paused = true;
+                self.status_message = Some((
+                    "Queue paused. New tasks will wait.".to_string(),
+                    Instant::now(),
+                ));
+            }
+            "/resume" | "/continue" | "/резюм" | "/продолжить" => {
+                let mut database = Database::open(&self.project)?;
+                let revision_id = current_project_revision_id(&self.project);
+                let _ = database.resume_project(revision_id.as_deref(), false);
+                self.queue_paused = false;
+                self.status_message = Some(("Queue resumed.".to_string(), Instant::now()));
+                if !self.supervisor_running {
+                    self.spawn_background_worker();
+                }
+            }
+            "/quit" | "/exit" | "/выход" | "/q" => {
+                self.should_exit = true;
+            }
+            "/clear" | "/очистить" => {
+                self.status_message = None;
+                self.input.clear();
+            }
+            "/stash" | "/стэш" => {
+                let mut stash_cmd = std::process::Command::new("git");
+                stash_cmd.arg("stash").current_dir(&self.project.root);
+                if let Ok(out) = stash_cmd.output() {
+                    let msg = String::from_utf8_lossy(&out.stdout);
+                    self.status_message =
+                        Some((format!("Git stash: {}", msg.trim()), Instant::now()));
+                    self.refresh_state()?;
+                }
+            }
+            "/status" | "/статус" => {
+                self.status_message = Some((
+                    format!(
+                        "Queue: {} active, {} queued, {} complete. Supervisor: {}",
+                        self.queue.active,
+                        self.queue.queued,
+                        self.queue.complete,
+                        if self.supervisor_running {
+                            "running"
+                        } else {
+                            "idle"
+                        }
+                    ),
+                    Instant::now(),
+                ));
+            }
+            "/writer" | "/писатель" => {
                 if arg.is_empty() {
                     self.status_message = Some((
                         format!(
@@ -415,9 +488,6 @@ impl TuiApp {
                     "Started background supervisor daemon.".to_string(),
                     Instant::now(),
                 ));
-            }
-            "/pause" | "/resume" => {
-                self.toggle_pause()?;
             }
             "/tmux" => {
                 let tmux = TmuxClient::default();
@@ -546,6 +616,10 @@ async fn run_app_loop(
     last_tick: &mut Instant,
 ) -> Result<()> {
     loop {
+        if app.should_exit {
+            return Ok(());
+        }
+
         terminal.draw(|f| ui(f, app))?;
 
         let timeout = tick_rate
@@ -559,9 +633,6 @@ async fn run_app_loop(
             match key.code {
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                     return Ok(());
-                }
-                KeyCode::Char('p') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                    let _ = app.toggle_pause();
                 }
                 KeyCode::Char('q')
                     if app.input.is_empty() && !key.modifiers.contains(KeyModifiers::CONTROL) =>
@@ -1175,7 +1246,7 @@ fn render_input(frame: &mut Frame, app: &TuiApp, area: Rect) {
     let title = if let Some((ref msg, _)) = app.status_message {
         format!(" Notice: {msg} ")
     } else {
-        " Describe task or type /help | Tabs: [1: Overview] [2: Dialogue] [3: Diff] [4: Audit] "
+        " Type task or command: /stop, /pause, /resume, /diff, /commit, /exit, /help | Tabs: [1-4] "
             .to_string()
     };
 
