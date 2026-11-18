@@ -3341,10 +3341,24 @@ fn acquire_recovery_lease(
 }
 
 fn talos_lease_owner_pid(owner_id: &str) -> Option<u32> {
-    if !owner_id.starts_with("talos-task-") {
+    // Only recover leases written by known TALOS operation families. Their final fields are
+    // always the process ID and creation timestamp, even when the operation includes task IDs.
+    let mut suffix = owner_id.rsplitn(3, '-');
+    let timestamp = suffix.next()?.parse::<i64>().ok()?;
+    let process_id = suffix.next()?.parse::<u32>().ok()?;
+    let owner_prefix = suffix.next()?;
+    let operation = owner_prefix
+        .strip_prefix("talos-task-")
+        .or_else(|| owner_prefix.strip_prefix("talos-worktree-"))?;
+    if timestamp <= 0
+        || operation.is_empty()
+        || operation.split('-').any(str::is_empty)
+        || !operation
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-')
+    {
         return None;
     }
-    let process_id = owner_id.rsplit('-').nth(1)?.parse::<u32>().ok()?;
     (process_id > 0).then_some(process_id)
 }
 
