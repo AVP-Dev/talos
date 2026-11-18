@@ -2435,7 +2435,7 @@ impl Database {
         self.connection.execute(
             "INSERT INTO task_events (task_id, occurred_at_ms, actor, event_type, reason, data_json)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            params![task_id, now, actor, event_type, reason, data_json],
+            params![task_id, now, actor, event_type, reason, data_json.unwrap_or("{}")],
         )?;
         Ok(())
     }

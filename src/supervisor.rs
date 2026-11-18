@@ -507,6 +507,13 @@ pub async fn run_critic_review(
                     "{}\n\nCRITIC WORKER AUDIT FINDINGS (independently detected issues that Critic Lead must inspect and evaluate for request_changes):\n{summary}",
                     review_task.acceptance_criteria
                 );
+            } else if (st.role == "writer_lead_rebuttal" || st.role == "writer_deliberation")
+                && let Some(summary) = &st.result_summary
+            {
+                review_task.acceptance_criteria = format!(
+                    "{}\n\nWRITER TEAM TECHNICAL JUSTIFICATION / REBUTTAL:\n{summary}\nNote: Passing unit tests prove behavioral compliance with existing tests, but do NOT automatically excuse architectural flaws, security risks, or contract violations. Evaluate the trade-offs rigorously.",
+                    review_task.acceptance_criteria
+                );
             }
         }
     }
@@ -666,6 +673,7 @@ pub async fn run_critic_review(
             line: None,
             title: "Child task changed a path outside its allowed scope".to_owned(),
             reason: "The child-task contract does not permit this changed path. Revert the out-of-scope change or move it to a separately scoped task.".to_owned(),
+            out_of_scope: false,
         });
         if response.summary.len() <= 3_800 {
             response

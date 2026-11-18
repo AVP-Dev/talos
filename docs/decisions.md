@@ -455,3 +455,31 @@ No schema change for process identity is selected or implemented. The separate s
      - Allows single-key navigation (`j`/`k`), staging (`s` executes `git add -- <file>`), discarding/reverting (`d` executes `git checkout -- <file>` or untracked file removal), and reloading (`r`).
      - Updates status messages and refreshes diff view in real time.
 - **Verification:** unit tests for `longest_common_prefix`, `complete_input`, task presets creation and acceptance criteria enforcement, and interactive diff navigation (`tab_completion_and_task_presets`, `diff_file_navigation_and_selection`). `./scripts/verify-project.sh` 5/5 checks passed clean.
+
+## ADR-050 — Autonomous Engineering Team Evolution: Deliberation, Adaptive Triage, Backlog Curation, and Resilient Validation
+
+- **Status:** accepted by the user.
+- **Decision:** evolve TALOS from a strict linear patch verification pipeline into an adaptive autonomous engineering team, building strictly on existing mechanisms without overengineering:
+  1. **Deliberation and Reasoned Debate (Activate Rebuttal Loop):**
+     - Wire `build_writer_lead_rebuttal_prompt` into the active team orchestration loop (`run_team_task`).
+     - Allow Writer Lead to respond to Critic Lead findings with either code adjustments, technical justifications, or a combination of both.
+     - **Passing tests are NOT automatic grounds to dismiss Critic remarks:** green tests verify existing behavioral assertions, but architectural debt, security vulnerabilities, API fragility, and subtle contract violations can easily coexist with passing tests. Test evidence informs debate as empirical input, but does not override Critic's architectural judgment.
+     - Structure deliberation outcomes and record accepted architectural trade-offs in task events and `TALOS_SUMMARY.md`.
+  2. **Resilient Validation vs. Hard Invariants:**
+     - Preserve hard safety boundaries with fail-closed enforcement: project root / worktree confinement, `.git/` and `.talos/` integrity, secret suppression, manual PR merge gate, SQLite transaction atomicity, and lease fencing.
+     - Replace fragile operational `bail!` crashes on formatting and length:
+       - Do **not** naively truncate long responses: important context must not be lost. Provide structured multi-part retention or artifact spillover where necessary.
+       - Normalize non-critical schema quirks (e.g. line number `0` to `None`).
+       - If a Critic finding references an out-of-scope or unmodified file (e.g. breaking a caller contract in another file), do not crash review with `bail!`; capture it as a cross-cutting finding and route it to the backlog.
+  3. **Adaptive Pre-Flight Triage (Recommendation-Based):**
+     - Perform lightweight, read-only pre-flight analysis of task requirements against repository structure.
+     - **Avoid rigid team selection rules:** triage recommends an appropriate depth of analysis and operational posture (e.g., light touch for single-line fixes, deep review for multi-file refactoring), allowing TALOS to adapt dynamically as new facts emerge without rigid workflow lock-in.
+  4. **Backlog Curation for Non-Critical Findings:**
+     - Stop discarding `Minor` and `Note` findings upon Critic approval.
+     - Retain and categorize non-blocking findings, suggestions, and deferred technical debt in persistent backlog storage and highlight them in the deliverable summary artifact (`TALOS_SUMMARY.md`).
+  5. **Verification Completion Defect Resolution:**
+     - Confirm via test and resolve the flow in `run_task_verification` / `finish_verification_run` where a failed verification run must not be treated as successful execution, ensuring tasks with failing checks are cleanly re-routed to implementation rather than proceeding to local commit, draft PR, or summary emission with an unverified state.
+  6. **Anti-Stagnation Loop Detection:**
+     - Detect identical patch hashes and stagnant verification errors between successive fix rounds to halt futile loops early, saving tokens and operator time.
+- **Reason:** user feedback on the comprehensive system audit confirmed 85–90% alignment, with explicit guidance to preserve architectural authority during debate, prevent loss of long context, avoid rigid team selection rules, verify verification failure handling by test, and avoid overengineering.
+- **Consequence:** these guidelines govern Round 17 implementation. Existing core subsystems (SQLite, adapters, worktrees, TUI) remain unchanged.

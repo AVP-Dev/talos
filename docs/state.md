@@ -4,15 +4,22 @@
 
 ## Current phase
 
-**Current phase is all 6 Real E2E scenarios verified live end-to-end without mocks on macOS and Linux.** All 7 AI CLI adapters (`agy`, `codex`, `omp`, `pi`, `kilo`, `opencode`, `claude`) are implemented with headless runners, role-appropriate permission enforcement, and optional model overrides. The complete autonomous loop (`talos up --auto`) has been verified live across 6 comprehensive production scenarios:
-1. Codex Writer (v0.169.0) + Antigravity Critic (`agy 1.5.11`) on real multi-file code and tests (`calc.py`, `parser.py`, `auth.py`).
-2. Injected defect detection, automated `request_changes` loop, Writer fix iteration (`search.py` leftmost binary search), Critic `approve`, and unit test verification.
-3. Two independent tasks simultaneously executed in isolated Git worktrees (`str_utils.py`, `math_utils.py`), with automated worktree patch integration, git commits, and worktree finalization.
-4. Forced crash drill with process termination, safe quarantine via `talos task recover`, operator resolution with `authorize-retry`, and automated resumption to completion.
-5. GitHub Draft PR publication policy enforcement: remote git preflight validation, branch preparation (`talos/task-1`), and strict prohibition of auto-merge.
-6. Cross-platform execution on Linux (Ubuntu x86_64 server `nyxos`): toolchains, SQLite WAL, Codex Writer + Codex Critic execution, and task completion verified live on Linux.
+**Current phase is system audit completed and ADR-050 accepted by the user for Round 17: Autonomous Engineering Team Evolution.**
 
-**Next action:** user confirmation and ongoing project task execution. Release v0.1.0 published on GitHub with multi-platform assets (macOS + Ubuntu). Terminal Orchestrator Cockpit (TUI) powered by `ratatui` and `crossterm` is now the default interface on bare `talos` (or `talos tui`), featuring live Writer/Critic stream monitoring, natural-language prompt dispatch, automatic background supervisor daemon execution, active session reconnection, uncommitted work protection, multi-view tabs (`Overview`, `Dialogue & Review`, `Git Diff`, `Audit & Checks`), and extensible in-TUI slash commands (`/stop`, `/pause`, `/resume`, `/commit`, `/diff`, `/audit`, `/dialogue`, `/help`, etc.) with full Russian alias support. Hotkey `Ctrl+P` was removed to prevent collision with terminal/tmux keybindings. Toolchain upgraded to stable Rust 1.100.0 (`rust-version = "1.100"` in `Cargo.toml`). Manual multi-terminal mode remains available via `talos attach`.
+All 7 AI CLI adapters (`agy`, `codex`, `omp`, `pi`, `kilo`, `opencode`, `claude`), TUI Cockpit (`ratatui`/`crossterm`), rate-limit detection with adaptive backoff, deliverable summary artifacts (`TALOS_SUMMARY.md`), `/cli` dynamic configuration, and operator ergonomics (Tab-completion, task presets, diff curation) are verified and operational.
+
+User reviewed and accepted the system audit findings (85–90% alignment) with three critical corrections recorded in **ADR-050**:
+1. **Green tests do not automatically dismiss Critic remarks:** architectural defects, design compromises, and security risks can exist with passing tests. Test evidence informs debate, but does not override Critic's architectural judgment.
+2. **Do not naively truncate long responses:** preserve context without loss; provide structured multi-part retention or artifact spillover where necessary.
+3. **No rigid team selection rules:** task triage recommends depth of analysis and posture, while TALOS adapts dynamically to context without rigid lock-in.
+
+Additionally, ADR-050 mandates:
+- Confirming by test and fixing the verification completion defect (where `run_task_verification` returning `Ok(())` on failed verification might lead to committing unverified state or leaving tasks stuck in `verifying`).
+- Activating the Writer Lead rebuttal loop in `run_team_task`.
+- Retaining non-critical Critic findings (`Minor`, `Note`, and out-of-scope files) in persistent backlog storage and `TALOS_SUMMARY.md`.
+- Anti-stagnation loop detection across fix rounds.
+
+**Next action:** Round 17 execution is complete: T17.1 (verification defect fix verified by regression test), T17.2 (resilient normalization of text lengths and line 0), T17.3 (activated Writer Lead deliberation and rebuttal loop in `run_team_task` with ADR-050 architectural invariant that passing tests do not dismiss Critic remarks), T17.4 (recommendation-based pre-flight task triage advising depth and posture without rigid locks), T17.5 (non-critical backlog curation into `TALOS_SUMMARY.md`), and T17.6 (anti-stagnation loop detection across fix rounds in `run_pair_task` and `run_team_task`). Toolchain: stable Rust 1.100.0 (`rust-version = "1.100"` in `Cargo.toml`). `./scripts/verify-project.sh` passes clean (166 tests passed, 0 failures, clippy clean, format clean, release build passed, security scan clean). Ready for user review / next phase.
 
 ## Goal and fixed direction
 
@@ -575,9 +582,33 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
   - `cargo test --locked --all-targets` passed (**154 passed**, 0 failed, 2 ignored).
   - `./scripts/verify-project.sh` passed: all 5 profile checks clean (format, clippy, tests, release build, security scan).
 
+## R17 progress and verification — Autonomous Engineering Team Evolution (T17.1, T17.2, T17.5)
+
+- **Implemented:**
+  - `src/review.rs` (T17.2):
+    - Removed `#[serde(deny_unknown_fields)]` from `CriticResponse` and `CriticFinding` to accommodate LLM schema variations without breaking deserialization.
+    - Added resilient normalization for line numbers: `line == Some(0)` normalizes to `None` instead of crashing via `bail!`.
+    - Removed arbitrary hard length bails on `summary` (>4000), `title` (>500), and `reason` (>8000), preserving full context and technical explanations without truncation while adding preview helpers (`title_preview`, `reason_preview`, `summary_preview`) for concise log/TUI display.
+    - Resilient path validation: project-relative paths not in `changed_paths` are classified as `out_of_scope = true` instead of throwing `bail!`, ensuring cross-cutting observations do not block immediate task patches.
+    - Graceful review decision downgrade: if Critic returns `request_changes` with only non-blocking findings (`Minor`, `Note`, or out-of-scope), TALOS automatically treats it as approval with remarks (`ReviewDecision::Approve`), preventing review deadlocks.
+    - Fail-closed hard safety boundary preserved: finding paths outside workspace or containing directory traversal (`..`) remain strictly rejected; Critic patch payloads are rejected upfront (`the findings-only Critic contract must reject patch payloads`).
+    - Added unit tests: `normalizes_line_zero_to_none`, `preserves_thorough_explanation_without_bailing`, `accepts_out_of_scope_path_without_bailing`, and `accepts_unknown_fields_in_critic_response_and_findings`.
+  - `src/revision.rs` (T17.2):
+    - Replaced abrupt `bail!` on oversized review patches and Git diff outputs with actionable guidance advising smaller incremental commits or subtask splitting.
+  - `src/summary.rs` & `src/app.rs` (T17.5):
+    - Added `pub deferred_findings: Vec<crate::review::CriticFinding>` to `TaskSummaryData`.
+    - Rendered dedicated markdown section `## 📌 Deferred Findings & Backlog` in `generate_summary_markdown`, displaying all non-critical findings (`Minor`, `Note`, and out-of-scope items) with severity, path, line, title, and reason.
+    - Updated `run_pair_task` and `run_team_task` in `src/app.rs` to extract non-blocking findings from approved Critic reports, record `task.backlog_curated` events in the database, and include them in `TALOS_SUMMARY.md`.
+    - Added unit test: `renders_deferred_findings_backlog_section`.
+- **Verification results:**
+  - `cargo fmt --all -- --check` passed.
+  - `cargo clippy --locked --all-targets --all-features -- -D warnings` passed (0 warnings).
+  - `cargo test --locked --all-targets` passed (**161 passed**, 0 failed, 2 ignored).
+  - `./scripts/verify-project.sh` passed: all 5 profile checks clean (rust-format, rust-clippy, rust-tests, release-build, security-secrets).
+
 ## Next action
 
-All planned rounds (R0 through R16) are fully implemented and verified. Release v0.1.0 is published on GitHub. Maintain local clean tree on `master`; do not push to remote or publish PR without explicit user instruction.
+Next action is **T17.3**: Activate Writer Lead deliberation and rebuttal loop in `run_team_task` by wiring `build_writer_lead_rebuttal_prompt`, recording technical decisions into summary data, and ensuring green verification checks inform but do not silently suppress Critic architectural guidance. Maintain local clean tree on `master`; do not push to remote or publish PR without explicit user instruction.
 
 ## Session close checklist
 

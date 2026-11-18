@@ -34,6 +34,11 @@ pub struct RevisionFacts {
     pub changed_paths: Vec<String>,
 }
 
+/// Compare patch digests across consecutive fix rounds to detect stagnation.
+pub fn is_diff_stagnant(previous_patch_digest: Option<&str>, current_patch_digest: &str) -> bool {
+    matches!(previous_patch_digest, Some(prev) if prev == current_patch_digest)
+}
+
 /// Capture a Git base revision for a new Writer task. Existing changes are rejected so that
 /// the later Critic review can attribute the complete diff to TALOS's task lifecycle.
 pub fn clean_base_commit(project_root: &Path) -> Result<String> {
@@ -83,7 +88,7 @@ impl RevisionSnapshot {
         let mut patch = patch_output.stdout;
         if patch.len() > MAX_REVIEW_PATCH_BYTES {
             bail!(
-                "Review patch exceeds the {MAX_REVIEW_PATCH_BYTES}-byte limit; TALOS will not truncate it"
+                "Review patch exceeds the {MAX_REVIEW_PATCH_BYTES}-byte limit; TALOS will not truncate it. Consider splitting changes across smaller scoped tasks or staging incremental commits."
             );
         }
         let tracked_paths_output = git_output_limited(
@@ -203,7 +208,7 @@ fn append_patch(target: &mut Vec<u8>, addition: &[u8]) -> Result<()> {
         .context("Review patch size overflowed")?;
     if new_length > MAX_REVIEW_PATCH_BYTES {
         bail!(
-            "Review patch exceeds the {MAX_REVIEW_PATCH_BYTES}-byte limit; TALOS will not truncate it"
+            "Review patch exceeds the {MAX_REVIEW_PATCH_BYTES}-byte limit; TALOS will not truncate it. Consider splitting changes across smaller scoped tasks or staging incremental commits."
         );
     }
     target.extend_from_slice(addition);
@@ -370,7 +375,7 @@ pub(crate) fn git_output_limited(
             let _ = child.kill();
             let _ = child.wait();
             bail!(
-                "Git {output_label} exceeds the {maximum_stdout_bytes}-byte limit; TALOS will not truncate it"
+                "Git {output_label} exceeds the {maximum_stdout_bytes}-byte limit; TALOS will not truncate it. Consider splitting changes across smaller scoped tasks or staging incremental commits."
             );
         }
         captured.extend_from_slice(&buffer[..bytes_read]);
@@ -428,7 +433,7 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{RevisionSnapshot, clean_base_commit};
+    use super::{RevisionSnapshot, clean_base_commit, is_diff_stagnant};
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
@@ -522,6 +527,13 @@ mod tests {
             .expect_err("oversized tracked patch must be refused");
         assert!(format!("{error:#}").contains("will not truncate"));
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn detects_diff_stagnation_across_rounds() {
+        assert!(!is_diff_stagnant(None, "sha256:abc"));
+        assert!(!is_diff_stagnant(Some("sha256:abc"), "sha256:def"));
+        assert!(is_diff_stagnant(Some("sha256:abc"), "sha256:abc"));
     }
 
     fn temp_git_project() -> PathBuf {

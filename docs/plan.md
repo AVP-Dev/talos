@@ -89,7 +89,14 @@ Each round ends with a usable, verifiable result, an updated backlog, and a sess
 | R7 | Decomposition and parallel work | T7.1–T7.5 implementation includes schema-v18 durable Writer slots and opt-in concurrency up to three distinct managed worktrees. Migration and behavior acceptance remain open; native delegation stays disabled and the three-agent scenario is unverified. |
 | R8 | GitHub workflow | In progress: T8.1 adds local `gh` capability reporting and an explicitly requested aggregate auth check. T8.2 implements policy-gated exact branch push, durable reconciliation, and draft PR creation. T8.3 records commit-bound CI snapshots with bounded polling. Remote behavior awaits the user's repository. No automatic merge. |
 | R9 | Hardening and release | In progress: T9.1 has a 15-scenario inventory; T9.2 has a separate hardening matrix and bounded package-script clean checks; T9.3 has Cargo lifecycle guidance and native macOS/Linux package scripts; T9.4 documentation is present; T9.5 rebuilt the ARM64 package from `cb67c52` and verified its checksums and version smoke. Install lifecycle, reproducibility, final-schema scenarios, SSH/TUI continuity, and Linux server acceptance remain open. |
-| R10 | Multi-CLI adapter profiles | Started by the user. Add Codex, OMP, Pi, Kilo, OpenCode, and Claude Code profiles in that order. Only Agy is implemented today; each new profile must pass role-specific live checks before it can launch a Writer or Critic. |
+| R10 | Multi-CLI adapter profiles | Complete. All 7 AI CLI adapters (`agy`, `codex`, `omp`, `pi`, `kilo`, `opencode`, `claude`) implemented and verified. |
+| R11 | Hybrid Team Orchestration | Complete. Two-tier team orchestration with Writer Team and Critic Team, schema v19, and full backward compatibility. |
+| R12 | Terminal Orchestrator Cockpit | Complete. Interactive TUI on Ratatui, slash commands with Russian aliases, and multi-adapter discovery. |
+| R13 | Intelligent Rate-Limit Backoff | Complete. Multi-vendor 429/quota classification, duration parsing, and automated pause/retry. |
+| R14 | Autonomous Decisions & Token Economy | Complete. `TALOS_SUMMARY.md` artifact generation, session timing metrics, and context truncation. |
+| R15 | CLI Adapter Switching & Unified Feed | Complete. Dynamic `/cli` command, persistent config, and live Unified Feed redesign. |
+| R16 | Operator Ergonomics | Complete. TUI Tab-completion, task archetype presets, and interactive diff curation. |
+| R17 | Autonomous Team Evolution | In planning. Deliberation & rebuttal loop, non-rigid task triage, non-critical backlog curation, resilient validation, and anti-stagnation loop detection. |
 
 ### R0 — completed foundation
 
@@ -285,13 +292,26 @@ Deliver modern terminal ergonomics for developer workflows:
 
 **Exit criteria:** Tab-completion operates smoothly in TUI input bar; task presets enqueue verified tasks; interactive diff staging works cleanly; all tests pass.
 
+### R17 — Autonomous Engineering Evolution: Deliberation, Adaptive Triage, and Resilient Validation
+
+Transform TALOS into a genuinely collaborative autonomous engineering team with reasoned debate, flexible recommendations, persistent backlog curation, and resilient validation:
+
+- **Deliberation & Reasoned Rebuttal:** Wire `build_writer_lead_rebuttal_prompt` into the active team orchestration loop (`run_team_task`). Enable Writer Lead to argue technical choices or apply fixes. Passing unit tests are an empirical signal during debate but do NOT automatically dismiss Critic's architectural concerns.
+- **Resilient Validation:** Replace brittle `bail!` crashes on formatting and length with safe normalization and structured multi-part retention (do not naively truncate long responses). Handle findings referencing out-of-scope files gracefully as cross-cutting backlog candidates.
+- **Recommendation-Based Task Triage:** Pre-flight read-only inspection suggests analysis depth and team posture without rigid hardcoded selection rules.
+- **Backlog Curation:** Persist non-critical (`Minor`, `Note`) and cross-cutting findings in durable backlog storage and feature them in `TALOS_SUMMARY.md`.
+- **Verification Integrity:** Test-verify and resolve the verification failure handling flow in `run_task_verification` so that failing checks prevent task completion, abort commit/PR steps, and cleanly return the task for resolution.
+- **Anti-Stagnation Loop Detection:** Compare patch hashes and check outputs across consecutive fix iterations to abort stagnant loops early.
+
+**Exit criteria:** Rebuttal loop functions in team orchestration; brittle formatting bails replaced; verification failure test confirmed; non-critical findings preserved in summary; all unit and integration tests pass with 0 warnings.
+
 ## 6. Dependency order
 
 ```text
 R0 → R1 → R2 → R3 → R4 → R5
                          └──→ R6
 R5 + R6 → R7 → R8 → R9
-R6 + R7 + R8 + R9 → R10 → R11 → R12 → R13 → R14 → R15 → R16
+R6 + R7 + R8 + R9 → R10 → R11 → R12 → R13 → R14 → R15 → R16 → R17
 ```
 
 Implementation details may change based on experiments. Preserve invariants and acceptance checks; update `docs/decisions.md`, `docs/tasks.md`, and `docs/state.md` when scope changes materially.

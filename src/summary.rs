@@ -23,6 +23,7 @@ pub struct TaskSummaryData<'a> {
     pub checks_passed: Vec<String>,
     pub modified_files: Vec<String>,
     pub commit_hash: Option<String>,
+    pub deferred_findings: Vec<crate::review::CriticFinding>,
 }
 
 /// Truncates large error/output texts to protect token economy (Context Budgeting).
@@ -133,6 +134,28 @@ pub fn generate_summary_markdown(data: &TaskSummaryData) -> String {
     }
     doc.push('\n');
 
+    doc.push_str("## 📌 Deferred Findings & Backlog\n");
+    if data.deferred_findings.is_empty() {
+        doc.push_str("*No non-critical findings or deferred technical debt.*\n");
+    } else {
+        for finding in &data.deferred_findings {
+            let line = finding
+                .line
+                .map(|line| format!(":{line}"))
+                .unwrap_or_default();
+            let scope = if finding.out_of_scope {
+                " (out-of-scope)"
+            } else {
+                ""
+            };
+            doc.push_str(&format!(
+                "- **[{:?}{}]** `{}`{} — **{}**: {}\n",
+                finding.severity, scope, finding.path, line, finding.title, finding.reason
+            ));
+        }
+    }
+    doc.push('\n');
+
     doc.push_str("---\n");
     doc.push_str("*Generated automatically by TALOS Local Multi-Agent Orchestrator.*\n");
 
@@ -167,5 +190,56 @@ mod tests {
     fn small_strings_are_not_truncated() {
         let small = "SyntaxError: invalid syntax at line 3";
         assert_eq!(truncate_for_token_economy(small, 4096), small);
+    }
+
+    #[test]
+    fn renders_deferred_findings_backlog_section() {
+        let task = TaskRecord {
+            id: 42,
+            title: "Improve error handling".to_owned(),
+            acceptance_criteria: "Graceful error normalization".to_owned(),
+            status: crate::db::TaskStatus::Complete,
+            created_at_ms: 1000,
+            updated_at_ms: 2000,
+        };
+        let deferred = vec![
+            crate::review::CriticFinding {
+                severity: crate::review::FindingSeverity::Minor,
+                path: "src/util.rs".to_owned(),
+                line: Some(15),
+                title: "Redundant clone".to_owned(),
+                reason: "Can take reference instead of clone.".to_owned(),
+                out_of_scope: false,
+            },
+            crate::review::CriticFinding {
+                severity: crate::review::FindingSeverity::Note,
+                path: "docs/architecture.md".to_owned(),
+                line: None,
+                title: "Update outdated diagram".to_owned(),
+                reason: "Diagram does not reflect latest component.".to_owned(),
+                out_of_scope: true,
+            },
+        ];
+        let summary_data = TaskSummaryData {
+            task: &task,
+            mode: OrchestrationMode::Pair,
+            writer_adapter: AdapterKind::Agy,
+            writer_model: Some("gemini-2.5-pro"),
+            critic_adapter: AdapterKind::Agy,
+            critic_model: Some("gemini-2.5-pro"),
+            start_time: SystemTime::now(),
+            total_pause_duration: Duration::from_secs(5),
+            decisions: vec!["Adopted resilient error normalization".to_owned()],
+            checks_passed: vec!["cargo check".to_owned()],
+            modified_files: vec!["src/util.rs".to_owned()],
+            commit_hash: Some("abcd1234ef5678".to_owned()),
+            deferred_findings: deferred,
+        };
+        let markdown = generate_summary_markdown(&summary_data);
+        assert!(markdown.contains("## 📌 Deferred Findings & Backlog"));
+        assert!(markdown.contains("Redundant clone"));
+        assert!(markdown.contains("Can take reference instead of clone."));
+        assert!(markdown.contains("Update outdated diagram"));
+        assert!(markdown.contains("(out-of-scope)"));
     }
 }

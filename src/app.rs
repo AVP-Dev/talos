@@ -2731,7 +2731,11 @@ async fn run_task_verification(
         }
     }
     if run.status != "passed" {
-        bail!("Verification did not pass for the approved revision; task remains open");
+        bail!(
+            "Task #{task_id} verification checks failed (run #{}, status '{}')",
+            run.id,
+            run.status
+        );
     }
     Ok(())
 }
@@ -3291,9 +3295,11 @@ async fn run_pair_task(
     };
 
     // Step 2: Critic Review & Automated Fix Loop
+    let mut deferred_findings = Vec::new();
     if task.status != crate::db::TaskStatus::Verifying {
         const MAX_REVIEW_FIX_CYCLES: usize = 3;
         let mut cycles = 0;
+        let mut previous_patch_digest: Option<String> = None;
         loop {
             cycles += 1;
             println!(
@@ -3303,13 +3309,58 @@ async fn run_pair_task(
             let critic_report = execute_critic_review(review_project, database, task.id).await?;
             print_critic_report(json_output, &critic_report)?;
 
+            let current_patch_digest = critic_report
+                .review
+                .patch_sha256
+                .clone()
+                .unwrap_or_else(|| critic_report.review.revision_id.clone());
+
             if critic_report.review.decision == "approve" {
                 println!(
                     "\n>>> [TALOS Auto] Critic approved changes for task #{}.",
                     task.id
                 );
+                for finding in critic_report.findings {
+                    if !finding.is_blocking() {
+                        deferred_findings.push(finding);
+                    }
+                }
                 break;
             }
+
+            // Anti-stagnation check: If cycles >= 2 and diff patch is identical to previous round
+            if cycles >= 2
+                && crate::revision::is_diff_stagnant(
+                    previous_patch_digest.as_deref(),
+                    &current_patch_digest,
+                )
+            {
+                println!(
+                    "\n>>> [TALOS Auto] Stagnation detected: Writer produced identical diff without addressing Critic findings."
+                );
+                let _ = database.record_task_event(
+                    task.id,
+                    "talos",
+                    "task.stagnation_detected",
+                    "Stagnation detected: Writer produced identical diff without addressing Critic findings",
+                    Some(&current_patch_digest),
+                );
+                if let Ok(Some(current_task)) = database.get_task(task.id)
+                    && current_task.status != crate::db::TaskStatus::Implementing
+                {
+                    let _ = database.transition_task(
+                        task.id,
+                        crate::db::TaskStatus::Implementing,
+                        "talos",
+                        "Stagnation detected: Writer produced identical diff without addressing Critic findings",
+                    );
+                }
+                bail!(
+                    "Stagnation detected on task #{}: Writer produced identical diff across fix rounds without addressing Critic findings",
+                    task.id
+                );
+            }
+            previous_patch_digest = Some(current_patch_digest);
 
             if cycles >= MAX_REVIEW_FIX_CYCLES {
                 println!(
@@ -3345,7 +3396,30 @@ async fn run_pair_task(
         "\n>>> [TALOS Auto] Running project verification for task #{}...",
         task.id
     );
-    run_task_verification(json_output, project, database, task.id).await?;
+    if let Err(err) = run_task_verification(json_output, project, database, task.id).await {
+        println!(
+            "\n>>> [TALOS Auto] Task #{} verification failed: {err}",
+            task.id
+        );
+        let _ = database.transition_task(
+            task.id,
+            crate::db::TaskStatus::Implementing,
+            "talos",
+            &format!("Verification failed: {err}"),
+        );
+        let event_data = serde_json::json!({
+            "error": err.to_string(),
+        })
+        .to_string();
+        let _ = database.record_task_event(
+            task.id,
+            "talos",
+            "task.verification_failed",
+            &format!("Verification checks failed: {err}"),
+            Some(&event_data),
+        );
+        return Err(err);
+    }
     println!(
         "\n>>> [TALOS Auto] Task #{} verified and completed successfully!",
         task.id
@@ -3424,6 +3498,33 @@ async fn run_pair_task(
     let changed = git_status_paths(project)
         .map(|p| p.preview)
         .unwrap_or_default();
+
+    if deferred_findings.is_empty()
+        && let Ok(Some(latest_review)) = database.latest_critic_review(task.id)
+        && let Ok(critic_resp) =
+            serde_json::from_str::<crate::review::CriticResponse>(&latest_review.result_json)
+    {
+        for finding in critic_resp.findings {
+            if !finding.is_blocking() {
+                deferred_findings.push(finding);
+            }
+        }
+    }
+
+    if !deferred_findings.is_empty() {
+        let payload = serde_json::to_string(&deferred_findings).ok();
+        let _ = database.record_task_event(
+            task.id,
+            "critic",
+            "task.backlog_curated",
+            &format!(
+                "Curated {} deferred finding(s) for task backlog",
+                deferred_findings.len()
+            ),
+            payload.as_deref(),
+        );
+    }
+
     let summary_data = crate::summary::TaskSummaryData {
         task,
         mode: crate::config::OrchestrationMode::Pair,
@@ -3440,6 +3541,7 @@ async fn run_pair_task(
         checks_passed: config.checks.iter().map(|c| c.id.clone()).collect(),
         modified_files: changed,
         commit_hash,
+        deferred_findings,
     };
     if let Ok(artifact) = crate::summary::write_task_summary(&project.root, &summary_data) {
         println!("\n>>> [TALOS Auto] 📄 Deliverable Summary Artifact written to: {artifact}");
@@ -3493,10 +3595,76 @@ async fn run_team_task(
 
     let (writer_exe, _) = resolve_adapter_executable(config.writer, &project.root)?;
 
+    // Phase 0: Recommendation-based Pre-Flight Task Triage
+    println!("\n>>> [TALOS Team] Phase 0: Pre-flight task triage & depth analysis...");
+    let repo_summary = match git_status_paths(project) {
+        Ok(paths) => paths.display_preview(),
+        Err(_) => "clean repository".to_string(),
+    };
+    let triage_prompt = crate::team::build_task_triage_prompt(task, &repo_summary);
+    let triage_response = crate::supervisor::run_agent_query(
+        &project.root,
+        config.writer,
+        writer_exe.clone(),
+        config.writer_model.clone(),
+        triage_prompt,
+        false,
+        Duration::from_secs(60),
+    )
+    .await;
+
+    let triage_rec = match triage_response {
+        Ok(resp) => match crate::team::parse_task_triage(&resp) {
+            Ok(rec) => {
+                println!(
+                    ">>> [TALOS Team] Triage Recommendation: complexity={}, depth={}, focus={:?}",
+                    rec.complexity.as_str(),
+                    rec.recommended_depth.as_str(),
+                    rec.suggested_focus
+                );
+                println!(">>> [TALOS Team] Triage Rationale: {}", rec.rationale);
+                let payload = serde_json::to_string(&rec).ok();
+                let _ = database.record_task_event(
+                    task.id,
+                    "talos_triage",
+                    "task.triage",
+                    &format!(
+                        "Triage recommendation: {} complexity, {} depth",
+                        rec.complexity.as_str(),
+                        rec.recommended_depth.as_str()
+                    ),
+                    payload.as_deref(),
+                );
+                architectural_decisions.push(format!(
+                    "Pre-flight triage: {} complexity, {} depth (rationale: {})",
+                    rec.complexity.as_str(),
+                    rec.recommended_depth.as_str(),
+                    rec.rationale
+                ));
+                Some(rec)
+            }
+            Err(e) => {
+                println!(
+                    ">>> [TALOS Team] Note: Pre-flight triage parse failed ({e:#}); proceeding with standard depth."
+                );
+                None
+            }
+        },
+        Err(e) => {
+            println!(
+                ">>> [TALOS Team] Note: Pre-flight triage query failed ({e:#}); proceeding with standard depth."
+            );
+            None
+        }
+    };
+
     // Step 1: Writer Lead Planning & Decomposition
     println!("\n>>> [TALOS Team] Phase 1: Writer Lead analyzing requirements & planning...");
-    let plan_prompt =
-        crate::team::build_writer_lead_plan_prompt(task, config.orchestration.max_writer_workers);
+    let plan_prompt = crate::team::build_writer_lead_plan_prompt(
+        task,
+        config.orchestration.max_writer_workers,
+        triage_rec.as_ref(),
+    );
     let plan_response = crate::supervisor::run_agent_query(
         &project.root,
         config.writer,
@@ -4094,11 +4262,20 @@ async fn run_team_task(
             if let Ok(snapshot) =
                 crate::revision::RevisionSnapshot::capture(&project.root, base_rev)
             {
-                let worker_prompt = crate::team::build_critic_worker_prompt(
-                    task,
-                    &snapshot.patch,
-                    "Security, edge case handling, and requirement compliance",
-                );
+                let focus_area = if let Some(rec) = &triage_rec {
+                    if !rec.suggested_focus.is_empty() {
+                        format!(
+                            "{}, edge case handling, and requirement compliance",
+                            rec.suggested_focus.join(", ")
+                        )
+                    } else {
+                        "Security, edge case handling, and requirement compliance".to_string()
+                    }
+                } else {
+                    "Security, edge case handling, and requirement compliance".to_string()
+                };
+                let worker_prompt =
+                    crate::team::build_critic_worker_prompt(task, &snapshot.patch, &focus_area);
                 let worker_resp = crate::supervisor::run_agent_query(
                     &project.root,
                     config.critic,
@@ -4136,6 +4313,8 @@ async fn run_team_task(
     // Critic Lead consolidated review & deliberation loop
     let max_rounds = config.orchestration.max_review_rounds;
     let mut round = 0;
+    let mut team_deferred_findings = Vec::new();
+    let mut previous_patch_digest: Option<String> = None;
     loop {
         round += 1;
         println!(
@@ -4144,6 +4323,12 @@ async fn run_team_task(
         );
         let critic_report = execute_critic_review(project, database, task.id).await?;
         print_critic_report(json_output, &critic_report)?;
+
+        let current_patch_digest = critic_report
+            .review
+            .patch_sha256
+            .clone()
+            .unwrap_or_else(|| critic_report.review.revision_id.clone());
 
         if critic_report.review.decision == "approve" {
             println!(
@@ -4157,8 +4342,47 @@ async fn run_team_task(
                 "Critic Lead approved solution",
                 Some(&critic_report.review.summary),
             );
+            for finding in critic_report.findings {
+                if !finding.is_blocking() {
+                    team_deferred_findings.push(finding);
+                }
+            }
             break;
         }
+
+        // Anti-stagnation check: If round >= 2 and diff patch is identical to previous round
+        if round >= 2
+            && crate::revision::is_diff_stagnant(
+                previous_patch_digest.as_deref(),
+                &current_patch_digest,
+            )
+        {
+            println!(
+                "\n>>> [TALOS Team] Stagnation detected: Writer produced identical diff without addressing Critic findings."
+            );
+            let _ = database.record_task_event(
+                task.id,
+                "talos",
+                "task.stagnation_detected",
+                "Stagnation detected: Writer produced identical diff without addressing Critic findings",
+                Some(&current_patch_digest),
+            );
+            if let Ok(Some(current_task)) = database.get_task(task.id)
+                && current_task.status != crate::db::TaskStatus::Implementing
+            {
+                let _ = database.transition_task(
+                    task.id,
+                    crate::db::TaskStatus::Implementing,
+                    "talos",
+                    "Stagnation detected: Writer produced identical diff without addressing Critic findings",
+                );
+            }
+            bail!(
+                "Stagnation detected on task #{}: Writer produced identical diff across fix rounds without addressing Critic findings",
+                task.id
+            );
+        }
+        previous_patch_digest = Some(current_patch_digest);
 
         if round >= max_rounds {
             println!(
@@ -4172,7 +4396,7 @@ async fn run_team_task(
         }
 
         println!(
-            "\n>>> [TALOS Team] Critic Lead requested changes. Writer Lead analyzing remarks and applying corrections..."
+            "\n>>> [TALOS Team] Critic Lead requested changes. Writer Lead analyzing remarks and deliberating..."
         );
         let findings_str = serde_json::to_string(&critic_report.findings)?;
         let _ = database.record_task_event(
@@ -4182,6 +4406,51 @@ async fn run_team_task(
             "Critic Lead requested modifications",
             Some(&findings_str),
         );
+
+        // Writer Lead deliberation & rebuttal query
+        let rebuttal_prompt =
+            crate::team::build_writer_lead_rebuttal_prompt(task, &findings_str, round, max_rounds);
+        let rebuttal_resp = crate::supervisor::run_agent_query(
+            &project.root,
+            config.writer,
+            writer_exe.clone(),
+            config.writer_model.clone(),
+            rebuttal_prompt,
+            false,
+            Duration::from_secs(120),
+        )
+        .await;
+
+        if let Ok(resp) = rebuttal_resp {
+            println!(">>> [TALOS Team] Writer Lead provided technical deliberation & response.");
+            let _ = database.record_task_event(
+                task.id,
+                "writer_lead",
+                "task.team_deliberation",
+                "Writer Lead deliberation and technical justification",
+                Some(&resp),
+            );
+            let summary_line = resp
+                .trim()
+                .lines()
+                .next()
+                .unwrap_or("Deliberated technical response")
+                .to_string();
+            architectural_decisions.push(format!(
+                "Writer Lead deliberation (round {round}): {summary_line}"
+            ));
+
+            let _ = database.add_team_subtask(
+                task.id,
+                task.id,
+                "writer_lead_rebuttal",
+                config.writer.as_str(),
+                "external",
+                "completed",
+                &[],
+            );
+            let _ = database.update_team_subtask_status(task.id, "completed", Some(&resp), None);
+        }
 
         let fix_execution =
             execute_writer_task(json_output, project, database, task.id, None).await?;
@@ -4204,7 +4473,30 @@ async fn run_team_task(
         database.add_task_verification_checks(task.id, &config.checks)?;
     }
 
-    run_task_verification(json_output, project, database, task.id).await?;
+    if let Err(err) = run_task_verification(json_output, project, database, task.id).await {
+        println!(
+            "\n>>> [TALOS Team] Task #{} verification failed: {err}",
+            task.id
+        );
+        let _ = database.transition_task(
+            task.id,
+            crate::db::TaskStatus::Implementing,
+            "talos",
+            &format!("Verification failed: {err}"),
+        );
+        let event_data = serde_json::json!({
+            "error": err.to_string(),
+        })
+        .to_string();
+        let _ = database.record_task_event(
+            task.id,
+            "talos",
+            "task.verification_failed",
+            &format!("Verification checks failed: {err}"),
+            Some(&event_data),
+        );
+        return Err(err);
+    }
     println!(
         ">>> [TALOS Team] All automated project checks PASSED successfully for task #{}.",
         task.id
@@ -4226,6 +4518,21 @@ async fn run_team_task(
     let changed = git_status_paths(project)
         .map(|p| p.preview)
         .unwrap_or_default();
+
+    if !team_deferred_findings.is_empty() {
+        let payload = serde_json::to_string(&team_deferred_findings).ok();
+        let _ = database.record_task_event(
+            task.id,
+            "critic_lead",
+            "task.backlog_curated",
+            &format!(
+                "Curated {} deferred finding(s) for task backlog",
+                team_deferred_findings.len()
+            ),
+            payload.as_deref(),
+        );
+    }
+
     let summary_data = crate::summary::TaskSummaryData {
         task,
         mode: crate::config::OrchestrationMode::Team,
@@ -4239,6 +4546,7 @@ async fn run_team_task(
         checks_passed: config.checks.iter().map(|c| c.id.clone()).collect(),
         modified_files: changed,
         commit_hash,
+        deferred_findings: team_deferred_findings,
     };
     if let Ok(artifact) = crate::summary::write_task_summary(&project.root, &summary_data) {
         println!("\n>>> [TALOS Team] 📄 Deliverable Summary Artifact written to: {artifact}");
@@ -4371,7 +4679,30 @@ async fn run_one_shot_semi(
         "\n>>> [TALOS Auto] Running project verification for task #{}...",
         task.id
     );
-    run_task_verification(json_output, project, database, task.id).await?;
+    if let Err(err) = run_task_verification(json_output, project, database, task.id).await {
+        println!(
+            "\n>>> [TALOS Auto] Task #{} verification failed: {err}",
+            task.id
+        );
+        let _ = database.transition_task(
+            task.id,
+            crate::db::TaskStatus::Implementing,
+            "talos",
+            &format!("Verification failed: {err}"),
+        );
+        let event_data = serde_json::json!({
+            "error": err.to_string(),
+        })
+        .to_string();
+        let _ = database.record_task_event(
+            task.id,
+            "talos",
+            "task.verification_failed",
+            &format!("Verification checks failed: {err}"),
+            Some(&event_data),
+        );
+        return Err(err);
+    }
     println!(
         "\n>>> [TALOS Auto] Task #{} verified and completed successfully!",
         task.id
@@ -5134,7 +5465,7 @@ mod tests {
 
     use super::{
         ResolveAction, SUPERVISOR_LEASE, acquire_recovery_lease, ensure_talos_ignored, now_ms,
-        recover_writer_attempts, resolve_writer_attempt, run_task_verification,
+        recover_writer_attempts, resolve_writer_attempt, run_pair_task, run_task_verification,
     };
     use crate::{
         checks::ProjectCheck,
@@ -5338,6 +5669,248 @@ mod tests {
                 .iter()
                 .any(|event| event.event_type == "verification.finished")
         );
+        drop(database);
+        fs::remove_dir_all(&project.root).expect("remove temporary verification project");
+    }
+
+    #[tokio::test]
+    async fn verification_failure_returns_error_and_does_not_complete_task() {
+        let mut project = temp_project();
+        fs::write(project.root.join(".gitignore"), ".talos/\n").expect("ignore TALOS runtime");
+        fs::create_dir_all(project.root.join("src")).expect("create source directory");
+        fs::write(
+            project.root.join("src/lib.rs"),
+            "pub fn value() -> u8 { 1 }\n",
+        )
+        .expect("write baseline source");
+        init_git(&project.root);
+        project.discovery = DiscoveryMethod::Git;
+        git(&project.root, &["add", ".gitignore", "src/lib.rs"]);
+        git(
+            &project.root,
+            &[
+                "-c",
+                "user.name=TALOS",
+                "-c",
+                "user.email=talos@example.invalid",
+                "commit",
+                "-m",
+                "baseline",
+            ],
+        );
+        let base = clean_base_commit(&project.root).expect("capture clean Git base");
+        fs::write(
+            project.root.join("src/lib.rs"),
+            "pub fn value() -> u8 { 2 }\n",
+        )
+        .expect("write task change");
+
+        let mut database = Database::open(&project).expect("initialize task database");
+        let failing_check = ProjectCheck {
+            id: "failing-check".to_owned(),
+            argv: vec!["cargo".to_owned(), "--invalid-flag-that-fails".to_owned()],
+            version_argv: vec!["cargo".to_owned(), "--version".to_owned()],
+            working_directory: ".".to_owned(),
+        };
+        let task = database
+            .add_task_with_checks(
+                "Verify task",
+                "The configured check exits zero",
+                &[failing_check],
+            )
+            .expect("create task with one required check");
+        let writer = database
+            .begin_writer_attempt(task.id, &"f".repeat(64))
+            .expect("begin Writer attempt");
+        database
+            .record_writer_base_revision(writer.id, &base)
+            .expect("record Writer base");
+        database
+            .finish_writer_attempt(
+                writer.id,
+                WriterAttemptOutcome::Succeeded,
+                None,
+                Some(0),
+                Some("SUCCESS"),
+                None,
+            )
+            .expect("finish Writer attempt");
+        let snapshot =
+            RevisionSnapshot::capture(&project.root, &base).expect("capture review revision");
+        let revision_json = serde_json::to_string(&snapshot.changed_paths)
+            .expect("serialize changed project paths");
+        let critic_result = format!(
+            r#"{{"decision":"approve","revision_id":"{}"}}"#,
+            snapshot.revision_id
+        );
+        database
+            .record_critic_review(CriticReviewInput {
+                task_id: task.id,
+                writer_attempt_id: writer.id,
+                base_revision: &snapshot.base_commit,
+                head_commit: &snapshot.head_commit,
+                revision_id: &snapshot.revision_id,
+                patch_sha256: &snapshot.patch_sha256,
+                changed_paths_json: &revision_json,
+                decision: "approve",
+                summary: "The project check is saved for verification.",
+                result_json: &critic_result,
+                adapter: "agy",
+                adapter_version: "1.5.10",
+            })
+            .expect("record approval for exact revision");
+
+        let err = run_task_verification(false, &project, &mut database, task.id)
+            .await
+            .expect_err("verification must fail when check exits non-zero");
+        let err_msg = format!("{err:#}");
+        assert!(
+            err_msg.contains(&format!("Task #{} verification checks failed", task.id)),
+            "unexpected error message: {err_msg}"
+        );
+        assert!(
+            err_msg.contains("status 'failed'"),
+            "unexpected error message: {err_msg}"
+        );
+        assert_eq!(
+            database.list_tasks().expect("read task")[0].status,
+            TaskStatus::Verifying
+        );
+        let history = database
+            .verification_history(task.id)
+            .expect("read verification history");
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].run.status, "failed");
+
+        drop(database);
+        fs::remove_dir_all(&project.root).expect("remove temporary verification project");
+    }
+
+    #[tokio::test]
+    async fn pair_task_verification_failure_transitions_to_implementing_and_emits_event() {
+        let mut project = temp_project();
+        fs::write(project.root.join(".gitignore"), ".talos/\n").expect("ignore TALOS runtime");
+        fs::create_dir_all(project.root.join("src")).expect("create source directory");
+        fs::write(
+            project.root.join("src/lib.rs"),
+            "pub fn value() -> u8 { 1 }\n",
+        )
+        .expect("write baseline source");
+        init_git(&project.root);
+        project.discovery = DiscoveryMethod::Git;
+        git(&project.root, &["add", ".gitignore", "src/lib.rs"]);
+        git(
+            &project.root,
+            &[
+                "-c",
+                "user.name=TALOS",
+                "-c",
+                "user.email=talos@example.invalid",
+                "commit",
+                "-m",
+                "baseline",
+            ],
+        );
+        let base = clean_base_commit(&project.root).expect("capture clean Git base");
+        fs::write(
+            project.root.join("src/lib.rs"),
+            "pub fn value() -> u8 { 2 }\n",
+        )
+        .expect("write task change");
+
+        let mut database = Database::open(&project).expect("initialize task database");
+        let failing_check = ProjectCheck {
+            id: "failing-check".to_owned(),
+            argv: vec!["cargo".to_owned(), "--invalid-flag-that-fails".to_owned()],
+            version_argv: vec!["cargo".to_owned(), "--version".to_owned()],
+            working_directory: ".".to_owned(),
+        };
+        let task = database
+            .add_task_with_checks(
+                "Verify task",
+                "The configured check exits zero",
+                &[failing_check],
+            )
+            .expect("create task with one required check");
+        let writer = database
+            .begin_writer_attempt(task.id, &"f".repeat(64))
+            .expect("begin Writer attempt");
+        database
+            .record_writer_base_revision(writer.id, &base)
+            .expect("record Writer base");
+        database
+            .finish_writer_attempt(
+                writer.id,
+                WriterAttemptOutcome::Succeeded,
+                None,
+                Some(0),
+                Some("SUCCESS"),
+                None,
+            )
+            .expect("finish Writer attempt");
+        let snapshot =
+            RevisionSnapshot::capture(&project.root, &base).expect("capture review revision");
+        let revision_json = serde_json::to_string(&snapshot.changed_paths)
+            .expect("serialize changed project paths");
+        let critic_result = format!(
+            r#"{{"decision":"approve","revision_id":"{}"}}"#,
+            snapshot.revision_id
+        );
+        database
+            .record_critic_review(CriticReviewInput {
+                task_id: task.id,
+                writer_attempt_id: writer.id,
+                base_revision: &snapshot.base_commit,
+                head_commit: &snapshot.head_commit,
+                revision_id: &snapshot.revision_id,
+                patch_sha256: &snapshot.patch_sha256,
+                changed_paths_json: &revision_json,
+                decision: "approve",
+                summary: "The project check is saved for verification.",
+                result_json: &critic_result,
+                adapter: "agy",
+                adapter_version: "1.5.10",
+            })
+            .expect("record approval for exact revision");
+
+        let task_record = database.get_task(task.id).unwrap().unwrap();
+        assert_eq!(task_record.status, TaskStatus::Verifying);
+
+        let config = crate::config::ProjectConfig::default();
+        let err = run_pair_task(false, &project, &mut database, &task_record, &config)
+            .await
+            .expect_err("run_pair_task must fail when verification checks fail");
+        assert!(format!("{err:#}").contains("verification checks failed"));
+
+        let updated_task = database.get_task(task.id).unwrap().unwrap();
+        assert_eq!(
+            updated_task.status,
+            TaskStatus::Implementing,
+            "task must transition back to implementing on verification failure"
+        );
+
+        let events = database
+            .task_events(Some(task.id))
+            .expect("read verification events");
+        assert!(
+            events
+                .iter()
+                .any(|event| event.event_type == "task.verification_failed"),
+            "task.verification_failed event must be emitted"
+        );
+
+        let log = Command::new("git")
+            .arg("-C")
+            .arg(&project.root)
+            .args(["log", "--oneline"])
+            .output()
+            .expect("read git log");
+        let log_str = String::from_utf8_lossy(&log.stdout);
+        assert!(
+            !log_str.contains("talos: task"),
+            "git log must not contain unverified completion commit"
+        );
+
         drop(database);
         fs::remove_dir_all(&project.root).expect("remove temporary verification project");
     }
@@ -5822,12 +6395,59 @@ mod tests {
         );
         assert!(lead_review_prompt.contains("SPECIALIZED CRITIC WORKER FINDINGS:"));
         assert!(lead_review_prompt.contains("CWE-312"));
+        assert!(lead_review_prompt.contains("Passing unit tests prove behavioral compliance with existing tests, but do NOT automatically excuse architectural flaws"));
 
         // Writer Lead receives rebuttal prompt with Critic's feedback
         let rebuttal_prompt =
             crate::team::build_writer_lead_rebuttal_prompt(&task, critic_worker_finding, 1, 3);
         assert!(rebuttal_prompt.contains("Round 1 of 3"));
         assert!(rebuttal_prompt.contains("CWE-312"));
+        assert!(rebuttal_prompt.contains("technical rebuttal"));
+
+        fs::remove_dir_all(&project.root).expect("remove temporary project");
+    }
+
+    #[test]
+    fn stagnation_detection_identifies_identical_diff_and_transitions_task() {
+        let project = temp_project();
+        init_git(&project.root);
+        fs::write(project.root.join(".gitignore"), ".talos/\n").expect("write gitignore");
+        fs::write(project.root.join("README.md"), "# Stagnation Test\n").expect("write readme");
+        git(&project.root, &["add", "."]);
+        git(&project.root, &["commit", "-m", "initial commit"]);
+
+        let mut database = Database::open(&project).expect("initialize database");
+        let task = database
+            .add_task("Fix bug", "Do not produce identical diff")
+            .expect("add task");
+
+        let digest1 = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let digest2 = "sha256:1111111111111111111111111111111111111111111111111111111111111111";
+        let digest3 = "sha256:2222222222222222222222222222222222222222222222222222222222222222";
+
+        assert!(!crate::revision::is_diff_stagnant(None, digest1));
+        assert!(!crate::revision::is_diff_stagnant(Some(digest1), digest3));
+        assert!(crate::revision::is_diff_stagnant(Some(digest1), digest2));
+
+        // Simulate anti-stagnation abort action
+        database
+            .record_task_event(
+                task.id,
+                "talos",
+                "task.stagnation_detected",
+                "Stagnation detected: Writer produced identical diff without addressing Critic findings",
+                Some(digest2),
+            )
+            .expect("record stagnation event");
+
+        let events = database
+            .task_events(Some(task.id))
+            .expect("read task events");
+        assert!(
+            events
+                .iter()
+                .any(|e| e.event_type == "task.stagnation_detected")
+        );
 
         fs::remove_dir_all(&project.root).expect("remove temporary project");
     }

@@ -204,6 +204,18 @@ Dependency: R6–R8.
 | T16.2 | done | Parameterized task presets (`/task:test`, `/task:refactor`, `/task:fix`, `/task:bench`) | Added shorthand archetype commands with automatic `--criteria` generation and path scoping. Verified in SQLite database with unit test `tab_completion_and_task_presets`. |
 | T16.3 | done | Interactive file staging & discarding in `3: Git Diff` view | Operator navigates modified files with `j`/`k`, inspects diff for selected file or working tree, stages clean files with `s`, and discards/reverts unwanted edits with `d`. Verified with unit test `diff_file_navigation_and_selection`. |
 
+## R17 — Autonomous Engineering Evolution: Deliberation, Adaptive Triage, and Resilient Validation
+**Status:** complete. Implemented structured deliberation, flexible recommendation-based triage, backlog curation, verification failure handling, and resilient validation.
+
+| ID | Status | Task | Exit criteria |
+|---|---|---|---|
+| T17.1 | complete | Test-verify and resolve the verification failure completion defect | Write regression test reproducing verification failure behavior where `run_task_verification` returns Ok while task status is `failed` in DB; ensure failed checks prevent completion, skip commit/PR, and report failure cleanly. |
+| T17.2 | complete | Replace brittle validation bails with resilient normalization | Replace crashes on text lengths (`summary`, `title`, `reason`) with multi-part retention or safe capture; normalize line 0; route findings on unmodified paths to cross-cutting backlog rather than failing review. |
+| T17.3 | complete | Activate Writer Lead deliberation and rebuttal loop | Wire `build_writer_lead_rebuttal_prompt` into `run_team_task`; allow Writer Lead to argue technical choices; ensure green tests inform but do NOT automatically dismiss Critic's architectural concerns; record decisions in summary. |
+| T17.4 | complete | Recommendation-based pre-flight task triage | Read-only analysis of task requirements and repository structure recommending analysis depth and team posture without rigid hardcoded selection rules. |
+| T17.5 | complete | Backlog curation for non-critical findings and technical debt | Capture `Minor` and `Note` findings into persistent backlog storage upon Critic approval; include deferred items in `TALOS_SUMMARY.md`. |
+| T17.6 | complete | Anti-stagnation loop detection across fix rounds | Compare diff hash and verification output across fix iterations; abort futile stagnant loops early without wasting token budgets. |
+
 ## Required end-to-end scenarios from the original request
 
 First launch/repeat `up`; Writer/Critic success and justified rejection; child task; independent parallel work; adding a task while work is running; manual takeover; CLI recovery; orchestrator crash; SSH disconnect/reconnect; Linux reboot autostart; PR without merge; duplicate-execution prevention; and rechecking original acceptance criteria before closeout. Keep separate evidence for each scenario; do not combine them into a misleading test.
