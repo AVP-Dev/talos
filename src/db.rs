@@ -3354,6 +3354,21 @@ impl Database {
         Ok(attempts)
     }
 
+    pub fn get_writer_attempt(&self, attempt_id: i64) -> Result<Option<WriterAttemptRecord>> {
+        self.connection
+            .query_row(
+                "SELECT id, task_id, state, process_id, started_at_ms, finished_at_ms,
+                        prompt_sha256, conversation_id, exit_code, agent_status, error_code,
+                        operator_resolution, resolved_at_ms, resolution_reason, source_attempt_id,
+                        base_revision, source_review_id, process_identity_fingerprint
+                 FROM writer_attempts WHERE id = ?1",
+                [attempt_id],
+                map_writer_attempt_record,
+            )
+            .optional()
+            .context("Cannot read Writer attempt")
+    }
+
     pub fn latest_writer_attempt(&self, task_id: i64) -> Result<Option<WriterAttemptRecord>> {
         self.connection
             .query_row(

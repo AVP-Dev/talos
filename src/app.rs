@@ -1881,9 +1881,7 @@ async fn stop_writer(json_output: bool, database: &mut Database) -> Result<()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
     loop {
         let attempt = database
-            .writer_attempts(None)?
-            .into_iter()
-            .find(|attempt| attempt.id == attempt_id)
+            .get_writer_attempt(attempt_id)?
             .with_context(|| format!("Writer attempt #{attempt_id} disappeared while stopping"))?;
         if !matches!(attempt.state.as_str(), "launching" | "running") {
             let stop_confirmed =

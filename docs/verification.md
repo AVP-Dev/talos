@@ -32,7 +32,7 @@ Run these as separate scenarios and record the host, database size before/after,
 
 | Area | Required scenario | Pass evidence |
 |---|---|---|
-| Database growth | Add a large task/event history, close/reopen the database, and measure WAL/checkpoint behavior. | All rows remain readable; measured size is recorded; no automatic deletion occurs. |
+| Database growth | Add a large task/event history, close/reopen the database, and measure WAL/checkpoint behavior. Exercise repeated `talos stop` polling with a large Writer history. | All rows remain readable; measured size is recorded; no automatic deletion occurs; stop polling reads only the requested attempt instead of materializing the project-wide attempt history. |
 | Migration fault | Interrupt or fault-inject a schema migration at transaction boundaries, then reopen. | The database is either at the prior complete version or the new complete version; task/event rows remain intact. |
 | Process limits | Exercise large stdout/stderr, a stuck child, timeout, SIGINT/SIGTERM, and a surviving descendant. | Captures remain bounded, children are reaped where possible, and ambiguous work stays `unknown`. |
 | Worktree recovery | Interrupt creation, integration, and finalization at each filesystem/database boundary. | Reconciliation uses recorded identity; it never resets or deletes operator data. |
