@@ -323,7 +323,7 @@ pub(crate) fn git_output_has_any_bytes(
     Ok(false)
 }
 
-fn git_output_limited(
+pub(crate) fn git_output_limited(
     project_root: &Path,
     arguments: &[&str],
     maximum_stdout_bytes: usize,

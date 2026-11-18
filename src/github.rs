@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     env, io,
     path::Path,
-    process::{Command as StdCommand, ExitStatus, Stdio},
+    process::{ExitStatus, Stdio},
     time::Duration,
 };
 
@@ -14,7 +14,9 @@ use tokio::{
     time::timeout,
 };
 
-use crate::{db::GithubCiCheckRecord, process_group::ProcessGroupGuard};
+use crate::{
+    db::GithubCiCheckRecord, process_group::ProcessGroupGuard, revision::git_output_limited,
+};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const NETWORK_READ_TIMEOUT: Duration = Duration::from_secs(60);
@@ -22,6 +24,9 @@ const NETWORK_WRITE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PULL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2 * 60);
 const CI_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CAPTURE_BYTES: usize = 32 * 1024;
+const MAX_REMOTE_CONFIG_OUTPUT_BYTES: usize = 64 * 1024;
+const MAX_REMOTE_URLS: usize = 64;
+const MAX_REMOTE_URL_BYTES: usize = 2 * 1024;
 
 #[derive(Clone, Debug, Serialize)]
 pub struct GithubProbe {
@@ -522,30 +527,28 @@ fn configured_remote_urls(project_root: &Path, remote: &str, push: bool) -> Resu
     } else {
         vec!["remote", "get-url", "--all", remote]
     };
-    let mut command = StdCommand::new("git");
-    command
-        .args(&arguments)
-        .current_dir(project_root)
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0");
-    for (key, _) in env::vars_os().filter(|(key, _)| key.to_string_lossy().starts_with("GIT_")) {
-        command.env_remove(key);
-    }
-    let output = command
-        .env("GIT_TERMINAL_PROMPT", "0")
-        .env("GIT_OPTIONAL_LOCKS", "0")
-        .output()
-        .context("Cannot inspect the configured GitHub remote")?;
+    let output = git_output_limited(
+        project_root,
+        &arguments,
+        MAX_REMOTE_CONFIG_OUTPUT_BYTES,
+        "configured remote URL list",
+    )?;
     if !output.status.success() {
         bail!("Cannot inspect the configured GitHub remote");
     }
-    let urls = std::str::from_utf8(&output.stdout)
+    let output = std::str::from_utf8(&output.stdout)
         .context("Configured Git remote URL is not valid UTF-8")?
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .map(str::to_owned)
-        .collect::<Vec<_>>();
+        .lines();
+    let mut urls = Vec::with_capacity(2);
+    for url in output.map(str::trim).filter(|line| !line.is_empty()) {
+        if urls.len() == MAX_REMOTE_URLS {
+            bail!("Configured Git remote has more than {MAX_REMOTE_URLS} URLs");
+        }
+        if url.len() > MAX_REMOTE_URL_BYTES {
+            bail!("Configured Git remote URL exceeds {MAX_REMOTE_URL_BYTES} bytes");
+        }
+        urls.push(url.to_owned());
+    }
     Ok(urls)
 }
 
