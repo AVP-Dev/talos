@@ -111,7 +111,7 @@ impl AgentRole {
     }
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct ProjectConfig {
     pub writer: AdapterKind,
     pub critic: AdapterKind,
@@ -249,6 +249,42 @@ impl ProjectConfig {
             AgentRole::Writer => self.writer,
             AgentRole::Critic => self.critic,
         }
+    }
+
+    pub fn save(&self, project: &Project) -> Result<()> {
+        project.ensure_runtime_dir()?;
+        let path = project.runtime_dir().join(CONFIG_FILE_NAME);
+        #[derive(Serialize)]
+        struct OutputConfig<'a> {
+            schema_version: u32,
+            writer: &'static str,
+            critic: &'static str,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            writer_model: Option<&'a str>,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            critic_model: Option<&'a str>,
+            checks: &'a [ProjectCheck],
+            max_concurrent_writers: usize,
+            orchestration: &'a OrchestrationConfig,
+            #[serde(skip_serializing_if = "Option::is_none")]
+            github: Option<&'a GithubPolicy>,
+        }
+        let output = OutputConfig {
+            schema_version: 5,
+            writer: self.writer.as_str(),
+            critic: self.critic.as_str(),
+            writer_model: self.writer_model.as_deref(),
+            critic_model: self.critic_model.as_deref(),
+            checks: &self.checks,
+            max_concurrent_writers: self.max_concurrent_writers,
+            orchestration: &self.orchestration,
+            github: self.github.as_ref(),
+        };
+        let json = serde_json::to_string_pretty(&output)
+            .context("Cannot serialize project config to JSON")?;
+        fs::write(&path, format!("{json}\n"))
+            .with_context(|| format!("Cannot write project config to {}", path.display()))?;
+        Ok(())
     }
 }
 

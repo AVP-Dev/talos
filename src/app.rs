@@ -17,8 +17,8 @@ use crate::{
     adapter::agy::AgyProbe,
     checks::{CheckExecution, ProjectCheck, run_project_check, validate_selected_checks},
     cli::{
-        Cli, Command, GithubBranchCommand, GithubCommand, ResolveAction, TaskCommand,
-        TaskWorktreeCommand,
+        Cli, Command, ConfigCommand, GithubBranchCommand, GithubCommand, ResolveAction,
+        TaskCommand, TaskWorktreeCommand,
     },
     config::{AdapterKind, AgentRole, GithubPolicy, ProjectConfig},
     db::{
@@ -139,7 +139,23 @@ struct GithubReconcileOptions<'a> {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
-    if let Command::Github(arguments) = &cli.command {
+    let command = match cli.command {
+        Some(cmd) => cmd,
+        None => {
+            if env::var_os("TMUX").is_some() {
+                Command::Status
+            } else {
+                let tmux = TmuxClient::default();
+                if tmux.probe().available {
+                    Command::Attach
+                } else {
+                    Command::Status
+                }
+            }
+        }
+    };
+
+    if let Command::Github(arguments) = &command {
         match &arguments.command {
             GithubCommand::Status { check_auth } => {
                 run_github_status(cli.json, *check_auth).await?;
@@ -156,7 +172,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     let working_directory = env::current_dir().context("Cannot read current directory")?;
     let project = Project::discover(&working_directory)?;
 
-    if let Command::Github(arguments) = &cli.command {
+    if let Command::Github(arguments) = &command {
         match &arguments.command {
             GithubCommand::Policy => {
                 ensure_talos_ignored(&project)?;
@@ -180,7 +196,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
 
     if matches!(
-        &cli.command,
+        &command,
         Command::Task(arguments)
             if matches!(
                 &arguments.command,
@@ -191,7 +207,7 @@ pub async fn run(cli: Cli) -> Result<()> {
         validate_project_scope(&project)?;
     }
 
-    if matches!(&cli.command, Command::Attach) {
+    if matches!(&command, Command::Attach) {
         let tmux = TmuxClient::default();
         let probe = tmux.probe();
         if !probe.available {
@@ -215,7 +231,7 @@ pub async fn run(cli: Cli) -> Result<()> {
     ensure_talos_ignored(&project)?;
 
     let mut database = Database::open(&project)?;
-    match cli.command {
+    match command {
         Command::Up(arguments) if arguments.auto => {
             ensure_queue_running(&database)?;
             run_one_shot_auto(cli.json, &project, &mut database, arguments.mode).await?;
@@ -1028,6 +1044,103 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
             _ => bail!("GitHub command was not dispatched before runtime initialization"),
         },
+        Command::Config(arguments) => {
+            let mut config = ProjectConfig::load(&project)?;
+            match arguments.command {
+                None | Some(ConfigCommand::Show) => {
+                    if cli.json {
+                        print_json(&config)?;
+                    } else {
+                        println!("TALOS Project Configuration (.talos/config.json):");
+                        println!(
+                            "  Writer:         {} (generates code and tests in worktrees)",
+                            config.writer.as_str()
+                        );
+                        if let Some(model) = &config.writer_model {
+                            println!("  Writer Model:   {model}");
+                        }
+                        println!(
+                            "  Critic:         {} (independent read-only auditor)",
+                            config.critic.as_str()
+                        );
+                        if let Some(model) = &config.critic_model {
+                            println!("  Critic Model:   {model}");
+                        }
+                        println!(
+                            "  Mode:           {} ({})",
+                            config.orchestration.mode.as_str(),
+                            if config.orchestration.mode == crate::config::OrchestrationMode::Team {
+                                "two-tier team with parallel worktrees and lead integration"
+                            } else {
+                                "sequential Writer -> Critic -> Verify pipeline"
+                            }
+                        );
+                        println!("  Max Writers:    {}", config.max_concurrent_writers);
+                        println!("  Checks:         {} configured", config.checks.len());
+                    }
+                }
+                Some(ConfigCommand::Set { key, value }) => {
+                    match key.to_ascii_lowercase().as_str() {
+                        "writer" => {
+                            let adapter = crate::adapter::AdapterId::parse(&value).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Unknown writer adapter '{value}'. Supported adapters: agy, codex, claude, omp, pi, kilo, opencode"
+                                )
+                            })?;
+                            config.writer = adapter;
+                        }
+                        "critic" => {
+                            let adapter = crate::adapter::AdapterId::parse(&value).ok_or_else(|| {
+                                anyhow::anyhow!(
+                                    "Unknown critic adapter '{value}'. Supported adapters: agy, codex, claude, omp, pi, kilo, opencode"
+                                )
+                            })?;
+                            config.critic = adapter;
+                        }
+                        "mode" => match value.to_ascii_lowercase().as_str() {
+                            "team" => {
+                                config.orchestration.mode = crate::config::OrchestrationMode::Team
+                            }
+                            "pair" => {
+                                config.orchestration.mode = crate::config::OrchestrationMode::Pair
+                            }
+                            _ => bail!("Unknown mode '{value}'. Supported modes: team, pair"),
+                        },
+                        "max-writers" | "max_writers" => {
+                            let n: usize = value
+                                .parse()
+                                .context("max-writers must be a number between 1 and 3")?;
+                            if !(1..=3).contains(&n) {
+                                bail!("max-writers must be between 1 and 3");
+                            }
+                            config.max_concurrent_writers = n;
+                            config.orchestration.max_writer_workers = n;
+                        }
+                        "checks" => {
+                            let checks: Vec<crate::checks::ProjectCheck> = serde_json::from_str(
+                                &value,
+                            )
+                            .context("checks value must be a valid JSON array of project checks")?;
+                            crate::checks::validate_project_checks(&checks)?;
+                            config.checks = checks;
+                        }
+                        _ => bail!(
+                            "Unknown config key '{key}'. Supported keys: writer, critic, mode, max-writers, checks"
+                        ),
+                    }
+                    config.save(&project)?;
+                    if cli.json {
+                        print_json(&json!({
+                            "updated_key": key,
+                            "updated_value": value,
+                            "status": "ok"
+                        }))?;
+                    } else {
+                        println!("Updated configuration: {key} = {value}");
+                    }
+                }
+            }
+        }
     }
     Ok(())
 }

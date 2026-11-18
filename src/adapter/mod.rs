@@ -7,7 +7,8 @@ pub mod omp;
 pub mod opencode;
 pub mod pi;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "lowercase")]
 pub enum AdapterId {
     Agy,
     Codex,

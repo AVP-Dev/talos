@@ -82,6 +82,92 @@ impl TmuxClient {
                 )
             })?;
         if output.status.success() || self.has_session(&session_name)? {
+            // Configure 3-pane interactive layout: top-left (Writer), top-right (Critic), bottom (Console)
+            let _ = self
+                .command()
+                .arg("split-window")
+                .arg("-v")
+                .arg("-p")
+                .arg("45")
+                .arg("-c")
+                .arg(&project_root)
+                .arg("-t")
+                .arg(format!("{session_name}:"))
+                .output();
+
+            let _ = self
+                .command()
+                .arg("split-window")
+                .arg("-h")
+                .arg("-p")
+                .arg("50")
+                .arg("-c")
+                .arg(&project_root)
+                .arg("-t")
+                .arg(format!("{session_name}:.top"))
+                .output();
+
+            let _ = self
+                .command()
+                .arg("select-pane")
+                .arg("-t")
+                .arg(format!("{session_name}:.top-left"))
+                .arg("-T")
+                .arg("Writer Stream")
+                .output();
+
+            let _ = self
+                .command()
+                .arg("select-pane")
+                .arg("-t")
+                .arg(format!("{session_name}:.top-right"))
+                .arg("-T")
+                .arg("Critic Stream")
+                .output();
+
+            let _ = self
+                .command()
+                .arg("select-pane")
+                .arg("-t")
+                .arg(format!("{session_name}:.bottom"))
+                .arg("-T")
+                .arg("Console")
+                .output();
+
+            let _ = self
+                .command()
+                .arg("send-keys")
+                .arg("-t")
+                .arg(format!("{session_name}:.top-left"))
+                .arg("echo '=== TALOS WRITER STREAM ==='; echo 'Waiting for Writer tasks...'; talos logs --project")
+                .arg("C-m")
+                .output();
+
+            let _ = self
+                .command()
+                .arg("send-keys")
+                .arg("-t")
+                .arg(format!("{session_name}:.top-right"))
+                .arg("echo '=== TALOS CRITIC AUDIT STREAM ==='; echo 'Waiting for Critic reviews...'; talos status")
+                .arg("C-m")
+                .output();
+
+            let _ = self
+                .command()
+                .arg("select-pane")
+                .arg("-t")
+                .arg(format!("{session_name}:.bottom"))
+                .output();
+
+            let _ = self
+                .command()
+                .arg("send-keys")
+                .arg("-t")
+                .arg(format!("{session_name}:.bottom"))
+                .arg("echo '=== TALOS INTERACTIVE WORKSPACE ==='; echo 'Ready. Enter commands below (e.g. talos task add \"...\" && talos up --auto):'")
+                .arg("C-m")
+                .output();
+
             return Ok(session_name);
         }
         bail!(

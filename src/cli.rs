@@ -13,7 +13,7 @@ pub struct Cli {
     pub json: bool,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -36,8 +36,29 @@ pub enum Command {
     Doctor,
     /// Create or reconnect to this project's persistent tmux control shell.
     Attach,
+    /// View or modify project configuration (.talos/config.json).
+    Config(ConfigArgs),
     /// Inspect the local GitHub CLI and optionally check its active authentication.
     Github(GithubArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct ConfigArgs {
+    #[command(subcommand)]
+    pub command: Option<ConfigCommand>,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ConfigCommand {
+    /// Display current project configuration.
+    Show,
+    /// Set a configuration option (writer, critic, mode, max-writers, checks).
+    Set {
+        /// Setting key (writer, critic, mode, max-writers, checks).
+        key: String,
+        /// Setting value.
+        value: String,
+    },
 }
 
 #[derive(Debug, Args)]
@@ -356,7 +377,10 @@ pub enum ResolveAction {
 mod tests {
     use clap::Parser;
 
-    use super::{Cli, Command, ResolveAction, ResumeArgs, TaskArgs, TaskCommand, UpArgs};
+    use super::{
+        Cli, Command, ConfigArgs, ConfigCommand, ResolveAction, ResumeArgs, TaskArgs, TaskCommand,
+        UpArgs,
+    };
 
     #[test]
     fn task_continue_requires_project_inspection_confirmation() {
@@ -371,13 +395,13 @@ mod tests {
             "--confirm-project-inspected",
         ])
         .expect("parse explicit continuation command");
-        let Command::Task(TaskArgs {
+        let Some(Command::Task(TaskArgs {
             command:
                 TaskCommand::Continue {
                     task_id,
                     confirm_project_inspected,
                 },
-        }) = parsed.command
+        })) = parsed.command
         else {
             panic!("expected task continue command");
         };
@@ -389,9 +413,9 @@ mod tests {
     fn task_review_parses_a_task_id() {
         let cli = Cli::try_parse_from(["talos", "task", "review", "17"])
             .expect("parse independent review command");
-        let Command::Task(TaskArgs {
+        let Some(Command::Task(TaskArgs {
             command: TaskCommand::Review { task_id },
-        }) = cli.command
+        })) = cli.command
         else {
             panic!("expected task review command");
         };
@@ -413,14 +437,14 @@ mod tests {
             "format",
         ])
         .expect("parse task with saved project checks");
-        let Command::Task(TaskArgs {
+        let Some(Command::Task(TaskArgs {
             command:
                 TaskCommand::Add {
                     title,
                     criteria,
                     checks,
                 },
-        }) = cli.command
+        })) = cli.command
         else {
             panic!("expected task add command");
         };
@@ -433,9 +457,9 @@ mod tests {
     fn task_verify_parses_a_task_id() {
         let cli = Cli::try_parse_from(["talos", "task", "verify", "17"])
             .expect("parse task verification command");
-        let Command::Task(TaskArgs {
+        let Some(Command::Task(TaskArgs {
             command: TaskCommand::Verify { task_id },
-        }) = cli.command
+        })) = cli.command
         else {
             panic!("expected task verify command");
         };
@@ -446,9 +470,9 @@ mod tests {
     fn task_evidence_parses_a_task_id() {
         let cli = Cli::try_parse_from(["talos", "task", "evidence", "17"])
             .expect("parse task evidence command");
-        let Command::Task(TaskArgs {
+        let Some(Command::Task(TaskArgs {
             command: TaskCommand::Evidence { task_id, .. },
-        }) = cli.command
+        })) = cli.command
         else {
             panic!("expected task evidence command");
         };
@@ -459,21 +483,21 @@ mod tests {
     fn attach_parses_without_starting_a_worker_option() {
         let cli = Cli::try_parse_from(["talos", "attach"])
             .expect("parse persistent control-session command");
-        assert!(matches!(cli.command, Command::Attach));
+        assert!(matches!(cli.command, Some(Command::Attach)));
     }
 
     #[test]
     fn pause_resume_and_project_logs_parse_explicit_controls() {
         let paused = Cli::try_parse_from(["talos", "pause", "--reason", "Operator review"])
             .expect("parse queue pause");
-        let Command::Pause(arguments) = paused.command else {
+        let Some(Command::Pause(arguments)) = paused.command else {
             panic!("expected pause command");
         };
         assert_eq!(arguments.reason.as_deref(), Some("Operator review"));
 
         let resumed = Cli::try_parse_from(["talos", "resume", "--reconcile"])
             .expect("parse explicit reconciliation");
-        let Command::Resume(ResumeArgs { reconcile }) = resumed.command else {
+        let Some(Command::Resume(ResumeArgs { reconcile })) = resumed.command else {
             panic!("expected resume command");
         };
         assert!(reconcile);
@@ -481,7 +505,7 @@ mod tests {
         assert!(Cli::try_parse_from(["talos", "logs", "17", "--project"]).is_err());
         let project_logs = Cli::try_parse_from(["talos", "logs", "--project"])
             .expect("parse project control log view");
-        let Command::Logs(arguments) = project_logs.command else {
+        let Some(Command::Logs(arguments)) = project_logs.command else {
             panic!("expected logs command");
         };
         assert!(arguments.project);
@@ -491,7 +515,7 @@ mod tests {
             Cli::try_parse_from(["talos", "stop"])
                 .expect("parse graceful Writer stop")
                 .command,
-            Command::Stop
+            Some(Command::Stop)
         ));
     }
 
@@ -500,9 +524,9 @@ mod tests {
         assert!(Cli::try_parse_from(["talos", "task", "checks", "17"]).is_err());
         let cli = Cli::try_parse_from(["talos", "task", "checks", "17", "--check", "unit"])
             .expect("parse task checks command");
-        let Command::Task(TaskArgs {
+        let Some(Command::Task(TaskArgs {
             command: TaskCommand::Checks { task_id, checks },
-        }) = cli.command
+        })) = cli.command
         else {
             panic!("expected task checks command");
         };
@@ -516,9 +540,9 @@ mod tests {
             "talos", "task", "checks", "17", "--check", "unit", "--check", "format",
         ])
         .expect("parse verification requirement command");
-        let Command::Task(TaskArgs {
+        let Some(Command::Task(TaskArgs {
             command: TaskCommand::Checks { task_id, checks },
-        }) = cli.command
+        })) = cli.command
         else {
             panic!("expected task checks command");
         };
@@ -542,7 +566,7 @@ mod tests {
         ])
         .expect("parse explicit resolution command");
 
-        let Command::Task(TaskArgs {
+        let Some(Command::Task(TaskArgs {
             command:
                 TaskCommand::Resolve {
                     attempt_id,
@@ -551,7 +575,7 @@ mod tests {
                     confirm_project_inspected,
                     reason,
                 },
-        }) = cli.command
+        })) = cli.command
         else {
             panic!("expected task resolve command");
         };
@@ -582,7 +606,7 @@ mod tests {
     fn up_auto_parses_mode_team() {
         let cli = Cli::try_parse_from(["talos", "up", "--auto", "--mode", "team"])
             .expect("parse up --auto --mode team");
-        let Command::Up(UpArgs { auto, mode, .. }) = cli.command else {
+        let Some(Command::Up(UpArgs { auto, mode, .. })) = cli.command else {
             panic!("expected up command");
         };
         assert!(auto);
@@ -590,11 +614,31 @@ mod tests {
 
         let cli_default =
             Cli::try_parse_from(["talos", "up", "--auto"]).expect("parse up --auto default mode");
-        let Command::Up(UpArgs { auto, mode, .. }) = cli_default.command else {
+        let Some(Command::Up(UpArgs { auto, mode, .. })) = cli_default.command else {
             panic!("expected up command");
         };
         assert!(auto);
         assert_eq!(mode, None);
+    }
+
+    #[test]
+    fn bare_talos_parses_without_command() {
+        let cli = Cli::try_parse_from(["talos"]).expect("parse bare talos");
+        assert!(cli.command.is_none());
+    }
+
+    #[test]
+    fn config_set_parses_key_and_value() {
+        let cli = Cli::try_parse_from(["talos", "config", "set", "writer", "codex"])
+            .expect("parse config set");
+        let Some(Command::Config(ConfigArgs {
+            command: Some(ConfigCommand::Set { key, value }),
+        })) = cli.command
+        else {
+            panic!("expected config set command");
+        };
+        assert_eq!(key, "writer");
+        assert_eq!(value, "codex");
     }
 }
 

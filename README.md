@@ -68,14 +68,22 @@ cargo install --locked --path .
 
 ## ⚡ Quick Start (30 Seconds)
 
-1. **Initialize in your project repository:**
+1. **Launch interactive 3-pane workspace (or check readiness):**
    ```sh
    cd /path/to/your/project
    talos doctor
-   echo ".talos/" >> .gitignore
+   # Or launch the interactive 3-pane terminal workspace directly:
+   talos
    ```
 
-2. **Configure automated project checks (optional):**
+2. **Configure AI CLI roles and mode:**
+   ```sh
+   talos config set writer codex
+   talos config set critic claude
+   talos config set mode team
+   ```
+
+3. **Configure automated project checks (optional):**
    ```sh
    # Python
    talos config set checks '[{"id":"unit","argv":["pytest"]}]'
@@ -85,14 +93,14 @@ cargo install --locked --path .
    talos config set checks '[{"id":"test","argv":["npm","test"]}]'
    ```
 
-3. **Add a task with acceptance criteria:**
+4. **Add a task with acceptance criteria:**
    ```sh
    talos task add "Add safe_eval function" --criteria "calc.py defines safe_eval(expr). Disallow eval/exec. Add unit tests."
    ```
 
-4. **Run autonomously:**
+5. **Run autonomously:**
    ```sh
-   # Team mode (parallel workers + lead integration):
+   # Team mode (parallel workers in worktrees + lead integration):
    talos up --auto --mode team
 
    # Pair mode (classic writer -> critic):
@@ -105,6 +113,9 @@ cargo install --locked --path .
 
 | Command | Description |
 | :--- | :--- |
+| `talos` | Launch or reconnect to the 3-pane interactive workspace (`tmux`) |
+| `talos config` | View current configuration (`writer`, `critic`, `mode`, checks) |
+| `talos config set <KEY> <VAL>` | Configure roles (`writer`, `critic`, `mode`, `max-writers`) |
 | `talos doctor` | Probe installed AI CLIs, Git, tmux, and dependencies |
 | `talos task add "<TITLE>" --criteria "..."` | Queue a task with verification criteria |
 | `talos task list` | Display active, queued, and completed tasks |
