@@ -24,6 +24,8 @@ const MAX_CHILD_TASK_TIMEOUT_MS: i64 = 30 * 60 * 1_000;
 const MAX_TASK_LIST_PAGE_SIZE: usize = 100;
 const MAX_HISTORY_PAGE_SIZE: usize = 100;
 const MAX_REOPENED_TASK_IDS_IN_EVENT: usize = 50;
+const MAX_WAITING_TASK_PREVIEW: usize = 25;
+const MAX_WAITING_PREREQUISITE_PREVIEW: usize = 10;
 type FinalizeReviewRow = (i64, String, String, String, Option<String>, Option<String>);
 type VerificationEvidenceRow = (VerificationRunRecord, String, String, String, String);
 
@@ -79,6 +81,20 @@ pub struct TaskListPage {
     pub limit: usize,
     pub has_more: bool,
     pub next_after: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct WaitingTaskSummary {
+    pub task_id: i64,
+    pub prerequisite_task_ids_preview: Vec<i64>,
+    pub prerequisites_truncated: bool,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct QueueWaitSummary {
+    pub waiting_task_count: usize,
+    pub waiting_tasks: Vec<WaitingTaskSummary>,
+    pub waiting_tasks_truncated: bool,
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -1765,32 +1781,75 @@ impl Database {
             .context("Cannot inspect whether queued tasks exist")
     }
 
-    pub fn queued_tasks_waiting_on_dependencies(&self) -> Result<Vec<(i64, Vec<i64>)>> {
-        let mut statement = self.connection.prepare(
-            "SELECT tasks.id, edges.depends_on_task_id
-             FROM tasks
-             JOIN task_dependencies AS edges ON edges.task_id = tasks.id
+    pub fn queued_tasks_waiting_on_dependencies(&self) -> Result<QueueWaitSummary> {
+        let waiting_predicate = "EXISTS(
+             SELECT 1 FROM task_dependencies AS edges
              JOIN tasks AS prerequisite ON prerequisite.id = edges.depends_on_task_id
-             WHERE tasks.status = 'queued' AND (
+             WHERE edges.task_id = tasks.id AND (
                  prerequisite.status <> 'complete'
                  OR EXISTS(SELECT 1 FROM task_worktree_integrations AS integrations
                            WHERE integrations.task_id = prerequisite.id
                              AND integrations.state <> 'integrated')
              )
-             ORDER BY tasks.id, edges.depends_on_task_id",
+         )";
+        let waiting_task_count: i64 = self.connection.query_row(
+            &format!("SELECT COUNT(*) FROM tasks WHERE status = 'queued' AND {waiting_predicate}"),
+            [],
+            |row| row.get(0),
         )?;
-        let rows = statement
-            .query_map([], |row| Ok((row.get::<_, i64>(0)?, row.get::<_, i64>(1)?)))?
+        let waiting_task_count = usize::try_from(waiting_task_count)
+            .context("Waiting task count is outside the supported range")?;
+        let query_limit = i64::try_from(MAX_WAITING_TASK_PREVIEW + 1)
+            .context("Waiting task preview limit is out of range")?;
+        let mut statement = self.connection.prepare(&format!(
+            "SELECT id FROM tasks WHERE status = 'queued' AND {waiting_predicate}
+             ORDER BY id LIMIT ?1"
+        ))?;
+        let mut task_ids = statement
+            .query_map([query_limit], |row| row.get::<_, i64>(0))?
             .collect::<rusqlite::Result<Vec<_>>>()?;
-        let mut waiting: Vec<(i64, Vec<i64>)> = Vec::new();
-        for (task_id, prerequisite_task_id) in rows {
-            if let Some((_, prerequisites)) = waiting.last_mut().filter(|(id, _)| *id == task_id) {
-                prerequisites.push(prerequisite_task_id);
-            } else {
-                waiting.push((task_id, vec![prerequisite_task_id]));
-            }
+        let waiting_tasks_truncated = task_ids.len() > MAX_WAITING_TASK_PREVIEW;
+        if waiting_tasks_truncated {
+            task_ids.pop();
         }
-        Ok(waiting)
+        drop(statement);
+
+        let prerequisite_query_limit = i64::try_from(MAX_WAITING_PREREQUISITE_PREVIEW + 1)
+            .context("Waiting prerequisite preview limit is out of range")?;
+        let mut waiting_tasks = Vec::with_capacity(task_ids.len());
+        for task_id in task_ids {
+            let mut statement = self.connection.prepare(
+                "SELECT edges.depends_on_task_id
+                 FROM task_dependencies AS edges
+                 JOIN tasks AS prerequisite ON prerequisite.id = edges.depends_on_task_id
+                 WHERE edges.task_id = ?1 AND (
+                     prerequisite.status <> 'complete'
+                     OR EXISTS(SELECT 1 FROM task_worktree_integrations AS integrations
+                               WHERE integrations.task_id = prerequisite.id
+                                 AND integrations.state <> 'integrated')
+                 )
+                 ORDER BY edges.depends_on_task_id LIMIT ?2",
+            )?;
+            let mut prerequisites = statement
+                .query_map(params![task_id, prerequisite_query_limit], |row| {
+                    row.get::<_, i64>(0)
+                })?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            let prerequisites_truncated = prerequisites.len() > MAX_WAITING_PREREQUISITE_PREVIEW;
+            if prerequisites_truncated {
+                prerequisites.pop();
+            }
+            waiting_tasks.push(WaitingTaskSummary {
+                task_id,
+                prerequisite_task_ids_preview: prerequisites,
+                prerequisites_truncated,
+            });
+        }
+        Ok(QueueWaitSummary {
+            waiting_task_count,
+            waiting_tasks,
+            waiting_tasks_truncated,
+        })
     }
 
     pub fn task_verification_checks(&self, task_id: i64) -> Result<Vec<ProjectCheck>> {

@@ -48,6 +48,8 @@ talos resume
 
 `talos task evidence <ID>` returns the latest 25 verification runs (maximum 100 per page). Use `--before <RUN_ID>` to continue with older runs; JSON includes `has_more` and `next_before`.
 
+When `up --auto` or `up --semi` finds no runnable task, it reports the total waiting count and a bounded preview of 25 tasks with up to 10 blocked prerequisites each. Use `talos task list` and `talos task dependencies <ID>` to inspect more.
+
 `talos attach` creates or reconnects to one persistent tmux shell for the current project. It does not start a worker. Run the existing TALOS commands in that shell, or keep using them directly in the foreground when tmux is unavailable.
 
 `talos pause` durably blocks new Writer attempts and continuations while preserving queued tasks. It does not stop an already-running Writer. Before resuming, TALOS compares the saved Git snapshot with the current project. If the snapshot changed or could not be captured, inspect `git diff` and `git status`, then run `talos resume --reconcile`; tasks already awaiting verification return to Critic review. `talos logs --project` shows the append-only pause and reconciliation history.

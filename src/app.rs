@@ -20,9 +20,9 @@ use crate::{
     config::{AdapterKind, AgentRole, GithubPolicy, ProjectConfig},
     db::{
         Database, GithubCiCheckRecord, GithubCiSnapshotInput, GithubPublicationInput,
-        GithubPublicationRecord, ProjectControlEvent, QueueSummary, ResumeProjectOutcome,
-        StopRequestOutcome, TaskEvent, TaskRecord, TaskSummaryRecord, WriterResolutionAction,
-        WriterResolutionRecord,
+        GithubPublicationRecord, ProjectControlEvent, QueueSummary, QueueWaitSummary,
+        ResumeProjectOutcome, StopRequestOutcome, TaskEvent, TaskRecord, TaskSummaryRecord,
+        WriterResolutionAction, WriterResolutionRecord,
     },
     github::{self, GithubProbe},
     policy::{self, Action as PolicyAction, Authorization, ExecutionMode},
@@ -2802,28 +2802,14 @@ async fn run_one_shot_auto(
                 } else {
                     "no_queued_tasks"
                 },
-                "waiting_tasks": waiting_tasks
-                    .iter()
-                    .map(|(task_id, prerequisites)| json!({
-                        "task_id": task_id,
-                        "prerequisite_task_ids": prerequisites,
-                    }))
-                    .collect::<Vec<_>>(),
+                "waiting_task_count": waiting_tasks.waiting_task_count,
+                "waiting_tasks_preview": waiting_tasks.waiting_tasks,
+                "waiting_tasks_truncated": waiting_tasks.waiting_tasks_truncated,
                 "writer_launched": false,
                 "automatic_retry": false,
             }))?;
-        } else if !waiting_tasks.is_empty() {
-            println!("No queued task is ready; prerequisite tasks are still open:");
-            for (task_id, prerequisites) in waiting_tasks {
-                println!(
-                    "  Task #{task_id} waits for {}.",
-                    prerequisites
-                        .iter()
-                        .map(|id| format!("#{id}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
+        } else if has_queued_tasks {
+            print_waiting_task_summary(&waiting_tasks);
         } else {
             println!("No queued tasks; no Writer was started.");
         }
@@ -2880,27 +2866,13 @@ async fn run_one_shot_semi(
                 } else {
                     "no_queued_tasks"
                 },
-                "waiting_tasks": waiting_tasks
-                    .iter()
-                    .map(|(task_id, prerequisites)| json!({
-                        "task_id": task_id,
-                        "prerequisite_task_ids": prerequisites,
-                    }))
-                    .collect::<Vec<_>>(),
+                "waiting_task_count": waiting_tasks.waiting_task_count,
+                "waiting_tasks_preview": waiting_tasks.waiting_tasks,
+                "waiting_tasks_truncated": waiting_tasks.waiting_tasks_truncated,
                 "writer_launched": false,
             }))?;
-        } else if !waiting_tasks.is_empty() {
-            println!("No queued task is ready; prerequisite tasks are still open:");
-            for (task_id, prerequisites) in waiting_tasks {
-                println!(
-                    "  Task #{task_id} waits for {}.",
-                    prerequisites
-                        .iter()
-                        .map(|id| format!("#{id}"))
-                        .collect::<Vec<_>>()
-                        .join(", ")
-                );
-            }
+        } else if has_queued_tasks {
+            print_waiting_task_summary(&waiting_tasks);
         } else {
             println!("No queued tasks; no Writer was started.");
         }
@@ -2931,6 +2903,40 @@ async fn run_one_shot_semi(
     let report = execution?;
     print_writer_report(json_output, &report, Some(&changed_files))?;
     ensure_writer_succeeded(&report)
+}
+
+fn print_waiting_task_summary(summary: &QueueWaitSummary) {
+    if summary.waiting_task_count == 0 {
+        println!("Queued tasks exist, but no task is currently eligible to run.");
+        println!("Inspect the queue with `talos task list`.");
+        return;
+    }
+
+    println!(
+        "No queued task is ready; {} task(s) wait on prerequisites:",
+        summary.waiting_task_count
+    );
+    for waiting in &summary.waiting_tasks {
+        let prerequisites = waiting
+            .prerequisite_task_ids_preview
+            .iter()
+            .map(|id| format!("#{id}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let extra = if waiting.prerequisites_truncated {
+            ", and more prerequisites"
+        } else {
+            ""
+        };
+        println!(
+            "  Task #{} waits on [{}{}].",
+            waiting.task_id, prerequisites, extra
+        );
+    }
+    if summary.waiting_tasks_truncated {
+        println!("Showing the first 25 waiting tasks.");
+    }
+    println!("Use `talos task list` and `talos task dependencies <ID>` to inspect the queue.");
 }
 
 fn request_operator_approval(action: &str) -> Result<()> {
