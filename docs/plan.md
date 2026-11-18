@@ -275,13 +275,23 @@ Deliver dynamic CLI adapter configuration and redesign the terminal interface ar
 
 **Exit criteria:** `/cli <name>` dynamically switches adapters and updates config; primary TUI view renders the Unified Feed with responsive layouts; scroll navigation functions cleanly; all tests pass.
 
+### R16 — Operator Ergonomics: Tab-Completion, Task Presets & Interactive Diff Control
+
+Deliver modern terminal ergonomics for developer workflows:
+
+- **Tab-Completion in TUI:** Auto-complete slash commands, CLI adapter names, orchestration modes, and project repository file paths on `Tab` with suggestions.
+- **Task Presets & Archetypes:** Parameterized task commands (`/task:test <file>`, `/task:refactor <file>`, `/task:fix <path> <issue>`, `/task:bench <func>`) that expand into structured requirements with automatic criteria and path scoping.
+- **Interactive Diff Control:** Selective file discard (`d`) and staging (`s`) in the `Git Diff` view.
+
+**Exit criteria:** Tab-completion operates smoothly in TUI input bar; task presets enqueue verified tasks; interactive diff staging works cleanly; all tests pass.
+
 ## 6. Dependency order
 
 ```text
 R0 → R1 → R2 → R3 → R4 → R5
                          └──→ R6
 R5 + R6 → R7 → R8 → R9
-R6 + R7 + R8 + R9 → R10 → R11 → R12 → R13 → R14 → R15
+R6 + R7 + R8 + R9 → R10 → R11 → R12 → R13 → R14 → R15 → R16
 ```
 
 Implementation details may change based on experiments. Preserve invariants and acceptance checks; update `docs/decisions.md`, `docs/tasks.md`, and `docs/state.md` when scope changes materially.

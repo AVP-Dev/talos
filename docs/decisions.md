@@ -432,3 +432,26 @@ No schema change for process identity is selected or implemented. The separate s
      - Scrolling up (`Up`, `PageUp`, `Home`) engages manual history inspection, updating the title indicator to `"Viewing earlier lines: -N | Press 'End' to resume"`.
      - Pressing `End` or scrolling down to the bottom snaps back to live stream auto-scroll.
 - **Verification:** automated CLI parsing tests (`cli_flag_parses_global_adapter_override`), TUI slash command tests (`tui_cli_slash_commands_and_feed`), tab title & navigation tests (`active_tab_navigation_and_titles`), and full verification profile `./scripts/verify-project.sh` clean.
+
+## ADR-049 — Operator Ergonomics: TUI Tab-Completion, Task Presets, and Interactive Git Diff Curation
+
+- **Status:** implemented and verified in R16.
+- **Decision:** implement operator workflow accelerators inside the interactive TUI: contextual inline Tab auto-completion, task generation presets (`/task:test`, `/task:refactor`, `/task:fix`, `/task:bench`), and interactive file-level Git Diff curation (`j`/`k` selection, `s` staging, `d` discard/revert, `r` reload).
+- **Architecture and Invariants:**
+  1. **Non-Intrusive Contextual Tab Completion:**
+     - When operator input is empty, `Tab` retains its classic role of cycling across tabs (`Feed` -> `Dialogue` -> `Diff` -> `Audit`).
+     - When operator input is non-empty, `Tab` triggers `complete_input()`:
+       - Autocompletes slash commands and presets (`/cl` suggests `/cli` or completes unambiguous prefixes to `/clear `, `/task:t` to `/task:test `).
+       - Autocompletes CLI adapter names following `/cli `, `/writer `, `/critic ` (e.g. `cod` -> `codex `, `cla` -> `claude `).
+       - Autocompletes project file paths sourced instantly via `git ls-files` without external shell overhead or locking.
+  2. **Standardized Task Presets:**
+     - `/task:test <file>` (aliases: `/тест`) creates an enqueued task with strict criteria: thorough unit tests covering target file behavior, prohibiting alteration of production code, and requiring clean assertions.
+     - `/task:refactor <file>` (aliases: `/рефакторинг`) generates a structured refactoring task preserving public API and behavioral invariants with full test suite passing.
+     - `/task:fix <path> <issue>` (aliases: `/фикс`) formulates a targeted defect resolution and regression test addition task.
+     - `/task:bench <path>` specifies a profiling and critical path optimization task with correctness assertions.
+  3. **Interactive Git Diff Curation (`ActiveTab::Diff`):**
+     - Tracks working tree changes via `git status --porcelain`.
+     - Displays an interactive top list of modified files with cursor indicator (`▶ [file]`).
+     - Allows single-key navigation (`j`/`k`), staging (`s` executes `git add -- <file>`), discarding/reverting (`d` executes `git checkout -- <file>` or untracked file removal), and reloading (`r`).
+     - Updates status messages and refreshes diff view in real time.
+- **Verification:** unit tests for `longest_common_prefix`, `complete_input`, task presets creation and acceptance criteria enforcement, and interactive diff navigation (`tab_completion_and_task_presets`, `diff_file_navigation_and_selection`). `./scripts/verify-project.sh` 5/5 checks passed clean.

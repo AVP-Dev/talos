@@ -195,6 +195,15 @@ Dependency: R6–R8.
 | T15.2 | done | Redesign TUI primary cockpit view into Unified Feed | Replaced fragmented overview with responsive `ActiveTab::Feed` (" 1: Unified Feed "): 34-col Cockpit Sidebar (AI Agents card, Active Task card, Queue & Repo card) alongside a prominent live Unified Feed stream combining real-time supervisor logs, phase announcements, agent planning, and milestone SQLite events. |
 | T15.3 | done | Interactive auto-scroll and manual history inspection | Feed supports automatic bottom-pinning stream mode (`scroll_offset == 0`) with seamless transition to manual scroll (Up, Down, PageUp, PageDown, Home, End) and live stream status indicator. 2 dedicated TUI unit tests passing. |
 
+## R16 — Operator Ergonomics: Tab-Completion, Task Presets & Interactive Diff Control
+**Status:** complete. Implemented inline contextual Tab-completion, parameterized task presets (`/task:test`, `/task:refactor`, `/task:fix`, `/task:bench`), and interactive Git Diff file curation.
+
+| ID | Status | Task | Exit criteria |
+|---|---|---|---|
+| T16.1 | done | Tab-completion for commands, adapters, and file paths | In TUI input bar, `Tab` auto-completes slash commands (`/cli`, `/commit`, `/mode`, `/feed`, etc. and Russian aliases), adapter names (`codex`, `claude`, `agy`, etc.), and relative project file paths via `git ls-files`. Common prefix matching and suggestions indicator. Unit test `tab_completion_and_task_presets`. |
+| T16.2 | done | Parameterized task presets (`/task:test`, `/task:refactor`, `/task:fix`, `/task:bench`) | Added shorthand archetype commands with automatic `--criteria` generation and path scoping. Verified in SQLite database with unit test `tab_completion_and_task_presets`. |
+| T16.3 | done | Interactive file staging & discarding in `3: Git Diff` view | Operator navigates modified files with `j`/`k`, inspects diff for selected file or working tree, stages clean files with `s`, and discards/reverts unwanted edits with `d`. Verified with unit test `diff_file_navigation_and_selection`. |
+
 ## Required end-to-end scenarios from the original request
 
 First launch/repeat `up`; Writer/Critic success and justified rejection; child task; independent parallel work; adding a task while work is running; manual takeover; CLI recovery; orchestrator crash; SSH disconnect/reconnect; Linux reboot autostart; PR without merge; duplicate-execution prevention; and rechecking original acceptance criteria before closeout. Keep separate evidence for each scenario; do not combine them into a misleading test.

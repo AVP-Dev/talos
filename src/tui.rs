@@ -81,6 +81,8 @@ pub struct TuiApp {
     verification_checks: Vec<ProjectCheck>,
     diff_lines: Vec<String>,
     supervisor_logs: Vec<String>,
+    pub diff_file_index: usize,
+    pub modified_files: Vec<String>,
     dirty_paths: GitStatusPaths,
     reconnect_notice: Option<String>,
     is_in_tmux: bool,
@@ -124,6 +126,8 @@ impl TuiApp {
             verification_checks: Vec::new(),
             diff_lines: Vec::new(),
             supervisor_logs: Vec::new(),
+            diff_file_index: 0,
+            modified_files: Vec::new(),
             dirty_paths,
             reconnect_notice: None,
             is_in_tmux,
@@ -219,6 +223,24 @@ impl TuiApp {
     }
 
     fn load_git_diff(&mut self) {
+        let mut status_cmd = std::process::Command::new("git");
+        status_cmd
+            .args(["status", "--porcelain"])
+            .current_dir(&self.project.root);
+        if let Ok(out) = status_cmd.output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            self.modified_files = text
+                .lines()
+                .filter(|l| l.len() >= 4)
+                .map(|l| l[3..].trim().to_string())
+                .collect();
+        }
+        if self.modified_files.is_empty() {
+            self.diff_file_index = 0;
+        } else if self.diff_file_index >= self.modified_files.len() {
+            self.diff_file_index = self.modified_files.len() - 1;
+        }
+
         let mut cmd = std::process::Command::new("git");
         cmd.args(["diff", "HEAD"]).current_dir(&self.project.root);
         if let Ok(out) = cmd.output() {
@@ -233,6 +255,240 @@ impl TuiApp {
                 }
             } else {
                 self.diff_lines = text.lines().map(|s| s.to_string()).collect();
+            }
+        }
+    }
+
+    pub fn selected_modified_file(&self) -> Option<&str> {
+        self.modified_files
+            .get(self.diff_file_index)
+            .map(|s| s.as_str())
+    }
+
+    pub fn stage_selected_file(&mut self) -> Result<()> {
+        if let Some(file) = self.selected_modified_file() {
+            let f = file.to_string();
+            let mut cmd = std::process::Command::new("git");
+            cmd.args(["add", "--", &f]).current_dir(&self.project.root);
+            if let Ok(out) = cmd.output()
+                && out.status.success()
+            {
+                self.status_message = Some((format!("Staged: {f}"), Instant::now()));
+                self.refresh_state()?;
+                self.load_git_diff();
+            }
+        }
+        Ok(())
+    }
+
+    pub fn discard_selected_file(&mut self) -> Result<()> {
+        if let Some(file) = self.selected_modified_file() {
+            let f = file.to_string();
+            let path = self.project.root.join(&f);
+            let mut checkout_cmd = std::process::Command::new("git");
+            checkout_cmd
+                .args(["checkout", "--", &f])
+                .current_dir(&self.project.root);
+            if let Ok(out) = checkout_cmd.output() {
+                if out.status.success() {
+                    self.status_message =
+                        Some((format!("Discarded changes in: {f}"), Instant::now()));
+                } else if path.exists() {
+                    let _ = std::fs::remove_file(&path);
+                    self.status_message =
+                        Some((format!("Removed untracked file: {f}"), Instant::now()));
+                }
+            }
+            self.refresh_state()?;
+            self.load_git_diff();
+        }
+        Ok(())
+    }
+
+    pub fn find_project_files(&self) -> Vec<String> {
+        let mut cmd = std::process::Command::new("git");
+        cmd.arg("ls-files").current_dir(&self.project.root);
+        if let Ok(out) = cmd.output() {
+            let text = String::from_utf8_lossy(&out.stdout);
+            text.lines()
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect()
+        } else {
+            Vec::new()
+        }
+    }
+
+    pub fn complete_input(&mut self) {
+        if self.input.is_empty() {
+            return;
+        }
+
+        let input_text = self.input.clone();
+        let tokens: Vec<&str> = input_text.split_whitespace().collect();
+
+        // 1. Completing a slash command
+        if input_text.starts_with('/') && !input_text.contains(' ') {
+            let slash_commands = [
+                "/cli",
+                "/commit",
+                "/mode",
+                "/writer",
+                "/critic",
+                "/model",
+                "/stop",
+                "/pause",
+                "/resume",
+                "/run",
+                "/feed",
+                "/diff",
+                "/dialogue",
+                "/audit",
+                "/status",
+                "/stash",
+                "/task:test",
+                "/task:refactor",
+                "/task:fix",
+                "/task:bench",
+                "/clear",
+                "/help",
+                "/exit",
+                "/кли",
+                "/тест",
+                "/рефакторинг",
+                "/фикс",
+                "/фид",
+                "/лента",
+                "/дифф",
+                "/диалог",
+                "/аудит",
+                "/статус",
+                "/стоп",
+                "/пауза",
+                "/выход",
+            ];
+            let matches: Vec<String> = slash_commands
+                .iter()
+                .filter(|c| c.starts_with(&input_text))
+                .map(|s| s.to_string())
+                .collect();
+
+            if matches.len() == 1 {
+                self.input = format!("{} ", matches[0]);
+            } else if matches.len() > 1 {
+                let common = longest_common_prefix(&matches);
+                if common.len() > self.input.len() {
+                    self.input = common;
+                } else {
+                    self.status_message = Some((
+                        format!("Suggestions: {}", matches.join("  ")),
+                        Instant::now(),
+                    ));
+                }
+            }
+            return;
+        }
+
+        // 2. Completing arguments for /cli, /writer, /critic, /mode
+        if tokens.len() == 1 && input_text.ends_with(' ') {
+            let cmd = tokens[0].to_ascii_lowercase();
+            if cmd == "/cli" || cmd == "/writer" || cmd == "/critic" {
+                self.status_message = Some((
+                    "Adapters: agy  codex  claude  omp  pi  kilo  opencode".to_string(),
+                    Instant::now(),
+                ));
+                return;
+            } else if cmd == "/mode" {
+                self.status_message = Some(("Modes: pair  team".to_string(), Instant::now()));
+                return;
+            }
+        }
+
+        if tokens.len() >= 2 {
+            let cmd = tokens[0].to_ascii_lowercase();
+            let last_token = tokens[tokens.len() - 1];
+
+            if (cmd == "/cli" || cmd == "/writer" || cmd == "/critic") && !input_text.ends_with(' ')
+            {
+                let adapters = ["agy", "codex", "claude", "omp", "pi", "kilo", "opencode"];
+                let matches: Vec<String> = adapters
+                    .iter()
+                    .filter(|a| a.starts_with(last_token))
+                    .map(|s| s.to_string())
+                    .collect();
+                if matches.len() == 1 {
+                    let mut prefix = tokens[..tokens.len() - 1].join(" ");
+                    prefix.push(' ');
+                    prefix.push_str(&matches[0]);
+                    prefix.push(' ');
+                    self.input = prefix;
+                } else if !matches.is_empty() {
+                    self.status_message =
+                        Some((format!("Adapters: {}", matches.join("  ")), Instant::now()));
+                }
+                return;
+            }
+
+            if cmd == "/mode" && !input_text.ends_with(' ') {
+                let modes = ["pair", "team"];
+                let matches: Vec<String> = modes
+                    .iter()
+                    .filter(|m| m.starts_with(last_token))
+                    .map(|s| s.to_string())
+                    .collect();
+                if matches.len() == 1 {
+                    self.input = format!("{} {} ", tokens[0], matches[0]);
+                }
+                return;
+            }
+        }
+
+        // 3. File path completion for project files
+        let last_word = if input_text.ends_with(' ') {
+            ""
+        } else {
+            tokens.last().copied().unwrap_or("")
+        };
+
+        if !last_word.is_empty() {
+            let files = self.find_project_files();
+            let matches: Vec<String> = files
+                .into_iter()
+                .filter(|f| f.starts_with(last_word))
+                .collect();
+
+            if matches.len() == 1 {
+                let prefix = if input_text.contains(' ') {
+                    let mut p = tokens[..tokens.len() - 1].join(" ");
+                    p.push(' ');
+                    p
+                } else {
+                    String::new()
+                };
+                self.input = format!("{}{}", prefix, matches[0]);
+            } else if matches.len() > 1 {
+                let common = longest_common_prefix(&matches);
+                if common.len() > last_word.len() {
+                    let prefix = if input_text.contains(' ') {
+                        let mut p = tokens[..tokens.len() - 1].join(" ");
+                        p.push(' ');
+                        p
+                    } else {
+                        String::new()
+                    };
+                    self.input = format!("{}{}", prefix, common);
+                } else {
+                    let preview = if matches.len() > 5 {
+                        format!(
+                            "Files: {} ... (+{} more)",
+                            matches[..5].join("  "),
+                            matches.len() - 5
+                        )
+                    } else {
+                        format!("Files: {}", matches.join("  "))
+                    };
+                    self.status_message = Some((preview, Instant::now()));
+                }
             }
         }
     }
@@ -276,9 +532,103 @@ impl TuiApp {
         match cmd.as_str() {
             "/help" | "/помощь" | "/справка" => {
                 self.status_message = Some((
-                    "Commands: /cli <name>, /stop, /pause, /resume, /run, /commit <msg>, /feed, /diff, /dialogue, /audit, /writer, /critic, /model, /mode, /exit".to_string(),
+                    "Commands: /cli <name>, /task:test <file>, /task:refactor <file>, /task:fix <path> <issue>, /task:bench <path>, /stop, /pause, /resume, /run, /commit <msg>, /feed, /diff, /dialogue, /audit, /writer, /critic, /model, /mode, /exit".to_string(),
                     Instant::now(),
                 ));
+            }
+            "/task:test" | "/тест" => {
+                if arg.is_empty() {
+                    self.status_message = Some((
+                        "Usage: /task:test <file_path> (e.g. /task:test calc.py)".to_string(),
+                        Instant::now(),
+                    ));
+                } else {
+                    let title = format!("Add comprehensive unit tests for {arg}");
+                    let criteria = format!(
+                        "Verify {arg} behavior with thorough unit tests. Production code in {arg} must not be altered. All assertions must pass."
+                    );
+                    let mut database = Database::open(&self.project)?;
+                    let task = database.add_task(&title, &criteria)?;
+                    self.status_message = Some((
+                        format!("Preset Task #{} enqueued: {}", task.id, task.title),
+                        Instant::now(),
+                    ));
+                    if !self.supervisor_running {
+                        self.spawn_background_worker();
+                    }
+                    self.refresh_state()?;
+                }
+            }
+            "/task:refactor" | "/рефакторинг" => {
+                if arg.is_empty() {
+                    self.status_message = Some((
+                        "Usage: /task:refactor <file_path> (e.g. /task:refactor src/tui.rs)"
+                            .to_string(),
+                        Instant::now(),
+                    ));
+                } else {
+                    let title = format!("Refactor {arg} for clarity and maintainability");
+                    let criteria = format!(
+                        "Refactor {arg} to improve code clarity and structure without breaking behavior or altering public API. All existing tests must pass."
+                    );
+                    let mut database = Database::open(&self.project)?;
+                    let task = database.add_task(&title, &criteria)?;
+                    self.status_message = Some((
+                        format!("Preset Task #{} enqueued: {}", task.id, task.title),
+                        Instant::now(),
+                    ));
+                    if !self.supervisor_running {
+                        self.spawn_background_worker();
+                    }
+                    self.refresh_state()?;
+                }
+            }
+            "/task:fix" | "/фикс" => {
+                if arg.is_empty() {
+                    self.status_message = Some((
+                        "Usage: /task:fix <path> <issue> (e.g. /task:fix calc.py handle negative square root)"
+                            .to_string(),
+                        Instant::now(),
+                    ));
+                } else {
+                    let title = format!("Fix defect: {arg}");
+                    let criteria = format!(
+                        "Diagnose and resolve defect: {arg}. Ensure full test suite passes and add regression test coverage."
+                    );
+                    let mut database = Database::open(&self.project)?;
+                    let task = database.add_task(&title, &criteria)?;
+                    self.status_message = Some((
+                        format!("Preset Task #{} enqueued: {}", task.id, task.title),
+                        Instant::now(),
+                    ));
+                    if !self.supervisor_running {
+                        self.spawn_background_worker();
+                    }
+                    self.refresh_state()?;
+                }
+            }
+            "/task:bench" => {
+                if arg.is_empty() {
+                    self.status_message = Some((
+                        "Usage: /task:bench <path> (e.g. /task:bench calc.py)".to_string(),
+                        Instant::now(),
+                    ));
+                } else {
+                    let title = format!("Benchmark and optimize performance for {arg}");
+                    let criteria = format!(
+                        "Measure execution performance and optimize critical paths in {arg}. Verify functional correctness with unit tests."
+                    );
+                    let mut database = Database::open(&self.project)?;
+                    let task = database.add_task(&title, &criteria)?;
+                    self.status_message = Some((
+                        format!("Preset Task #{} enqueued: {}", task.id, task.title),
+                        Instant::now(),
+                    ));
+                    if !self.supervisor_running {
+                        self.spawn_background_worker();
+                    }
+                    self.refresh_state()?;
+                }
             }
             "/feed" | "/фид" | "/лента" | "/overview" | "/обзор" => {
                 self.active_tab = ActiveTab::Feed;
@@ -622,10 +972,12 @@ impl TuiApp {
                 Ok(child) => {
                     self.supervisor_running = true;
                     self.supervisor_owner = Some(format!("pid-{}", child.id()));
-                    self.status_message = Some((
-                        format!("Background worker spawned (PID: {}).", child.id()),
-                        Instant::now(),
-                    ));
+                    if self.status_message.is_none() {
+                        self.status_message = Some((
+                            format!("Background worker spawned (PID: {}).", child.id()),
+                            Instant::now(),
+                        ));
+                    }
                 }
                 Err(err) => {
                     self.status_message = Some((
@@ -710,10 +1062,33 @@ async fn run_app_loop(
                     return Ok(());
                 }
                 KeyCode::Tab => {
-                    app.active_tab = app.active_tab.next();
-                    if app.active_tab == ActiveTab::Diff {
-                        app.load_git_diff();
+                    if app.input.is_empty() {
+                        app.active_tab = app.active_tab.next();
+                        if app.active_tab == ActiveTab::Diff {
+                            app.load_git_diff();
+                        }
+                    } else {
+                        app.complete_input();
                     }
+                }
+                KeyCode::Char('s') if app.active_tab == ActiveTab::Diff && app.input.is_empty() => {
+                    let _ = app.stage_selected_file();
+                }
+                KeyCode::Char('d') if app.active_tab == ActiveTab::Diff && app.input.is_empty() => {
+                    let _ = app.discard_selected_file();
+                }
+                KeyCode::Char('r') if app.active_tab == ActiveTab::Diff && app.input.is_empty() => {
+                    app.load_git_diff();
+                    app.status_message = Some(("Git diff reloaded.".to_string(), Instant::now()));
+                }
+                KeyCode::Char('j') if app.active_tab == ActiveTab::Diff && app.input.is_empty() => {
+                    if !app.modified_files.is_empty() {
+                        app.diff_file_index = (app.diff_file_index + 1)
+                            .min(app.modified_files.len().saturating_sub(1));
+                    }
+                }
+                KeyCode::Char('k') if app.active_tab == ActiveTab::Diff && app.input.is_empty() => {
+                    app.diff_file_index = app.diff_file_index.saturating_sub(1);
                 }
                 KeyCode::Char('1') if app.input.is_empty() => {
                     app.active_tab = ActiveTab::Feed;
@@ -1527,6 +1902,51 @@ fn render_dialogue_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
 }
 
 fn render_diff_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    if !app.modified_files.is_empty() {
+        let files_height = (app.modified_files.len() as u16 + 2).min(7);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Length(files_height), Constraint::Min(4)])
+            .split(area);
+
+        let mut file_items = Vec::new();
+        for (i, file) in app.modified_files.iter().enumerate() {
+            let is_selected = i == app.diff_file_index;
+            let (cursor, style) = if is_selected {
+                (
+                    "▶ ",
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                )
+            } else {
+                ("  ", Style::default().fg(Color::White))
+            };
+            file_items.push(ListItem::new(Line::from(vec![
+                Span::styled(
+                    cursor,
+                    Style::default()
+                        .fg(Color::Cyan)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(file.clone(), style),
+            ])));
+        }
+
+        let files_block = Block::default()
+            .borders(Borders::ALL)
+            .title(" 📂 Modified Files (Keys: 'j'/'k' Navigate | 's' Stage | 'd' Discard | 'r' Reload) ")
+            .border_style(Style::default().fg(Color::Yellow));
+
+        frame.render_widget(List::new(file_items).block(files_block), chunks[0]);
+
+        render_diff_view(frame, app, chunks[1]);
+    } else {
+        render_diff_view(frame, app, area);
+    }
+}
+
+fn render_diff_view(frame: &mut Frame, app: &TuiApp, area: Rect) {
     let mut items = Vec::new();
 
     if app.diff_lines.is_empty() {
@@ -1554,12 +1974,21 @@ fn render_diff_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
         }
     }
 
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .title(format!(
+    let title = if let Some(selected) = app.selected_modified_file() {
+        format!(
+            " 📄 Live Git Diff: Selected [{selected}] ({} diff lines) ",
+            app.diff_lines.len()
+        )
+    } else {
+        format!(
             " 📄 Live Code Diff ({} lines changed) ",
             app.diff_lines.len()
-        ))
+        )
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .title(title)
         .border_style(Style::default().fg(Color::Green));
 
     frame.render_widget(List::new(items).block(block), area);
@@ -1639,6 +2068,22 @@ fn render_input(frame: &mut Frame, app: &TuiApp, area: Rect) {
         .border_style(Style::default().fg(Color::Cyan));
 
     frame.render_widget(Paragraph::new(input_line).block(input_block), area);
+}
+
+fn longest_common_prefix(strings: &[String]) -> String {
+    if strings.is_empty() {
+        return String::new();
+    }
+    let first = &strings[0];
+    let mut len = 0;
+    for (i, c) in first.char_indices() {
+        if strings.iter().all(|s| s[i..].starts_with(c)) {
+            len += c.len_utf8();
+        } else {
+            break;
+        }
+    }
+    first[..len].to_string()
 }
 
 #[cfg(test)]
@@ -1727,6 +2172,128 @@ mod tests {
         ];
         let feed = build_unified_feed_lines(&app);
         assert!(feed.len() >= 4);
+
+        let _ = std::fs::remove_dir_all(&project.root);
+    }
+
+    #[test]
+    fn tab_completion_and_task_presets() {
+        let project = test_tui_project();
+
+        let talos_dir = project.root.join(".talos");
+        std::fs::create_dir_all(&talos_dir).expect("create .talos");
+        let db = Database::open(&project).expect("open db");
+        drop(db);
+
+        let mut app = TuiApp::new(project.clone()).expect("create TuiApp");
+
+        // 1. Longest common prefix helper
+        assert_eq!(
+            longest_common_prefix(&["/task:test".to_string(), "/task:refactor".to_string(),]),
+            "/task:"
+        );
+        assert_eq!(
+            longest_common_prefix(&["/cli".to_string(), "/commit".to_string()]),
+            "/c"
+        );
+        assert_eq!(longest_common_prefix(&[]), "");
+
+        // 2. Tab completion for slash command
+        app.input = "/cle".to_string();
+        app.complete_input();
+        assert_eq!(app.input, "/clear ");
+
+        app.input = "/cli".to_string();
+        app.complete_input();
+        assert_eq!(app.input, "/cli ");
+
+        app.input = "/task:t".to_string();
+        app.complete_input();
+        assert_eq!(app.input, "/task:test ");
+
+        app.input = "/тес".to_string();
+        app.complete_input();
+        assert_eq!(app.input, "/тест ");
+
+        // 3. Tab completion for CLI adapter arguments
+        app.input = "/cli cod".to_string();
+        app.complete_input();
+        assert_eq!(app.input, "/cli codex ");
+
+        app.input = "/cli cla".to_string();
+        app.complete_input();
+        assert_eq!(app.input, "/cli claude ");
+
+        // 4. Task preset execution without argument prompts usage
+        app.execute_slash_command("/task:test")
+            .expect("execute empty /task:test");
+        assert!(app.status_message.is_some());
+        let (msg, _) = app.status_message.as_ref().unwrap();
+        assert!(msg.contains("Usage: /task:test"));
+
+        // 5. Task presets create enqueued tasks with clear criteria
+        app.execute_slash_command("/task:test src/calc.rs")
+            .expect("execute /task:test");
+        let (msg, _) = app.status_message.as_ref().unwrap();
+        assert!(msg.contains("Preset Task #"));
+        assert!(msg.contains("calc.rs"));
+
+        app.execute_slash_command("/task:refactor src/storage.rs")
+            .expect("execute /task:refactor");
+        let (msg, _) = app.status_message.as_ref().unwrap();
+        assert!(msg.contains("storage.rs"));
+
+        app.execute_slash_command("/task:fix src/parser.rs")
+            .expect("execute /task:fix");
+        let (msg, _) = app.status_message.as_ref().unwrap();
+        assert!(msg.contains("parser.rs"));
+
+        app.execute_slash_command("/task:bench src/engine.rs")
+            .expect("execute /task:bench");
+        let (msg, _) = app.status_message.as_ref().unwrap();
+        assert!(msg.contains("engine.rs"));
+
+        // Verify tasks in database
+        let database = Database::open(&project).expect("open db");
+        let tasks = database.list_tasks().expect("list tasks");
+        assert_eq!(tasks.len(), 4);
+        assert!(tasks[0].title.contains("calc.rs"));
+        assert!(tasks[0].acceptance_criteria.contains("calc.rs"));
+        assert!(tasks[1].title.contains("storage.rs"));
+        assert!(tasks[2].title.contains("parser.rs"));
+        assert!(tasks[3].title.contains("engine.rs"));
+
+        let _ = std::fs::remove_dir_all(&project.root);
+    }
+
+    #[test]
+    fn diff_file_navigation_and_selection() {
+        let project = test_tui_project();
+
+        let talos_dir = project.root.join(".talos");
+        std::fs::create_dir_all(&talos_dir).expect("create .talos");
+        let db = Database::open(&project).expect("open db");
+        drop(db);
+
+        let mut app = TuiApp::new(project.clone()).expect("create TuiApp");
+        app.modified_files = vec![
+            "src/main.rs".to_string(),
+            "src/tui.rs".to_string(),
+            "docs/tasks.md".to_string(),
+        ];
+        app.diff_file_index = 0;
+
+        assert_eq!(app.selected_modified_file(), Some("src/main.rs"));
+
+        // Navigation
+        app.diff_file_index = 1;
+        assert_eq!(app.selected_modified_file(), Some("src/tui.rs"));
+
+        app.diff_file_index = 2;
+        assert_eq!(app.selected_modified_file(), Some("docs/tasks.md"));
+
+        app.diff_file_index = 10;
+        assert_eq!(app.selected_modified_file(), None);
 
         let _ = std::fs::remove_dir_all(&project.root);
     }

@@ -542,9 +542,42 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
   - `cargo test --locked --all-targets` passed (**152 passed**, 0 failed, 2 ignored).
   - `./scripts/verify-project.sh` passed: all 5 profile checks clean (format, clippy, tests, release build, security scan).
 
+## R16 progress and verification — Operator Ergonomics: Tab-Completion, Task Presets & Interactive Diff Control
+
+- **Implemented:**
+  - `src/tui.rs`:
+    - Contextual inline Tab-completion (`complete_input()`):
+      - Completes slash commands and presets (`/cli`, `/task:test`, `/task:refactor`, `/task:fix`, `/task:bench`, `/mode`, `/feed`, `/diff`, `/dialogue`, `/audit`, `/clear`, `/help`, etc.) and Russian aliases (`/кли`, `/тест`, `/рефакторинг`, `/фикс`, `/лента`, etc.).
+      - Suggests common prefixes via `longest_common_prefix()` or displays candidate lists when ambiguous.
+      - Completes CLI adapter names following `/cli `, `/writer `, `/critic ` (`codex`, `claude`, `agy`, `omp`, `pi`, `kilo`, `opencode`).
+      - Completes relative project repository file paths on demand using `git ls-files` without external shell overhead.
+    - Parameterized task presets:
+      - `/task:test <file>` (aliases: `/тест`): Automatically generates tasks with rigorous criteria enforcing behavior verification without modifying production code.
+      - `/task:refactor <file>` (aliases: `/рефакторинг`): Automates refactoring task generation preserving public APIs and behavioral invariants.
+      - `/task:fix <path> <issue>` (aliases: `/фикс`): Generates defect resolution tasks with regression test coverage requirements.
+      - `/task:bench <path>`: Generates profiling and performance optimization tasks.
+    - Interactive Git Diff Curation (`ActiveTab::Diff`):
+      - Collects changed files via `git status --porcelain`.
+      - Renders an interactive top selector bar showing all modified files with cursor indicator (`▶ [file]`).
+      - Single-key navigation and curation shortcuts:
+        - `j` / `k`: Select next / previous modified file.
+        - `s`: Stage selected file (`git add -- <file>`).
+        - `d`: Discard changes in selected file (`git checkout -- <file>` or remove untracked file).
+        - `r`: Reload working tree diff.
+      - Non-intrusive status messaging: preserves enqueued task numbers and titles when background worker spawns.
+    - Added 2 dedicated unit tests: `tab_completion_and_task_presets` and `diff_file_navigation_and_selection`.
+  - `README.md`: Updated test badge to `154 passed`.
+  - `docs/decisions.md`: Recorded `ADR-049`.
+  - `docs/tasks.md` & `docs/plan.md`: Added and closed R16 tasks.
+- **Verification results:**
+  - `cargo fmt --all -- --check` passed.
+  - `cargo clippy --locked --all-targets --all-features -- -D warnings` passed (0 warnings).
+  - `cargo test --locked --all-targets` passed (**154 passed**, 0 failed, 2 ignored).
+  - `./scripts/verify-project.sh` passed: all 5 profile checks clean (format, clippy, tests, release build, security scan).
+
 ## Next action
 
-All planned rounds (R0 through R15) are fully implemented and verified. Release v0.1.0 is published on GitHub. Maintain local clean tree on `master`; do not push to remote or publish PR without explicit user instruction.
+All planned rounds (R0 through R16) are fully implemented and verified. Release v0.1.0 is published on GitHub. Maintain local clean tree on `master`; do not push to remote or publish PR without explicit user instruction.
 
 ## Session close checklist
 
