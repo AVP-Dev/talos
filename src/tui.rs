@@ -1,5 +1,6 @@
 use std::{
-    io,
+    fs::{File, OpenOptions},
+    io::{self, BufRead, BufReader},
     time::{Duration, Instant},
 };
 
@@ -19,10 +20,12 @@ use ratatui::{
 };
 
 use crate::{
+    adapter::AdapterId as AdapterKind,
     app::{GitStatusPaths, current_project_revision_id, ensure_talos_ignored, git_status_paths},
     config::{OrchestrationMode, ProjectConfig},
     db::{Database, QueueSummary, TaskEvent, TaskRecord, TaskStatus, TaskWorktreeRecord},
     project::Project,
+    tmux::{TmuxClient, project_session_name},
 };
 
 pub struct TuiApp {
@@ -42,8 +45,10 @@ pub struct TuiApp {
     active_tasks: Vec<TaskRecord>,
     worktrees: Vec<TaskWorktreeRecord>,
     recent_events: Vec<TaskEvent>,
+    supervisor_logs: Vec<String>,
     dirty_paths: GitStatusPaths,
     reconnect_notice: Option<String>,
+    is_in_tmux: bool,
 }
 
 impl TuiApp {
@@ -62,6 +67,8 @@ impl TuiApp {
             preview_values_truncated: false,
         };
 
+        let is_in_tmux = std::env::var_os("TMUX").is_some();
+
         let mut app = Self {
             project,
             config,
@@ -77,8 +84,10 @@ impl TuiApp {
             active_tasks: Vec::new(),
             worktrees: Vec::new(),
             recent_events: Vec::new(),
+            supervisor_logs: Vec::new(),
             dirty_paths,
             reconnect_notice: None,
+            is_in_tmux,
         };
 
         app.refresh_state()?;
@@ -94,6 +103,10 @@ impl TuiApp {
     }
 
     pub fn refresh_state(&mut self) -> Result<()> {
+        if let Ok(cfg) = ProjectConfig::load(&self.project) {
+            self.config = cfg;
+        }
+
         let database = Database::open(&self.project)?;
         self.queue = database.queue_summary().unwrap_or(QueueSummary {
             total: 0,
@@ -135,26 +148,225 @@ impl TuiApp {
             preview_values_truncated: false,
         });
 
+        self.read_supervisor_logs();
         Ok(())
     }
 
-    pub fn submit_task(&mut self) -> Result<()> {
-        let task_text = self.input.trim().to_string();
-        if task_text.is_empty() {
+    fn read_supervisor_logs(&mut self) {
+        let log_path = self.project.root.join(".talos").join("supervisor.log");
+        if let Ok(file) = File::open(&log_path) {
+            let reader = BufReader::new(file);
+            let lines: Vec<String> = reader
+                .lines()
+                .map_while(Result::ok)
+                .filter(|l| !l.trim().is_empty())
+                .collect();
+            let start = lines.len().saturating_sub(25);
+            self.supervisor_logs = lines[start..].to_vec();
+        }
+    }
+
+    pub fn handle_submit(&mut self) -> Result<()> {
+        let input_text = self.input.trim().to_string();
+        if input_text.is_empty() {
             return Ok(());
         }
 
+        if input_text.starts_with('/') {
+            self.execute_slash_command(&input_text)?;
+        } else {
+            self.submit_task(&input_text)?;
+        }
+        self.input.clear();
+        Ok(())
+    }
+
+    pub fn submit_task(&mut self, task_text: &str) -> Result<()> {
         let mut database = Database::open(&self.project)?;
-        let task = database.add_task(&task_text, &task_text)?;
+        let task = database.add_task(task_text, task_text)?;
         self.status_message = Some((
             format!("Task #{} enqueued: {}", task.id, task.title),
             Instant::now(),
         ));
-        self.input.clear();
 
-        // If supervisor is not currently running, spawn it in background
         if !self.supervisor_running {
             self.spawn_background_worker();
+        }
+
+        self.refresh_state()?;
+        Ok(())
+    }
+
+    pub fn execute_slash_command(&mut self, command: &str) -> Result<()> {
+        let parts: Vec<&str> = command.splitn(2, ' ').collect();
+        let cmd = parts[0].to_ascii_lowercase();
+        let arg = parts.get(1).copied().unwrap_or("").trim();
+
+        match cmd.as_str() {
+            "/help" => {
+                self.status_message = Some((
+                    "Commands: /writer <adapter> | /critic <adapter> | /model <name> | /mode <pair|team> | /commit <msg> | /run | /tmux".to_string(),
+                    Instant::now(),
+                ));
+            }
+            "/writer" => {
+                if arg.is_empty() {
+                    self.status_message = Some((
+                        format!(
+                            "Current Writer: {}. Use /writer <codex|claude|agy|omp|pi|kilo|opencode>",
+                            self.config.writer.as_str()
+                        ),
+                        Instant::now(),
+                    ));
+                } else if let Some(adapter) = AdapterKind::parse(arg) {
+                    self.config.writer = adapter;
+                    self.config.save(&self.project)?;
+                    self.status_message = Some((
+                        format!("Writer updated to: {}", adapter.as_str()),
+                        Instant::now(),
+                    ));
+                } else {
+                    self.status_message = Some((
+                        format!(
+                            "Unknown adapter '{arg}'. Valid: agy, codex, claude, omp, pi, kilo, opencode"
+                        ),
+                        Instant::now(),
+                    ));
+                }
+            }
+            "/critic" => {
+                if arg.is_empty() {
+                    self.status_message = Some((
+                        format!(
+                            "Current Critic: {}. Use /critic <codex|claude|agy|omp|pi|kilo|opencode>",
+                            self.config.critic.as_str()
+                        ),
+                        Instant::now(),
+                    ));
+                } else if let Some(adapter) = AdapterKind::parse(arg) {
+                    self.config.critic = adapter;
+                    self.config.save(&self.project)?;
+                    self.status_message = Some((
+                        format!("Critic updated to: {}", adapter.as_str()),
+                        Instant::now(),
+                    ));
+                } else {
+                    self.status_message = Some((
+                        format!(
+                            "Unknown adapter '{arg}'. Valid: agy, codex, claude, omp, pi, kilo, opencode"
+                        ),
+                        Instant::now(),
+                    ));
+                }
+            }
+            "/model" => {
+                if arg.is_empty() {
+                    self.config.writer_model = None;
+                    self.config.critic_model = None;
+                    self.config.save(&self.project)?;
+                    self.status_message = Some((
+                        "Model override cleared (using adapter defaults).".to_string(),
+                        Instant::now(),
+                    ));
+                } else {
+                    self.config.writer_model = Some(arg.to_string());
+                    self.config.critic_model = Some(arg.to_string());
+                    self.config.save(&self.project)?;
+                    self.status_message =
+                        Some((format!("Model override set to: {arg}"), Instant::now()));
+                }
+            }
+            "/mode" => match arg.to_ascii_lowercase().as_str() {
+                "team" => {
+                    self.config.orchestration.mode = OrchestrationMode::Team;
+                    self.config.save(&self.project)?;
+                    self.status_message = Some(("Mode set to TEAM.".to_string(), Instant::now()));
+                }
+                "pair" => {
+                    self.config.orchestration.mode = OrchestrationMode::Pair;
+                    self.config.save(&self.project)?;
+                    self.status_message = Some(("Mode set to PAIR.".to_string(), Instant::now()));
+                }
+                _ => {
+                    self.status_message =
+                        Some(("Use /mode pair or /mode team.".to_string(), Instant::now()));
+                }
+            },
+            "/commit" => {
+                let msg = if arg.is_empty() {
+                    "checkpoint before talos run"
+                } else {
+                    arg
+                };
+                let mut add_cmd = std::process::Command::new("git");
+                add_cmd.args(["add", "-A"]).current_dir(&self.project.root);
+                let _ = add_cmd.output();
+
+                let mut commit_cmd = std::process::Command::new("git");
+                commit_cmd
+                    .args(["commit", "-m", msg])
+                    .current_dir(&self.project.root);
+                match commit_cmd.output() {
+                    Ok(out) if out.status.success() => {
+                        self.status_message = Some((
+                            format!("Git commit created: {msg}. Worktree is now clean!"),
+                            Instant::now(),
+                        ));
+                        self.refresh_state()?;
+                        if !self.supervisor_running {
+                            self.spawn_background_worker();
+                        }
+                    }
+                    Ok(out) => {
+                        let err = String::from_utf8_lossy(&out.stderr);
+                        self.status_message =
+                            Some((format!("Git commit failed: {err}"), Instant::now()));
+                    }
+                    Err(e) => {
+                        self.status_message = Some((format!("Git error: {e}"), Instant::now()));
+                    }
+                }
+            }
+            "/run" => {
+                self.spawn_background_worker();
+                self.status_message = Some((
+                    "Started background supervisor daemon.".to_string(),
+                    Instant::now(),
+                ));
+            }
+            "/pause" | "/resume" => {
+                self.toggle_pause()?;
+            }
+            "/tmux" => {
+                let tmux = TmuxClient::default();
+                let probe = tmux.probe();
+                let session = project_session_name(&self.project.root);
+                if self.is_in_tmux {
+                    self.status_message = Some((
+                        format!(
+                            "Running inside tmux session '{session}' (tmux v{}).",
+                            probe.version.unwrap_or_default()
+                        ),
+                        Instant::now(),
+                    ));
+                } else if probe.available {
+                    self.status_message = Some((
+                        "Outside tmux. To launch inside persistent session: run 'talos --tmux' or 'talos attach'".to_string(),
+                        Instant::now(),
+                    ));
+                } else {
+                    self.status_message = Some((
+                        "tmux is not installed on this machine.".to_string(),
+                        Instant::now(),
+                    ));
+                }
+            }
+            _ => {
+                self.status_message = Some((
+                    format!("Unknown command '{cmd}'. Type /help for command list."),
+                    Instant::now(),
+                ));
+            }
         }
 
         self.refresh_state()?;
@@ -167,8 +379,16 @@ impl TuiApp {
             cmd.arg("up").arg("--auto");
             cmd.current_dir(&self.project.root);
             cmd.stdin(std::process::Stdio::null());
-            cmd.stdout(std::process::Stdio::null());
-            cmd.stderr(std::process::Stdio::null());
+
+            // Pipe output to .talos/supervisor.log for real-time visibility
+            let _ = std::fs::create_dir_all(self.project.root.join(".talos"));
+            let log_path = self.project.root.join(".talos").join("supervisor.log");
+            if let Ok(file) = OpenOptions::new().create(true).append(true).open(&log_path)
+                && let Ok(err_file) = file.try_clone()
+            {
+                cmd.stdout(file);
+                cmd.stderr(err_file);
+            }
 
             #[cfg(unix)]
             {
@@ -180,6 +400,10 @@ impl TuiApp {
                 Ok(child) => {
                     self.supervisor_running = true;
                     self.supervisor_owner = Some(format!("pid-{}", child.id()));
+                    self.status_message = Some((
+                        format!("Background worker spawned (PID: {}).", child.id()),
+                        Instant::now(),
+                    ));
                 }
                 Err(err) => {
                     self.status_message = Some((
@@ -263,7 +487,7 @@ async fn run_app_loop(
                     return Ok(());
                 }
                 KeyCode::Enter => {
-                    let _ = app.submit_task();
+                    let _ = app.handle_submit();
                 }
                 KeyCode::Backspace => {
                     app.input.pop();
@@ -361,6 +585,17 @@ fn render_header(frame: &mut Frame, app: &TuiApp, area: Rect) {
         )
     };
 
+    let tmux_span = if app.is_in_tmux {
+        Span::styled(
+            " [tmux: attached] ",
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(" [tmux: direct] ", Style::default().fg(Color::DarkGray))
+    };
+
     let project_name = app
         .project
         .root
@@ -370,7 +605,7 @@ fn render_header(frame: &mut Frame, app: &TuiApp, area: Rect) {
 
     let header_text = vec![Line::from(vec![
         Span::styled(
-            "TALOS Orchestrator",
+            "TALOS",
             Style::default()
                 .fg(Color::Cyan)
                 .add_modifier(Modifier::BOLD),
@@ -398,6 +633,7 @@ fn render_header(frame: &mut Frame, app: &TuiApp, area: Rect) {
             Style::default().fg(Color::White),
         ),
         status_span,
+        tmux_span,
     ])];
 
     let header_block = Block::default()
@@ -426,7 +662,7 @@ fn render_alerts(frame: &mut Frame, app: &TuiApp, area: Rect) {
     if !app.dirty_paths.is_empty() {
         alert_spans.push(Span::styled(
             format!(
-                " ⚠️ Warning: {} uncommitted file(s) in repository. Commit or clean before running new worktrees! ",
+                " ⚠️ Warning: {} uncommitted file(s) in repository. Type '/commit <msg>' or clean git before worktree execution! ",
                 app.dirty_paths.total_count
             ),
             Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD),
@@ -452,6 +688,7 @@ fn render_agents(frame: &mut Frame, app: &TuiApp, area: Rect) {
     // Left card: Writer Team
     let writer_profile = app.config.writer.as_str();
     let mut writer_lines = Vec::new();
+    let writer_model_str = app.config.writer_model.as_deref().unwrap_or("default");
     writer_lines.push(Line::from(vec![
         Span::styled("Adapter Profile: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
@@ -460,6 +697,8 @@ fn render_agents(frame: &mut Frame, app: &TuiApp, area: Rect) {
                 .fg(Color::Yellow)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::raw(" | Model: "),
+        Span::styled(writer_model_str, Style::default().fg(Color::White)),
     ]));
 
     if let Some(task) = active_task {
@@ -508,6 +747,7 @@ fn render_agents(frame: &mut Frame, app: &TuiApp, area: Rect) {
     // Right card: Critic Team
     let critic_profile = app.config.critic.as_str();
     let mut critic_lines = Vec::new();
+    let critic_model_str = app.config.critic_model.as_deref().unwrap_or("default");
     critic_lines.push(Line::from(vec![
         Span::styled("Adapter Profile: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
@@ -516,6 +756,8 @@ fn render_agents(frame: &mut Frame, app: &TuiApp, area: Rect) {
                 .fg(Color::Magenta)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::raw(" | Model: "),
+        Span::styled(critic_model_str, Style::default().fg(Color::White)),
     ]));
 
     if let Some(task) = active_task {
@@ -565,50 +807,70 @@ fn render_agents(frame: &mut Frame, app: &TuiApp, area: Rect) {
 fn render_activity(frame: &mut Frame, app: &TuiApp, area: Rect) {
     let mut items = Vec::new();
 
-    if app.recent_events.is_empty() {
+    // 1. Render recent SQLite task events
+    for event in &app.recent_events {
+        let actor_color = match event.actor.as_str() {
+            "writer" | "writer_lead" => Color::Yellow,
+            "critic" => Color::Magenta,
+            "supervisor" => Color::Green,
+            "git" | "worktree" => Color::Cyan,
+            _ => Color::White,
+        };
+
+        let reason_preview = if event.reason.len() > 80 {
+            format!("{}...", &event.reason[..77])
+        } else {
+            event.reason.clone()
+        };
+
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(
+                format!("[Task #{}] ", event.task_id),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled(
+                format!("[{}] ", event.actor),
+                Style::default()
+                    .fg(actor_color)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{}: ", event.event_type),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(reason_preview, Style::default().fg(Color::DarkGray)),
+        ])));
+    }
+
+    // 2. Render live supervisor log lines (errors, progress, warnings)
+    for log_line in &app.supervisor_logs {
+        let (color, prefix) = if log_line.to_ascii_lowercase().contains("error") {
+            (Color::Red, "[SUPERVISOR ERROR] ")
+        } else if log_line.starts_with(">>>") {
+            (Color::Cyan, "[SUPERVISOR] ")
+        } else {
+            (Color::DarkGray, "[SUPERVISOR LOG] ")
+        };
+
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(
+                prefix,
+                Style::default().fg(color).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(log_line, Style::default().fg(color)),
+        ])));
+    }
+
+    if items.is_empty() {
         items.push(ListItem::new(Line::from(Span::styled(
-            "No events recorded yet. Type a task below to begin.",
+            "No events recorded yet. Describe a task below or type /help for commands.",
             Style::default().fg(Color::DarkGray),
         ))));
-    } else {
-        for event in &app.recent_events {
-            let actor_color = match event.actor.as_str() {
-                "writer" | "writer_lead" => Color::Yellow,
-                "critic" => Color::Magenta,
-                "supervisor" => Color::Green,
-                "git" | "worktree" => Color::Cyan,
-                _ => Color::White,
-            };
-
-            let reason_preview = if event.reason.len() > 80 {
-                format!("{}...", &event.reason[..77])
-            } else {
-                event.reason.clone()
-            };
-
-            items.push(ListItem::new(Line::from(vec![
-                Span::styled(
-                    format!("[Task #{}] ", event.task_id),
-                    Style::default().fg(Color::DarkGray),
-                ),
-                Span::styled(
-                    format!("[{}] ", event.actor),
-                    Style::default()
-                        .fg(actor_color)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(
-                    format!("{}: ", event.event_type),
-                    Style::default().fg(Color::White),
-                ),
-                Span::styled(reason_preview, Style::default().fg(Color::DarkGray)),
-            ])));
-        }
     }
 
     let log_block = Block::default()
         .borders(Borders::ALL)
-        .title(" 📜 Activity & Supervision Log (Auto-updates) ")
+        .title(" 📜 Live Activity & Supervisor Stream (Auto-updates) ")
         .border_style(Style::default().fg(Color::White));
 
     let list = List::new(items).block(log_block);
@@ -619,8 +881,7 @@ fn render_input(frame: &mut Frame, app: &TuiApp, area: Rect) {
     let title = if let Some((ref msg, _)) = app.status_message {
         format!(" Notice: {msg} ")
     } else {
-        " Describe next task (Enter: Enqueue & Run | Ctrl+P: Pause/Resume | Ctrl+C/q: Exit) "
-            .to_string()
+        " Describe task or type /help (/writer, /critic, /model, /commit, /run, /tmux) ".to_string()
     };
 
     let input_line = Line::from(vec![

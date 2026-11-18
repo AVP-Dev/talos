@@ -144,6 +144,8 @@ pub async fn run(cli: Cli) -> Result<()> {
         None => {
             if cli.json {
                 Command::Status
+            } else if cli.tmux {
+                Command::Attach
             } else {
                 Command::Tui
             }

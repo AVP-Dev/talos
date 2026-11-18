@@ -12,6 +12,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub json: bool,
 
+    /// Launch or connect to the persistent tmux session for this project.
+    #[arg(long, global = true)]
+    pub tmux: bool,
+
     #[command(subcommand)]
     pub command: Option<Command>,
 }
