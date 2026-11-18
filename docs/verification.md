@@ -25,3 +25,20 @@ Use temporary directories and repositories. Never put actual credentials in fixt
 ## Completion gate
 
 The task must have a concrete acceptance list. At closeout TALOS verifies current repository facts, records actual check results, confirms the critic reviewed the same revision, and leaves an audit trail. A missing CLI feature is reported as unsupported and blocks only the workflow that depends on it; it must not be silently emulated by parsing terminal art.
+
+## R9.2 hardening acceptance plan
+
+Run these as separate scenarios and record the host, database size before/after, peak process memory where available, exact command, and result. No hard long-term database size target or retention policy exists yet; measure growth and keep archival/pruning decisions in F1 rather than claiming the database is bounded.
+
+| Area | Required scenario | Pass evidence |
+|---|---|---|
+| Database growth | Add a large task/event history, close/reopen the database, and measure WAL/checkpoint behavior. | All rows remain readable; measured size is recorded; no automatic deletion occurs. |
+| Migration fault | Interrupt or fault-inject a schema migration at transaction boundaries, then reopen. | The database is either at the prior complete version or the new complete version; task/event rows remain intact. |
+| Process limits | Exercise large stdout/stderr, a stuck child, timeout, SIGINT/SIGTERM, and a surviving descendant. | Captures remain bounded, children are reaped where possible, and ambiguous work stays `unknown`. |
+| Worktree recovery | Interrupt creation, integration, and finalization at each filesystem/database boundary. | Reconciliation uses recorded identity; it never resets or deletes operator data. |
+| GitHub recovery | Interrupt push and draft PR creation, then reconcile repeated requests. | TALOS pushes only the recorded ref, does not auto-retry unknown effects, and does not create duplicates. |
+| CI storage | Repeat identical CI snapshots and collect multiple distinct runs. | Identical summaries deduplicate; a changed commit or status produces separate evidence; raw output stays absent. |
+| Backup/restore | Create a consistent SQLite backup while WAL is active and restore into a disposable project. | Task state and migration behavior are readable after restore; permissions remain private. |
+| Release reproducibility | Build twice from the same clean commit/toolchain/target and compare binary checksums. | Identical checksums or a documented toolchain/linker source of variation. |
+
+These scenarios are not run by `scripts/verify-project.sh`. T9.2 remains in progress until each result is recorded. Linux-native cases stay deferred to the user's server.

@@ -26,7 +26,7 @@ cargo uninstall talos
 
 These commands manage Cargo's executable installation root. They do not remove project-local `.talos/` databases or backups. Cargo's root defaults to `$CARGO_HOME` or `$HOME/.cargo`; `--root` can select another install location. See the official [Cargo install](https://doc.rust-lang.org/cargo/commands/cargo-install.html) and [Cargo uninstall](https://doc.rust-lang.org/cargo/commands/cargo-uninstall.html) references.
 
-On macOS, `scripts/package-macos.sh` builds the native ARM64 artifact by default. Pass `x86_64-apple-darwin` to build for Intel when that target is installed. The script requires a clean committed worktree and writes the binary, README, build manifest, and SHA-256 checksums under the ignored `dist/` directory. It records the compiler and lockfile digest so another build can be compared. Byte-for-byte reproducibility has not yet been verified.
+On macOS, `scripts/package-macos.sh` builds the native ARM64 artifact by default. Pass `x86_64-apple-darwin` to build for Intel when that target is installed. The script requires a clean committed worktree and writes the binary, README, build manifest, and SHA-256 checksums under the ignored `dist/` directory. It records the compiler and lockfile digest so another build can be compared. Byte-for-byte reproducibility has not yet been verified. The current artifact is unsigned and not notarized; it is a local build output, not a ready-to-publish macOS distribution.
 
 Before an update, back up the project database. A newer TALOS can migrate it forward; an older binary rejects a database schema newer than it supports. Do not downgrade by replacing the executable after a migration unless you have restored a compatible backup.
 

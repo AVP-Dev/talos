@@ -197,7 +197,7 @@ T8.1–T8.4 implement local `gh` diagnostics, explicit auth checking, policy-gat
 
 For macOS, run clean installation, upgrade, diagnostics, long-running and fault-injection runs, process-loss scenarios, and incomplete-write recovery without destroying the last good database. Implement Linux-specific paths incrementally; run native Linux build, runtime, and package acceptance on the user's server when local setup would slow development. Document SSH, manual takeover, access policy, CLI limitations, and backups. Produce binaries only after reproducible builds and packaging checks for the platform being released.
 
-Current preparation includes the 15-scenario inventory, a Cargo-based install/update/uninstall runbook, an ARM64-default macOS packaging script, a minimum Rust version, and a build manifest/checksum format. No artifact has been built from the current committed source yet. Byte-for-byte reproducibility and install lifecycle acceptance remain pending. Linux artifact packaging waits for native T6.5 acceptance.
+Current preparation includes the 15-scenario inventory, a distinct hardening matrix, a Cargo-based install/update/uninstall runbook, an ARM64-default macOS packaging script, a minimum Rust version, and a build manifest/checksum format. One ARM64 artifact was generated from the committed source and its listed checksums verified. Byte-for-byte reproducibility, binary smoke, and install lifecycle acceptance remain pending. Linux artifact packaging waits for native T6.5 acceptance.
 
 **Exit criteria:** clean install on supported systems; acceptance scenarios pass with evidence; documentation matches actual supported CLI versions; no unverified feature is enabled.
 
@@ -223,4 +223,4 @@ Implementation details may change based on experiments. Preserve invariants and 
 
 ## 8. Current continuation point
 
-R3–R5 are closed. T6 and T7 code are implemented in part, with behavior and platform acceptance gates recorded in `docs/state.md`. R8 code is implemented locally: T8.1–T8.3 acceptance awaits the user's repository, and T8.4 keeps merge/deletion manual. Continue R9.3/R9.5 macOS packaging preparation and complete the R9.4 doc audit without creating a repository, adding a remote, or invoking GitHub. Linux-native checks and artifacts remain deferred until server acceptance.
+R3–R5 are closed. T6 and T7 code are implemented in part, with behavior and platform acceptance gates recorded in `docs/state.md`. R8 code is implemented locally: T8.1–T8.3 acceptance awaits the user's repository, and T8.4 keeps merge/deletion manual. Continue R9.3 install lifecycle preparation and R9.4 documentation audit without creating a repository, adding a remote, or invoking GitHub. Linux-native checks and artifacts remain deferred until server acceptance.

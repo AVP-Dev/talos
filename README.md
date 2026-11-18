@@ -2,7 +2,7 @@
 
 TALOS is a Rust CLI-first orchestrator for local AI coding CLIs. It stores tasks, Writer attempts, and events in a durable local SQLite database, supervises one verified Antigravity Writer at a time, and preserves ambiguous work for operator review.
 
-> **Current status:** R6 remains in progress: macOS SSH reconnect, process-recovery behavior, interactive handoff, and Linux server acceptance are open. R7.1–R7.5 implementation is in progress; behavior and migration acceptance remain open. Native Agy subagent delegation remains disabled until its public invocation interface and configured roster pass a live probe. R8.1 diagnostics, R8.2 policy-gated publication, and R8.3 commit-bound CI evidence are implemented locally; behavior acceptance and a user-provided GitHub repository remain pending. No GitHub auth or remote operation has been invoked. Linux-specific checks wait for the user's server; Linux support remains unverified. No Docker or VM is required. Antigravity 1.5.10 is the only Writer- and Critic-verified adapter. Critic approval moves a task to `verifying`; managed-worktree tasks also require explicit integration, post-integration checks, a user-created commit, and finalization. `up --auto` runs at most one task per explicit call. `up --semi` prompts before a Writer launch and requires an interactive terminal.
+> **Current status:** R6 remains in progress: macOS SSH reconnect, process-recovery behavior, interactive handoff, and Linux server acceptance are open. R7.1–R7.5 implementation is in progress; behavior and migration acceptance remain open. Native Agy subagent delegation remains disabled until its public invocation interface and configured roster pass a live probe. R8.1 diagnostics, R8.2 policy-gated publication, and R8.3 commit-bound CI evidence are implemented locally; behavior acceptance and a user-provided GitHub repository remain pending. R9 has an end-to-end acceptance inventory, operator runbook, and one ARM64 macOS artifact; scenario execution, install lifecycle, and reproducibility checks remain open. No GitHub auth or remote operation has been invoked. Linux-specific checks wait for the user's server; Linux support remains unverified. No Docker or VM is required. Antigravity 1.5.10 is the only Writer- and Critic-verified adapter. Critic approval moves a task to `verifying`; managed-worktree tasks also require explicit integration, post-integration checks, a user-created commit, and finalization. `up --auto` runs at most one task per explicit call. `up --semi` prompts before a Writer launch and requires an interactive terminal.
 
 ## Start here
 
@@ -137,6 +137,7 @@ Example check configuration:
 
 - [Operator runbook](docs/operator-runbook.md)
 - [Plan and rounds](docs/plan.md)
+- [Verification policy and hardening matrix](docs/verification.md)
 - [Task backlog](docs/tasks.md)
 - [Current status and session handoff](docs/state.md)
 - [End-to-end acceptance scenarios](docs/acceptance-scenarios.md)
