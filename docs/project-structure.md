@@ -28,7 +28,7 @@ src/
   tmux.rs                   optional persistent terminal control session
   worktree.rs               explicit task-worktree lifecycle and integration
   inline test modules      unit and behavior tests colocated with modules
-scripts/                    verification profile, scanner, and macOS packager
+scripts/                    verification profile, scanner, and macOS/Linux packagers
 docs/
   plan.md                  product direction and delivery rounds
   tasks.md                 status-tracked implementation backlog

@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R6–R9 implementation remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 live interactive handoff remain open; T6.6 now has a read-only context-packet fallback. R7.1–R7.5 code is implemented, with behavior/migration acceptance still open; native subagent delegation and three-agent acceptance remain unavailable until verified. T8.1 diagnostics, T8.2 publication, and T8.3 commit-bound CI snapshots are implemented locally; T8.4 keeps merge/deletion manual. T8.1–T8.3 command, migration, and remote acceptance remains pending. R9.1 has a 15-scenario evidence inventory; T9.2 hardening scenarios are documented; T9.4 documentation is complete; T9.3 install/package preparation and T9.5 artifact work remain in progress. No GitHub authentication or remote operation has been performed. Linux access, native checks, and Linux artifacts are deferred to the user's server. Backlog: 42/61 scheduled tasks done (68.9%, unweighted), 16 in progress, 0 planned, and 3 deferred; two unscheduled ideas remain recorded separately.
+**R6–R9 implementation remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 live interactive handoff remain open; T6.6 now has a read-only context-packet fallback. R7.1–R7.5 code is implemented, with behavior/migration acceptance still open; native subagent delegation and three-agent acceptance remain unavailable until verified. T8.1 diagnostics, T8.2 publication, and T8.3 commit-bound CI snapshots are implemented locally; T8.4 keeps merge/deletion manual. T8.1–T8.3 command, migration, and remote acceptance remains pending. R9.1 has a 15-scenario evidence inventory; T9.2 hardening scenarios are documented; T9.4 documentation is complete; T9.3 install/package preparation includes a Linux packager script that has not been run; T9.5 artifact work remains in progress. No GitHub authentication or remote operation has been performed. Linux access, native checks, and Linux artifacts are deferred to the user's server. Backlog: 42/61 scheduled tasks done (68.9%, unweighted), 16 in progress, 0 planned, and 3 deferred; two unscheduled ideas remain recorded separately.
 
 ## Goal and fixed direction
 
@@ -342,10 +342,11 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - Corrected stale Cargo install-root guidance, `.talos/` ignore behavior, implemented-feature wording, and Linux scope. README now links the operator, architecture, handoff, onboarding, and research documents.
 - TALOS project artifacts remain English. GitHub remote actions and Linux acceptance remain explicitly pending.
 
-## R9.3 progress — macOS installation preparation
+## R9.3 progress — install and native package preparation
 
 - Added a runbook with Cargo install, update, and uninstall commands. These operate on the binary installation root and preserve project `.talos/` databases. It also documents backups, recovery, worktrees, GitHub workflow, and current platform limits.
 - Added `scripts/package-macos.sh` for ARM64 by default and optional Intel builds. The script requires a clean committed checkout, builds with `--locked`, records version/target/commit/source date/Rust compiler/Cargo.lock digest, copies README, and writes SHA-256 checksums to ignored `dist/` output.
+- Added `scripts/package-linux.sh` for native `x86_64-unknown-linux-gnu` and `aarch64-unknown-linux-gnu` hosts. It requires a clean committed checkout and writes a binary, README, build manifest, and checksums to ignored `dist/`. `bash -n` passed on macOS; the script has not been run, and no Linux build or host connection occurred.
 - Generated the ARM64 artifact at `dist/talos-v0.1.0-aarch64-apple-darwin-9fafb4c9d3fa/`. The executable is 4.6 MiB; Cargo's release build succeeded with the known non-fatal macOS `xcrun` cache warnings. All three entries in `SHA256SUMS` passed `shasum -a 256 -c` from the artifact directory.
 - The artifact is unsigned and not notarized; the runbook labels it a local build output, not a publish-ready macOS distribution.
 - Linux package generation remains after T6.5 native server acceptance; no Linux system was contacted or packaged.

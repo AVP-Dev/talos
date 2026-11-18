@@ -30,6 +30,8 @@ These commands manage Cargo's executable installation root. They do not remove p
 
 On macOS, `scripts/package-macos.sh` builds the native ARM64 artifact by default. Pass `x86_64-apple-darwin` to build for Intel when that target is installed. The script requires a clean committed worktree and writes the binary, README, build manifest, and SHA-256 checksums under the ignored `dist/` directory. It records the compiler and lockfile digest so another build can be compared. Byte-for-byte reproducibility has not yet been verified. The current artifact is unsigned and not notarized; it is a local build output, not a ready-to-publish macOS distribution.
 
+On Linux, `scripts/package-linux.sh` builds for the host's native GNU target when it is `x86_64-unknown-linux-gnu` or `aarch64-unknown-linux-gnu`. It requires a clean committed checkout, Cargo, Rust, Git, `install`, and `sha256sum`. It writes the binary, README, build manifest, and checksums under ignored `dist/`. The script has been authored on macOS but has not been run; native Linux build/runtime acceptance and package generation remain pending on the user's server. It does not cross-compile from macOS.
+
 Before an update, back up the project database. A newer TALOS can migrate it forward; an older binary rejects a database schema newer than it supports. Do not downgrade by replacing the executable after a migration unless you have restored a compatible backup.
 
 ## First launch and normal task flow
