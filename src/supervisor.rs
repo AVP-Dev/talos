@@ -541,6 +541,21 @@ pub async fn run_critic_review(
                 |_| Ok(()),
             )
             .await?;
+            if res.exit_code != Some(0)
+                && [
+                    res.error.as_deref(),
+                    res.response.as_deref(),
+                    Some(res.stderr_excerpt.as_str()),
+                ]
+                .into_iter()
+                .flatten()
+                .any(crate::adapter::mentions_authentication_failure)
+            {
+                bail!(
+                    "{} authentication required for Critic. Sign in to the CLI and retry this task.",
+                    adapter.as_str()
+                );
+            }
             (res.response, res.exit_code, res.termination)
         }
         crate::config::AdapterKind::Omp => {
@@ -593,6 +608,21 @@ pub async fn run_critic_review(
                 |_| Ok(()),
             )
             .await?;
+            if res.exit_code != Some(0)
+                && [
+                    res.error.as_deref(),
+                    res.response.as_deref(),
+                    Some(res.stderr_excerpt.as_str()),
+                ]
+                .into_iter()
+                .flatten()
+                .any(crate::adapter::mentions_authentication_failure)
+            {
+                bail!(
+                    "{} authentication required for Critic. Sign in to the CLI and retry this task.",
+                    adapter.as_str()
+                );
+            }
             (res.response, res.exit_code, res.termination)
         }
         crate::config::AdapterKind::OpenCode => {
@@ -1179,7 +1209,18 @@ async fn run_writer_attempt_inner(
     } else {
         outcome
     };
-    let error_code = if error_code.is_none()
+    let authentication_failed = outcome == WriterAttemptOutcome::Failed
+        && [
+            execution.agent_error.as_deref(),
+            execution.response.as_deref(),
+            Some(execution.stderr_excerpt.as_str()),
+        ]
+        .into_iter()
+        .flatten()
+        .any(crate::adapter::mentions_authentication_failure);
+    let error_code = if authentication_failed {
+        Some("adapter_authentication_required")
+    } else if error_code.is_none()
         && conversation_id.is_none()
         && outcome == WriterAttemptOutcome::Failed
     {

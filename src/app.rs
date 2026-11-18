@@ -3334,6 +3334,30 @@ fn commit_approved_changes(
     Ok(())
 }
 
+fn record_task_result_commit(
+    database: &mut Database,
+    task_id: i64,
+    commit: Option<&str>,
+) -> Result<Vec<String>> {
+    let review = database
+        .latest_critic_review(task_id)?
+        .context("Task has no approved review")?;
+    if let Some(commit) = commit {
+        let data = json!({"base": review.base_revision, "commit": commit}).to_string();
+        database.record_task_event(
+            task_id,
+            "git",
+            "task.commit_saved",
+            "Task result saved in Git",
+            Some(&data),
+        )?;
+    }
+    Ok(review
+        .changed_paths_json
+        .and_then(|paths| serde_json::from_str(&paths).ok())
+        .unwrap_or_default())
+}
+
 async fn run_pair_task(
     json_output: bool,
     project: &Project,
@@ -3602,11 +3626,7 @@ async fn run_pair_task(
     }
 
     let commit_hash = git_head(&project.root).ok().flatten();
-    let changed = database
-        .latest_critic_review(task.id)?
-        .and_then(|review| review.changed_paths_json)
-        .and_then(|paths| serde_json::from_str(&paths).ok())
-        .unwrap_or_default();
+    let changed = record_task_result_commit(database, task.id, commit_hash.as_deref())?;
 
     if deferred_findings.is_empty()
         && let Ok(Some(latest_review)) = database.latest_critic_review(task.id)
@@ -4647,11 +4667,7 @@ async fn run_team_task(
     }
 
     let commit_hash = git_head(&project.root).ok().flatten();
-    let changed = database
-        .latest_critic_review(task.id)?
-        .and_then(|review| review.changed_paths_json)
-        .and_then(|paths| serde_json::from_str(&paths).ok())
-        .unwrap_or_default();
+    let changed = record_task_result_commit(database, task.id, commit_hash.as_deref())?;
 
     if !team_deferred_findings.is_empty() {
         let payload = serde_json::to_string(&team_deferred_findings).ok();

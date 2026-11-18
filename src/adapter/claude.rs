@@ -54,9 +54,10 @@ pub async fn run_claude(
     match config.role {
         ClaudeRoleMode::Critic => {
             cmd.arg("--tools").arg("Read,Grep,Glob");
+            cmd.arg("--permission-mode").arg("plan");
         }
         ClaudeRoleMode::Writer => {
-            cmd.arg("--allow-dangerously-skip-permissions");
+            cmd.arg("--permission-mode").arg("acceptEdits");
         }
     }
 

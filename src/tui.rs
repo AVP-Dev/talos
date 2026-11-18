@@ -34,8 +34,8 @@ use crate::{
     checks::ProjectCheck,
     config::{OrchestrationMode, ProjectConfig},
     db::{
-        CriticReviewRecord, Database, QueueSummary, StopRequestOutcome, TaskEvent, TaskRecord,
-        TaskStatus, TaskSummaryRecord, TaskWorktreeRecord,
+        COCKPIT_CANCELLED_REASON, CriticReviewRecord, Database, QueueSummary, RecentTask,
+        StopRequestOutcome, TaskEvent, TaskRecord, TaskStatus, TaskWorktreeRecord,
     },
     project::{DiscoveryMethod, Project},
     tmux::{TmuxClient, project_session_name},
@@ -79,6 +79,7 @@ enum Screen {
     Review,
     History,
     Task,
+    Changes,
     ChooseProject,
 }
 
@@ -99,16 +100,17 @@ pub struct TuiApp {
     settings: Option<ProjectConfig>,
     selection: usize,
     available: Vec<AdapterKind>,
-    history: Vec<TaskSummaryRecord>,
+    history: Vec<RecentTask>,
     history_before: Option<i64>,
     task_view: Option<i64>,
     detail_scroll: u16,
     event_baseline: i64,
     log_baseline: u64,
-    child: Option<Child>,
+    child: Option<(i64, Child)>,
     run_notice: Option<String>,
     task_status: Option<TaskStatus>,
     task_details: String,
+    result_diff: String,
     status_message: Option<(String, Instant)>,
     scroll_offset: usize,
 
@@ -140,7 +142,11 @@ impl TuiApp {
     }
 
     fn with_adapters(project: Project, available: Vec<AdapterKind>) -> Result<Self> {
-        let mut config = ProjectConfig::load(&project)?;
+        let mut config = if matches!(project.discovery, DiscoveryMethod::Git) {
+            ProjectConfig::load(&project)?
+        } else {
+            ProjectConfig::default()
+        };
         if matches!(project.discovery, DiscoveryMethod::Git)
             && !crate::config::config_path(&project.state_root).exists()
             && let Some(writer) = available.first().copied()
@@ -189,6 +195,7 @@ impl TuiApp {
             run_notice: None,
             task_status: None,
             task_details: String::new(),
+            result_diff: String::new(),
             status_message: None,
             scroll_offset: 0,
             queue,
@@ -229,15 +236,17 @@ impl TuiApp {
         if !matches!(self.project.discovery, DiscoveryMethod::Git) {
             return Ok(());
         }
-        if let Some(child) = &mut self.child
+        if let Some((task_id, child)) = &mut self.child
             && let Some(status) = child.try_wait()?
         {
+            let task_id = *task_id;
             self.child = None;
-            if !status.success()
-                && let Some(id) = self.task_view
-            {
-                let log = recent_log_lines(&self.task_log(id), 0);
-                self.run_notice = Some(run_recovery_hint(&log, &self.config));
+            if self.task_view == Some(task_id) {
+                self.status_message = None;
+                if !status.success() {
+                    let log = recent_log_lines(&self.task_log(task_id), 0);
+                    self.run_notice = Some(run_recovery_hint(&log, &self.config));
+                }
             }
         }
         if let Ok(cfg) = ProjectConfig::load(&self.project) {
@@ -658,7 +667,7 @@ impl TuiApp {
             Screen::Review => self.run_draft()?,
             Screen::History => {
                 if let Some(task) = self.history.get(self.selection) {
-                    self.task_view = Some(task.id);
+                    self.task_view = Some(task.task.id);
                     self.run_notice = None;
                     self.detail_scroll = 0;
                     self.screen = Screen::Task;
@@ -698,9 +707,13 @@ impl TuiApp {
             draft.config == self.config,
             "Project settings changed. Open Settings and save to review the new assignments."
         );
-        if let Some(blocker) = self.run_blocker() {
+        if let Some(blocker) = self.run_blocker(None) {
             anyhow::bail!("{blocker}");
         }
+        anyhow::ensure!(
+            crate::revision::git_head(&self.project.root)?.is_some(),
+            "This Git project has no commits yet. Make an initial commit with your project files, or choose an existing project."
+        );
         let mut database = Database::open(&self.project)?;
         let task =
             database.add_task_with_checks(&draft.title, &draft.criteria, &draft.config.checks)?;
@@ -712,8 +725,8 @@ impl TuiApp {
         self.start_selected_task(task.id)
     }
 
-    fn run_blocker(&self) -> Option<String> {
-        if self.supervisor_running || !self.active_tasks.is_empty() {
+    fn run_blocker(&self, retry: Option<i64>) -> Option<String> {
+        if self.supervisor_running || self.active_tasks.iter().any(|task| Some(task.id) != retry) {
             return Some(
                 "A task is active. Wait for it to finish or request Stop for its Writer.".into(),
             );
@@ -721,7 +734,9 @@ impl TuiApp {
         if self.queue_paused {
             return Some("The queue is paused. Press U to resume the queue, then retry.".into());
         }
-        if !self.dirty_paths.is_empty() {
+        let retry_in_progress =
+            retry.is_some_and(|id| self.active_tasks.iter().any(|task| task.id == id));
+        if !retry_in_progress && !self.dirty_paths.is_empty() {
             return Some(format!(
                 "Project has uncommitted changes. Press D to view them. Commit or stash your own changes, then retry. {}",
                 self.dirty_paths.display_preview()
@@ -736,6 +751,14 @@ impl TuiApp {
             }
         }
         None
+    }
+
+    fn can_retry_task(&self) -> bool {
+        !self.supervisor_running
+            && matches!(
+                self.task_status,
+                Some(TaskStatus::Queued | TaskStatus::Reviewing | TaskStatus::Verifying)
+            )
     }
 
     fn open_settings(&mut self) {
@@ -763,6 +786,10 @@ impl TuiApp {
         self.draft = None;
         self.task_view = None;
         self.task_status = None;
+        self.task_details.clear();
+        self.result_diff.clear();
+        self.recent_events.clear();
+        self.supervisor_logs.clear();
         self.run_notice = None;
         self.reconnect_notice = None;
         self.scroll_offset = 0;
@@ -788,17 +815,101 @@ impl TuiApp {
         Ok(())
     }
 
+    fn open_result_changes(&mut self) -> Result<()> {
+        let id = self.task_view.context("Select a task in History")?;
+        let database = Database::open(&self.project)?;
+        let event = database
+            .task_events_page(Some(id), None, 20)?
+            .events
+            .into_iter()
+            .find(|event| event.event_type == "task.commit_saved")
+            .context(
+                "A saved commit diff is unavailable. The task result lists the reviewed paths.",
+            )?;
+        let data: serde_json::Value = serde_json::from_str(&event.data_json)?;
+        let revision = |key| {
+            data.get(key)
+                .and_then(|value| value.as_str())
+                .filter(|value| {
+                    matches!(value.len(), 40 | 64)
+                        && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+                .context("The task has an invalid Git revision")
+        };
+        let mut child = std::process::Command::new("git")
+            .args([
+                "diff",
+                "--no-ext-diff",
+                "--no-textconv",
+                revision("base")?,
+                revision("commit")?,
+                "--",
+            ])
+            .current_dir(&self.project.root)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .context("Cannot open saved changes")?;
+        const PREVIEW_LIMIT: usize = 64 * 1024;
+        let mut bytes = Vec::new();
+        let result = child
+            .stdout
+            .take()
+            .context("Cannot read Git diff")?
+            .take((PREVIEW_LIMIT + 1) as u64)
+            .read_to_end(&mut bytes);
+        if result.is_err() || bytes.len() > PREVIEW_LIMIT {
+            let _ = child.kill();
+        }
+        let status = child.wait()?;
+        result?;
+        anyhow::ensure!(
+            status.success() || bytes.len() > PREVIEW_LIMIT,
+            "Git could not read the saved revisions. They may be unavailable in this checkout."
+        );
+        self.result_diff = crate::secrets::redact_sensitive(&String::from_utf8_lossy(
+            &bytes[..bytes.len().min(PREVIEW_LIMIT)],
+        ));
+        if bytes.len() > PREVIEW_LIMIT {
+            self.result_diff
+                .push_str("\n\nPreview ended after 64 KiB. Open Git to inspect the full changes.");
+        }
+        self.detail_scroll = 0;
+        self.screen = Screen::Changes;
+        self.status_message = None;
+        Ok(())
+    }
+
     fn update_task_details(&mut self, database: &Database, task: &TaskRecord) -> Result<()> {
         let report = crate::summary::task_summary_path(&self.project.root, task.id);
-        let mut details = format!(
-            "Task #{} · {}\n{}\n",
-            task.id,
-            task.status.as_str(),
-            task.title
-        );
-        if let Some(integration) = database.task_worktree_integration(task.id)? {
+        let events = database.task_events_page(Some(task.id), None, 20)?;
+        let cancelled = task.status == TaskStatus::Failed
+            && events
+                .events
+                .iter()
+                .find(|event| event.event_type == "task.status_changed")
+                .is_some_and(|event| event.reason == COCKPIT_CANCELLED_REASON);
+        let status = if cancelled {
+            "cancelled"
+        } else {
+            task.status.as_str()
+        };
+        let mut details = format!("Task #{} · {status}\n{}\n", task.id, task.title);
+        let review_paths = database
+            .latest_critic_review(task.id)?
+            .and_then(|review| review.changed_paths_json)
+            .and_then(|paths| serde_json::from_str::<Vec<String>>(&paths).ok());
+        let paths = match review_paths {
+            Some(paths) => paths,
+            None => database
+                .task_worktree_integration(task.id)?
+                .map(|integration| integration.changed_paths)
+                .unwrap_or_default(),
+        };
+        if !paths.is_empty() {
             details.push_str("\nChanged files\n");
-            details.push_str(&integration.changed_paths.join("\n"));
+            details.push_str(&paths.join("\n"));
             details.push('\n');
         }
         let report_text = open_runtime_read(&report).and_then(|file| {
@@ -810,7 +921,6 @@ impl TuiApp {
             details.push('\n');
             details.push_str(&report_text);
         } else {
-            let events = database.task_events_page(Some(task.id), None, 20)?;
             for event in events.events.iter().take(5).rev() {
                 details.push_str(&format!("\n{}", event.reason));
             }
@@ -1250,7 +1360,7 @@ impl TuiApp {
             .stderr(log)
             .spawn()
             .context("Cannot start TALOS. Check the installation and retry.")?;
-        self.child = Some(child);
+        self.child = Some((id, child));
         self.supervisor_running = true;
         self.run_notice = None;
         self.notice(format!("Starting task #{id}."));
@@ -1338,19 +1448,8 @@ fn available_adapters(project: &Project) -> Vec<AdapterKind> {
 }
 
 fn run_recovery_hint(log: &[String], config: &ProjectConfig) -> String {
-    if log.iter().rev().any(|line| {
-        let line = line.to_ascii_lowercase();
-        [
-            "not logged in",
-            "authentication required",
-            "unauthorized",
-            "status 401",
-            "api key is missing",
-            "invalid api key",
-            "please run /login",
-        ]
-        .iter()
-        .any(|marker| line.contains(marker))
+    if log.iter().any(|line| {
+        line.starts_with("Error:") && crate::adapter::mentions_authentication_failure(line)
     }) {
         let mut commands = [config.writer, config.critic]
             .into_iter()
@@ -1370,7 +1469,7 @@ fn run_recovery_hint(log: &[String], config: &ProjectConfig) -> String {
             )
         };
         format!(
-            "The agent could not authenticate. {actions} Return to TALOS to retry, or press F2 to choose another CLI."
+            "The agent could not authenticate. {actions} Then retry the task or edit it as a new draft. Press F2 to choose another CLI."
         )
     } else {
         "Run stopped. See Run details below for the error and the next action.".to_owned()
@@ -1526,6 +1625,10 @@ impl TuiApp {
                     self.screen = Screen::Main;
                     return Ok(());
                 }
+                Screen::Changes => {
+                    self.detail_scroll = 0;
+                    Screen::Task
+                }
                 Screen::ChooseProject => {
                     self.clear_input();
                     return Ok(());
@@ -1593,14 +1696,26 @@ impl TuiApp {
                     self.selection = (self.selection + 1).min(self.history.len().saturating_sub(1))
                 }
                 KeyCode::PageDown if !repeat && self.history.len() == 50 => {
-                    self.open_history(self.history.last().map(|task| task.id))?;
+                    self.open_history(self.history.last().map(|entry| entry.task.id))?;
                 }
                 KeyCode::PageUp if !repeat && self.history_before.is_some() => {
                     self.open_history(None)?
                 }
                 _ => {}
             },
+            Screen::Changes => match key.code {
+                KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
+                KeyCode::Down => self.detail_scroll = self.detail_scroll.saturating_add(1),
+                KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
+                KeyCode::PageDown => self.detail_scroll = self.detail_scroll.saturating_add(10),
+                _ => {}
+            },
             Screen::Task => match key.code {
+                KeyCode::Char('d' | 'D')
+                    if !repeat && self.task_status == Some(TaskStatus::Complete) =>
+                {
+                    self.open_result_changes()?
+                }
                 KeyCode::Up => self.detail_scroll = self.detail_scroll.saturating_sub(1),
                 KeyCode::Down => self.detail_scroll = self.detail_scroll.saturating_add(1),
                 KeyCode::PageUp => self.detail_scroll = self.detail_scroll.saturating_sub(10),
@@ -1622,17 +1737,44 @@ impl TuiApp {
                 {
                     self.execute_slash_command("/stop")?
                 }
-                KeyCode::Char('r' | 'R')
-                    if !repeat && self.task_status == Some(TaskStatus::Queued) =>
-                {
+                KeyCode::Char('r' | 'R') if !repeat && self.can_retry_task() => {
                     self.available = available_adapters(&self.project);
                     self.refresh_state()?;
-                    if let Some(blocker) = self.run_blocker() {
+                    anyhow::ensure!(
+                        self.can_retry_task(),
+                        "The task status changed. Review its details."
+                    );
+                    if let Some(blocker) = self.run_blocker(self.task_view) {
                         anyhow::bail!("{blocker}");
                     }
                     if let Some(id) = self.task_view {
                         self.start_selected_task(id)?;
                     }
+                }
+                KeyCode::Char('e' | 'E')
+                    if !repeat
+                        && !self.supervisor_running
+                        && matches!(
+                            self.task_status,
+                            Some(TaskStatus::Failed | TaskStatus::Blocked)
+                        ) =>
+                {
+                    if let Some(id) = self.task_view
+                        && let Some(task) = Database::open(&self.project)?.get_task(id)?
+                    {
+                        self.prepare_draft(task.title, task.acceptance_criteria);
+                    }
+                }
+                KeyCode::Char('d' | 'D') if !repeat && !self.dirty_paths.is_empty() => {
+                    self.active_tab = ActiveTab::Diff;
+                    self.load_git_diff();
+                    self.screen = Screen::Main;
+                    self.notice(
+                        "Review the changed files. Press F3 to return to the task in History.",
+                    );
+                }
+                KeyCode::Char('u' | 'U') if !repeat && self.queue_paused => {
+                    self.execute_slash_command("/resume")?
                 }
                 KeyCode::Char('c' | 'C')
                     if !repeat
@@ -1902,7 +2044,12 @@ fn render_workflow(frame: &mut Frame, app: &TuiApp, area: Rect) {
             }).collect::<Vec<_>>().join("\n");
             let discovered = app.available.iter().map(|adapter| adapter.as_str()).collect::<Vec<_>>().join(", ");
             if discovered.is_empty() {
-                body.push_str("\n\nNo compatible agent CLI found. Install one of these tools, then press R:\ncodex, claude, agy, opencode, pi, omp, kilo.");
+                body.push_str("\n\nNo agent CLI found. Install one in a separate terminal, sign in if prompted, then press R here.");
+                if cfg!(target_os = "macos") {
+                    body.push_str("\nCodex: brew install --cask codex\nClaude Code: brew install --cask claude-code");
+                } else {
+                    body.push_str("\nCodex: https://github.com/openai/codex\nClaude Code: https://code.claude.com/docs/en/setup");
+                }
             } else {
                 body.push_str(&format!("\n\nFound locally: {discovered}\nSign in or configure credentials in the agent's own CLI if required."));
             }
@@ -1928,7 +2075,13 @@ fn render_workflow(frame: &mut Frame, app: &TuiApp, area: Rect) {
                 config.critic.as_str(), config.critic_model.as_deref().unwrap_or("CLI default"),
                 config.orchestration.mode.as_str(), checks, draft.criteria
             );
-            let actions = if let Some(blocker) = app.run_blocker() {
+            if let Some(policy) = &config.github
+                && policy.allow_push && policy.allow_pull_request
+                && config.orchestration.mode == OrchestrationMode::Pair
+            {
+                body = format!("GitHub draft PR enabled for {}.\n\n{body}", policy.repository);
+            }
+            let actions = if let Some(blocker) = app.run_blocker(None) {
                 body = format!("{blocker}\n\n{body}");
                 "Esc  Edit   S  Settings   D  View changes   R  Check again   U  Resume queue"
             } else {
@@ -1942,9 +2095,11 @@ fn render_workflow(frame: &mut Frame, app: &TuiApp, area: Rect) {
             } else {
                 let visible = usize::from(chunks[1].height).saturating_sub(2).max(1);
                 let start = app.selection.saturating_add(1).saturating_sub(visible);
-                app.history.iter().enumerate().skip(start).take(visible).map(|(index, task)| {
+                app.history.iter().enumerate().skip(start).take(visible).map(|(index, entry)| {
+                    let task = &entry.task;
                     let title = task.title.lines().next().unwrap_or_default();
-                    format!("{} #{} · {} · {}", if index == app.selection { ">" } else { " " }, task.id, task.status.as_str(), title)
+                    let status = if entry.cancelled { "cancelled" } else { task.status.as_str() };
+                    format!("{} #{} · {status} · {title}", if index == app.selection { ">" } else { " " }, task.id)
                 }).collect::<Vec<_>>().join("\n")
             };
             ("History", body, "↑ ↓  Select   Enter  Open result   PgDn  Older   PgUp  Latest   F4  New session   Esc  Back".to_owned())
@@ -1958,18 +2113,32 @@ fn render_workflow(frame: &mut Frame, app: &TuiApp, area: Rect) {
                 }
             } else if app.task_status == Some(TaskStatus::Queued) {
                 "R  Retry   C  Cancel queued task   F2  Settings   F3  History   F4  New session"
-            } else if !app.active_tasks.is_empty() {
-                "An unfinished task needs attention   ↑ ↓  Scroll   F3  History"
+            } else if app.can_retry_task() {
+                "R  Retry this stage   F2  Settings   F3  History   ↑ ↓  Scroll"
+            } else if matches!(app.task_status, Some(TaskStatus::Failed | TaskStatus::Blocked)) {
+                "E  Edit as new task   F2  Settings   F3  History   F4  New session"
             } else {
-                "F4  New session   F3  History   ↑ ↓  Scroll result   Esc  Back"
+                "D  View changes   F4  New session   F3  History   ↑ ↓  Scroll   Esc  Back"
+            };
+            let hint = if app.queue_paused {
+                format!("{hint}   U  Resume queue")
+            } else if app.task_status != Some(TaskStatus::Complete) && !app.dirty_paths.is_empty() {
+                format!("{hint}   D  View changes")
+            } else {
+                hint.to_owned()
             };
             let body = if let Some(note) = &app.run_notice {
                 format!("{note}\n\n{}", app.task_details)
             } else {
                 app.task_details.clone()
             };
-            ("Task result", body, hint.to_owned())
+            ("Task result", body, hint)
         }
+        Screen::Changes => (
+            "Saved changes",
+            if app.result_diff.is_empty() { "This result has no Git file changes.".into() } else { app.result_diff.clone() },
+            "↑ ↓  Scroll changes   Esc  Back to result   F4  New session".to_owned(),
+        ),
         Screen::Main => unreachable!(),
     };
     let project = app.project.root.display();
@@ -1981,7 +2150,7 @@ fn render_workflow(frame: &mut Frame, app: &TuiApp, area: Rect) {
     let body = Paragraph::new(body)
         .wrap(Wrap { trim: false })
         .block(Block::bordered());
-    let body = if matches!(app.screen, Screen::Task | Screen::Review) {
+    let body = if matches!(app.screen, Screen::Task | Screen::Review | Screen::Changes) {
         body.scroll((app.detail_scroll, 0))
     } else {
         body
@@ -3047,7 +3216,7 @@ mod tests {
         assert!(app.task_view.is_none());
         assert_eq!(app.config.writer, AdapterKind::Codex);
         app.open_history(None).expect("open history");
-        assert_eq!(app.history[0].id, old.id);
+        assert_eq!(app.history[0].task.id, old.id);
         std::fs::remove_dir_all(&project.root).expect("remove test project");
     }
 

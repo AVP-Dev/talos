@@ -7,6 +7,22 @@ pub mod omp;
 pub mod opencode;
 pub mod pi;
 
+pub(crate) fn mentions_authentication_failure(text: &str) -> bool {
+    let text = text.to_ascii_lowercase();
+    [
+        "not logged in",
+        "authentication required",
+        "unauthorized",
+        "status 401",
+        "api key is missing",
+        "invalid api key",
+        "please run /login",
+        "authentication_required",
+    ]
+    .iter()
+    .any(|marker| text.contains(marker))
+}
+
 pub(crate) fn resolve_installed_cli(
     name: &str,
     override_variable: &str,

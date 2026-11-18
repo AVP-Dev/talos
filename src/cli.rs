@@ -168,7 +168,7 @@ pub struct UpArgs {
     /// Select the safe readiness-only mode. This is the default.
     #[arg(long, conflicts_with_all = ["auto", "semi"])]
     pub observe: bool,
-    /// Run at most one queued task in a clean Git project.
+    /// Process the runnable queue in a clean Git project.
     #[arg(long, conflicts_with = "semi")]
     pub auto: bool,
     /// Select execution with operator approval at policy boundaries.

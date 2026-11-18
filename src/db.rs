@@ -78,6 +78,13 @@ pub struct TaskSummaryRecord {
     pub status: TaskStatus,
 }
 
+pub(crate) const COCKPIT_CANCELLED_REASON: &str = "Cancelled by the operator before execution";
+
+pub(crate) struct RecentTask {
+    pub task: TaskSummaryRecord,
+    pub cancelled: bool,
+}
+
 #[derive(Clone, Debug, Serialize)]
 pub struct TaskListPage {
     pub tasks: Vec<TaskSummaryRecord>,
@@ -2289,7 +2296,7 @@ impl Database {
             Some(TaskStatus::Queued),
             TaskStatus::Failed,
             "operator",
-            "Cancelled by the operator before execution",
+            COCKPIT_CANCELLED_REASON,
         )
     }
 
@@ -2392,18 +2399,31 @@ impl Database {
         Ok(records)
     }
 
-    pub fn recent_tasks(
+    pub(crate) fn recent_tasks(
         &self,
         before: Option<i64>,
         limit: usize,
-    ) -> Result<Vec<TaskSummaryRecord>> {
+    ) -> Result<Vec<RecentTask>> {
         validate_history_page(before, limit)?;
         let mut statement = self.connection.prepare(
-            "SELECT id, title, status FROM tasks
-             WHERE (?1 IS NULL OR id < ?1) ORDER BY id DESC LIMIT ?2",
+            "SELECT id, title, status,
+                    COALESCE(status = 'failed' AND (
+                        SELECT reason FROM task_events
+                        WHERE task_id = tasks.id AND event_type = 'task.status_changed'
+                        ORDER BY id DESC LIMIT 1
+                    ) = ?3, 0)
+             FROM tasks WHERE (?1 IS NULL OR id < ?1) ORDER BY id DESC LIMIT ?2",
         )?;
         statement
-            .query_map(params![before, limit as i64], map_task_summary_record)?
+            .query_map(
+                params![before, limit as i64, COCKPIT_CANCELLED_REASON],
+                |row| {
+                    Ok(RecentTask {
+                        task: map_task_summary_record(row)?,
+                        cancelled: row.get(3)?,
+                    })
+                },
+            )?
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("Cannot read task history")
     }
