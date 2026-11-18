@@ -44,6 +44,8 @@ talos resume
 
 `talos task list` returns 25 compact task summaries by default (maximum 100 per page) and omits acceptance criteria. In JSON, use `has_more` and `next_after` to request the next page with `talos task list --after <ID>`. Use `talos task show <ID>` when you need the full criteria for one task.
 
+`talos task dependencies`, `talos task children`, and `talos task worktree list` also use cursor pages. Dependencies and worktrees default to 25 rows (maximum 100); child contracts default to 5 rows (maximum 10) because each contract can contain many allowed paths.
+
 `talos logs` and `talos logs --project` return the latest 25 events by default (maximum 100 per page). Use `--before <EVENT_ID>` to continue with older events; JSON includes `has_more` and `next_before`. Event history remains stored locally.
 
 `talos task evidence <ID>` returns the latest 25 verification runs (maximum 100 per page). Use `--before <RUN_ID>` to continue with older runs; JSON includes `has_more` and `next_before`.

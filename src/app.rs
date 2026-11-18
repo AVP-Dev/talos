@@ -281,25 +281,33 @@ pub async fn run(cli: Cli) -> Result<()> {
                     }
                 }
             }
-            TaskCommand::Dependencies { task_id } => {
+            TaskCommand::Dependencies {
+                task_id,
+                limit,
+                after,
+            } => {
                 if database.get_task(task_id)?.is_none() {
                     bail!("Task #{task_id} does not exist");
                 }
-                let dependencies = database.task_dependencies(task_id)?;
+                let page = database.task_dependencies_page(task_id, after, limit)?;
                 if cli.json {
-                    print_json(&json!({
-                        "task_id": task_id,
-                        "dependencies": dependencies,
-                    }))?;
-                } else if dependencies.is_empty() {
+                    print_json(&page)?;
+                } else if page.dependencies.is_empty() && after == 0 {
                     println!("Task #{task_id} has no prerequisite tasks.");
+                } else if page.dependencies.is_empty() {
+                    println!("No more prerequisites for task #{task_id}.");
                 } else {
-                    for dependency in dependencies {
+                    for dependency in &page.dependencies {
                         println!(
                             "Task #{} requires task #{} ({}).",
                             dependency.task_id,
                             dependency.prerequisite_task_id,
                             dependency.prerequisite_status.as_str(),
+                        );
+                    }
+                    if let Some(next_after) = page.next_after {
+                        println!(
+                            "More prerequisites are available: `talos task dependencies {task_id} --after {next_after} --limit {limit}`."
                         );
                     }
                 }
@@ -335,25 +343,33 @@ pub async fn run(cli: Cli) -> Result<()> {
                     println!("Parent task #{parent_task_id} now waits for this child to complete.");
                 }
             }
-            TaskCommand::Children { parent_task_id } => {
+            TaskCommand::Children {
+                parent_task_id,
+                limit,
+                after,
+            } => {
                 if database.get_task(parent_task_id)?.is_none() {
                     bail!("Parent task #{parent_task_id} does not exist");
                 }
-                let children = database.children_for_parent(parent_task_id)?;
+                let page = database.children_for_parent_page(parent_task_id, after, limit)?;
                 if cli.json {
-                    print_json(&json!({
-                        "parent_task_id": parent_task_id,
-                        "children": children,
-                    }))?;
-                } else if children.is_empty() {
+                    print_json(&page)?;
+                } else if page.children.is_empty() && after == 0 {
                     println!("Task #{parent_task_id} has no child tasks.");
+                } else if page.children.is_empty() {
+                    println!("No more child tasks for task #{parent_task_id}.");
                 } else {
-                    for child in children {
+                    for child in &page.children {
                         println!(
                             "Child #{}: allowed paths [{}], timeout {} seconds.",
                             child.child_task_id,
                             child.allowed_paths.join(", "),
                             child.timeout_ms / 1_000,
+                        );
+                    }
+                    if let Some(next_after) = page.next_after {
+                        println!(
+                            "More child tasks are available: `talos task children {parent_task_id} --after {next_after} --limit {limit}`."
                         );
                     }
                 }
@@ -372,15 +388,22 @@ pub async fn run(cli: Cli) -> Result<()> {
                         })?;
                     print_task_worktree(cli.json, "created", &record, &database)?;
                 }
-                TaskWorktreeCommand::List => {
-                    let worktrees = worktree::list(&database)?;
+                TaskWorktreeCommand::List { limit, after } => {
+                    let page = worktree::list(&database, after, limit)?;
                     if cli.json {
-                        print_json(&json!({ "worktrees": worktrees }))?;
-                    } else if worktrees.is_empty() {
+                        print_json(&page)?;
+                    } else if page.worktrees.is_empty() && after == 0 {
                         println!("No TALOS-managed task worktrees.");
+                    } else if page.worktrees.is_empty() {
+                        println!("No more TALOS-managed task worktrees.");
                     } else {
-                        for record in worktrees {
+                        for record in &page.worktrees {
                             print_task_worktree(false, "", &record, &database)?;
+                        }
+                        if let Some(next_after) = page.next_after {
+                            println!(
+                                "More worktrees are available: `talos task worktree list --after {next_after} --limit {limit}`."
+                            );
                         }
                     }
                 }

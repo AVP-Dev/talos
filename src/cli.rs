@@ -184,6 +184,12 @@ pub enum TaskCommand {
     Dependencies {
         /// ID of the dependent task.
         task_id: i64,
+        /// Maximum prerequisites to print, from 1 through 100.
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+        /// Continue after this prerequisite task ID.
+        #[arg(long, default_value_t = 0)]
+        after: i64,
     },
     /// Create a bounded child task and make its parent wait for completion.
     Child {
@@ -205,6 +211,12 @@ pub enum TaskCommand {
     Children {
         /// ID of the parent task.
         parent_task_id: i64,
+        /// Maximum child contracts to print, from 1 through 10.
+        #[arg(long, default_value_t = 5)]
+        limit: usize,
+        /// Continue after this child task ID.
+        #[arg(long, default_value_t = 0)]
+        after: i64,
     },
     /// Print a compact, read-only context packet for continuing a task in a new session.
     Handoff {
@@ -297,8 +309,15 @@ pub enum TaskWorktreeCommand {
         /// ID of the queued task.
         task_id: i64,
     },
-    /// List TALOS-managed task worktrees.
-    List,
+    /// List one bounded page of TALOS-managed task worktrees.
+    List {
+        /// Maximum worktrees to print, from 1 through 100.
+        #[arg(long, default_value_t = 25)]
+        limit: usize,
+        /// Continue after this task ID.
+        #[arg(long, default_value_t = 0)]
+        after: i64,
+    },
     /// Reconcile a recorded worktree after an interrupted lifecycle operation.
     Reconcile {
         /// ID of the task whose worktree should be reconciled.

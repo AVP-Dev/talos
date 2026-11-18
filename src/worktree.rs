@@ -80,8 +80,8 @@ pub fn create(
     )
 }
 
-pub fn list(database: &Database) -> Result<Vec<TaskWorktreeRecord>> {
-    database.task_worktrees()
+pub fn list(database: &Database, after: i64, limit: usize) -> Result<crate::db::TaskWorktreePage> {
+    database.task_worktrees_page(after, limit)
 }
 
 pub fn execution_project(project: &Project, database: &Database, task_id: i64) -> Result<Project> {

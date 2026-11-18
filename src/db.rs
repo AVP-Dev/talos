@@ -22,6 +22,7 @@ const MAX_CHILD_TASK_SCOPE_BYTES: usize = 16 * 1024;
 const MIN_CHILD_TASK_TIMEOUT_MS: i64 = 1_000;
 const MAX_CHILD_TASK_TIMEOUT_MS: i64 = 30 * 60 * 1_000;
 const MAX_TASK_LIST_PAGE_SIZE: usize = 100;
+const MAX_CHILD_LIST_PAGE_SIZE: usize = 10;
 const MAX_HISTORY_PAGE_SIZE: usize = 100;
 const MAX_REOPENED_TASK_IDS_IN_EVENT: usize = 50;
 const MAX_WAITING_TASK_PREVIEW: usize = 25;
@@ -77,6 +78,35 @@ pub struct TaskSummaryRecord {
 #[derive(Clone, Debug, Serialize)]
 pub struct TaskListPage {
     pub tasks: Vec<TaskSummaryRecord>,
+    pub after: i64,
+    pub limit: usize,
+    pub has_more: bool,
+    pub next_after: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TaskDependencyPage {
+    pub task_id: i64,
+    pub dependencies: Vec<TaskDependencyRecord>,
+    pub after: i64,
+    pub limit: usize,
+    pub has_more: bool,
+    pub next_after: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct ChildTaskContractPage {
+    pub parent_task_id: i64,
+    pub children: Vec<ChildTaskContract>,
+    pub after: i64,
+    pub limit: usize,
+    pub has_more: bool,
+    pub next_after: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct TaskWorktreePage {
+    pub worktrees: Vec<TaskWorktreeRecord>,
     pub after: i64,
     pub limit: usize,
     pub has_more: bool,
@@ -733,6 +763,54 @@ impl Database {
             .context("Cannot list child-task contracts")
     }
 
+    pub fn children_for_parent_page(
+        &self,
+        parent_task_id: i64,
+        after: i64,
+        limit: usize,
+    ) -> Result<ChildTaskContractPage> {
+        if parent_task_id <= 0 || after < 0 || !(1..=MAX_CHILD_LIST_PAGE_SIZE).contains(&limit) {
+            bail!(
+                "Child task pages require a positive parent ID, a non-negative cursor, and a limit from 1 to 10"
+            );
+        }
+        let query_limit = i64::try_from(
+            limit
+                .checked_add(1)
+                .context("Child task page limit is out of range")?,
+        )
+        .context("Child task page limit is out of range")?;
+        let mut statement = self.connection.prepare(
+            "SELECT child_task_id, parent_task_id, allowed_paths_json, timeout_ms, created_at_ms
+             FROM child_task_contracts
+             WHERE parent_task_id = ?1 AND child_task_id > ?2
+             ORDER BY child_task_id LIMIT ?3",
+        )?;
+        let mut children = statement
+            .query_map(
+                params![parent_task_id, after, query_limit],
+                map_child_task_contract,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = children.len() > limit;
+        if has_more {
+            children.pop();
+        }
+        let next_after = if has_more {
+            children.last().map(|child| child.child_task_id)
+        } else {
+            None
+        };
+        Ok(ChildTaskContractPage {
+            parent_task_id,
+            children,
+            after,
+            limit,
+            has_more,
+            next_after,
+        })
+    }
+
     pub fn begin_task_worktree(
         &mut self,
         task_id: i64,
@@ -856,6 +934,42 @@ impl Database {
             .query_map([], map_task_worktree)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("Cannot list task worktrees")
+    }
+
+    pub fn task_worktrees_page(&self, after: i64, limit: usize) -> Result<TaskWorktreePage> {
+        if after < 0 || !(1..=MAX_TASK_LIST_PAGE_SIZE).contains(&limit) {
+            bail!("Worktree pages require a non-negative cursor and a limit from 1 to 100");
+        }
+        let query_limit = i64::try_from(
+            limit
+                .checked_add(1)
+                .context("Worktree page limit is out of range")?,
+        )
+        .context("Worktree page limit is out of range")?;
+        let mut statement = self.connection.prepare(
+            "SELECT task_id, worktree_path, branch_name, base_commit, state,
+                    created_at_ms, updated_at_ms, retired_at_ms, writer_routed_at_ms
+             FROM task_worktrees WHERE task_id > ?1 ORDER BY task_id LIMIT ?2",
+        )?;
+        let mut worktrees = statement
+            .query_map(params![after, query_limit], map_task_worktree)?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = worktrees.len() > limit;
+        if has_more {
+            worktrees.pop();
+        }
+        let next_after = if has_more {
+            worktrees.last().map(|worktree| worktree.task_id)
+        } else {
+            None
+        };
+        Ok(TaskWorktreePage {
+            worktrees,
+            after,
+            limit,
+            has_more,
+            next_after,
+        })
     }
 
     pub fn update_task_worktree_state(
@@ -1714,6 +1828,59 @@ impl Database {
             .query_map([task_id], map_task_dependency_record)?
             .collect::<rusqlite::Result<Vec<_>>>()
             .context("Cannot list task dependencies")
+    }
+
+    pub fn task_dependencies_page(
+        &self,
+        task_id: i64,
+        after: i64,
+        limit: usize,
+    ) -> Result<TaskDependencyPage> {
+        if task_id <= 0 || after < 0 || !(1..=MAX_TASK_LIST_PAGE_SIZE).contains(&limit) {
+            bail!(
+                "Dependency pages require a positive task ID, a non-negative cursor, and a limit from 1 to 100"
+            );
+        }
+        let query_limit = i64::try_from(
+            limit
+                .checked_add(1)
+                .context("Dependency page limit is out of range")?,
+        )
+        .context("Dependency page limit is out of range")?;
+        let mut statement = self.connection.prepare(
+            "SELECT edges.task_id, edges.depends_on_task_id, tasks.status, integrations.state
+             FROM task_dependencies AS edges
+             JOIN tasks ON tasks.id = edges.depends_on_task_id
+             LEFT JOIN task_worktree_integrations AS integrations
+               ON integrations.task_id = tasks.id
+             WHERE edges.task_id = ?1 AND edges.depends_on_task_id > ?2
+             ORDER BY edges.depends_on_task_id LIMIT ?3",
+        )?;
+        let mut dependencies = statement
+            .query_map(
+                params![task_id, after, query_limit],
+                map_task_dependency_record,
+            )?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let has_more = dependencies.len() > limit;
+        if has_more {
+            dependencies.pop();
+        }
+        let next_after = if has_more {
+            dependencies
+                .last()
+                .map(|dependency| dependency.prerequisite_task_id)
+        } else {
+            None
+        };
+        Ok(TaskDependencyPage {
+            task_id,
+            dependencies,
+            after,
+            limit,
+            has_more,
+            next_after,
+        })
     }
 
     pub fn task_dependency_summary(
