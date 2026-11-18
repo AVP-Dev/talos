@@ -88,7 +88,7 @@ Each round ends with a usable, verifiable result, an updated backlog, and a sess
 | R6 | Persistent runtime and recovery | In progress: T6.1 adds a project-scoped tmux control shell; T6.2 adds durable pause/resume and manual-change reconciliation; T6.3 adds cooperative stop and safer recovery; T6.4 SSH reconnect and T6.5 Linux identity/server acceptance remain open. R6.3 behavior/profile verification is pending. |
 | R7 | Decomposition and parallel work | In progress: T7.1 dependency scheduling and T7.2 child-task contracts are implemented with behavior checks pending; T7.3 capability reporting is implemented but native delegation remains unverified; T7.4 adds explicit task worktree lifecycle management; T7.5 adds Writer routing and evidence-gated integration. Behavior and migration acceptance remain open. |
 | R8 | GitHub workflow | In progress: T8.1 adds local `gh` capability reporting and an explicitly requested aggregate auth check. T8.2 implements policy-gated exact branch push, durable reconciliation, and draft PR creation. T8.3 records commit-bound CI snapshots with bounded polling. Remote behavior awaits the user's repository. No automatic merge. |
-| R9 | Hardening and release | Resilience, long-running checks, macOS install/update/uninstall, complete operator documentation, and Linux build/runtime/package acceptance. |
+| R9 | Hardening and release | In progress: T9.1 scenario inventory, T9.3 macOS install/package preparation, T9.4 operator documentation, and T9.5 macOS artifact packaging are underway. Runtime scenarios, install acceptance, reproducibility, and Linux server gates remain open. |
 
 ### R0 — completed foundation
 
@@ -189,13 +189,15 @@ Start with a dependency DAG and bounded child tasks. Use native subagents only w
 
 ### R8 — GitHub
 
-Use `gh` or another supported official GitHub interface after a dedicated capability/security review. Create a feature branch and PR, include report/evidence, and wait for CI. Do not include local push/PR in a general allowlist without an explicit configured policy. TALOS never auto-merges.
+T8.1–T8.4 implement local `gh` diagnostics, explicit auth checking, policy-gated one-branch push, draft PR creation, durable reconciliation, commit-bound CI snapshots, and a manual merge boundary. The CLI has not contacted GitHub in this workspace. The user will provide the repository before live access, push, PR, or CI acceptance is attempted.
 
-**Exit criteria:** end-to-end PR workflow completes after CI and saves the link; merge remains a user decision.
+**Exit criteria:** a user-provided repository completes the end-to-end PR/CI workflow and saves evidence. Merge and remote branch deletion remain user operations.
 
 ### R9 — Reliability and release
 
 For macOS, run clean installation, upgrade, diagnostics, long-running and fault-injection runs, process-loss scenarios, and incomplete-write recovery without destroying the last good database. Implement Linux-specific paths incrementally; run native Linux build, runtime, and package acceptance on the user's server when local setup would slow development. Document SSH, manual takeover, access policy, CLI limitations, and backups. Produce binaries only after reproducible builds and packaging checks for the platform being released.
+
+Current preparation includes the 15-scenario inventory, a Cargo-based install/update/uninstall runbook, an ARM64-default macOS packaging script, a minimum Rust version, and a build manifest/checksum format. No artifact has been built from the current committed source yet. Byte-for-byte reproducibility and install lifecycle acceptance remain pending. Linux artifact packaging waits for native T6.5 acceptance.
 
 **Exit criteria:** clean install on supported systems; acceptance scenarios pass with evidence; documentation matches actual supported CLI versions; no unverified feature is enabled.
 
@@ -221,4 +223,4 @@ Implementation details may change based on experiments. Preserve invariants and 
 
 ## 8. Current continuation point
 
-R3–R5 are closed. T6 and T7 code are implemented in part, with behavior and platform acceptance gates recorded in `docs/state.md`. R8 code is implemented locally: T8.1–T8.3 acceptance awaits the user's repository, and T8.4 keeps merge/deletion manual. Continue to R9.1 preparation without creating a repository, adding a remote, or invoking GitHub. Linux-specific checks remain deferred until server access.
+R3–R5 are closed. T6 and T7 code are implemented in part, with behavior and platform acceptance gates recorded in `docs/state.md`. R8 code is implemented locally: T8.1–T8.3 acceptance awaits the user's repository, and T8.4 keeps merge/deletion manual. Continue R9.3/R9.5 macOS packaging preparation and complete the R9.4 doc audit without creating a repository, adding a remote, or invoking GitHub. Linux-native checks and artifacts remain deferred until server acceptance.

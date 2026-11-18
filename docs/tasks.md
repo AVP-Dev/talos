@@ -129,11 +129,11 @@ Dependency: R6–R8.
 
 | ID | Status | Task | Exit criteria |
 |---|---|---|---|
-| T9.1 | planned | Run the end-to-end scenarios from the original request | Each of the 15 scenarios has a result and evidence; untested cases are explicit. |
+| T9.1 | in progress | Run the end-to-end scenarios from the original request | `docs/acceptance-scenarios.md` maps all 15 scenarios and separates prior evidence, unverified behavior, and deferred infrastructure. Current-schema execution remains pending. |
 | T9.2 | planned | Run long-duration/load and fault-injection checks | Memory/log limits, stuck children, and incomplete writes do not destroy working state. |
-| T9.3 | planned | Prepare macOS install/upgrade/uninstall and Linux packages | Verify macOS install/upgrade/uninstall without deleting `.talos` unless explicitly requested. Complete reproducible Linux build, runtime, and package support after T6.5; use the user's server for native checks when local Linux setup would slow development, and do not claim verified Linux support before those checks pass. |
-| T9.4 | planned | Finish English documentation and operator runbook | Commands and limits match the binary and locally supported CLI versions. |
-| T9.5 | planned | Build release artifacts | Produce reproducible initial macOS artifacts. Add reproducible Linux artifacts only after Linux build/runtime/package support passes T6.5/T9.3. |
+| T9.3 | in progress | Prepare macOS install/upgrade/uninstall and Linux packages | `docs/operator-runbook.md` documents Cargo install/update/uninstall without touching project state. `scripts/package-macos.sh` creates target-specific binaries and checksums. Install lifecycle acceptance remains pending; Linux packages wait for T6.5 server acceptance. |
+| T9.4 | in progress | Finish English documentation and operator runbook | Audit all docs against current commands, limits, platform support, and verification evidence; remote/Linux claims remain explicitly pending. |
+| T9.5 | in progress | Build release artifacts | `rust-version = 1.94`, `--locked` builds, source commit, source date, compiler, and lockfile digest are recorded by `scripts/package-macos.sh`. Byte-for-byte reproducibility is not verified; Linux artifacts wait for T6.5/T9.3 acceptance. |
 
 ## Required end-to-end scenarios from the original request
 

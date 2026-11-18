@@ -4,11 +4,11 @@
 
 ## Current phase
 
-**R6–R8 implementation remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. R7.1–R7.5 code is implemented or in progress, with behavior/migration acceptance still open; native subagent delegation and three-agent acceptance remain unavailable until verified. T8.1 diagnostics, T8.2 publication, and T8.3 commit-bound CI snapshots are implemented locally; T8.4 keeps merge/deletion manual. T8.1–T8.3 command, migration, and remote acceptance remains pending. No GitHub authentication or remote operation has been performed. Linux access and native checks are deferred to the user's server. Backlog count must be recalculated after the current batch.
+**R6–R9 implementation remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. R7.1–R7.5 code is implemented or in progress, with behavior/migration acceptance still open; native subagent delegation and three-agent acceptance remain unavailable until verified. T8.1 diagnostics, T8.2 publication, and T8.3 commit-bound CI snapshots are implemented locally; T8.4 keeps merge/deletion manual. T8.1–T8.3 command, migration, and remote acceptance remains pending. R9.1 now has a 15-scenario evidence inventory; T9.3 macOS install/package preparation, T9.4 documentation, and T9.5 packaging are in progress. No GitHub authentication or remote operation has been performed. Linux access, native checks, and Linux artifacts are deferred to the user's server. Backlog: 41/61 scheduled tasks done (67.2%, unweighted), 15 in progress, 2 planned, and 3 deferred; two unscheduled ideas remain recorded separately.
 
 ## Goal and fixed direction
 
-TALOS is a Rust local CLI orchestrator for installed AI coding CLIs. The target workflow is a durable task queue, one Writer, an independent read-only Critic, real checks, safe recovery, and eventually an optional GitHub PR without automatic merge.
+TALOS is a Rust local CLI orchestrator for installed AI coding CLIs. The target workflow is a durable task queue, one Writer, an independent read-only Critic, real checks, safe recovery, and an optional policy-gated draft GitHub PR with commit-bound CI evidence; merge remains manual.
 
 - Local modular monolith; SQLite WAL is authoritative.
 - Each discovered project owns `<project-root>/.talos/state.sqlite3`; there is no shared/global database.
@@ -324,9 +324,32 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - `talos github policy` now reports `manual_only` merge and `unsupported` remote branch deletion in human and JSON output, even when publication policy is absent.
 - No schema or network operation is required. T8.4 implementation is complete; T8.1–T8.3 live behavior remains pending until the user creates a repository.
 
+## R9.1 progress — end-to-end scenario inventory
+
+- Added `docs/acceptance-scenarios.md` with 15 separate scenarios from the original request. Each row distinguishes recorded historical evidence, partial coverage, unverified work, and infrastructure deferred to the Linux server or hosted GitHub repository.
+- The inventory does not mark prior results as current-schema acceptance. Rerun the applicable scenarios against the release candidate and record exact commands/platform/evidence. No scenario was run while creating the inventory.
+- R9.1 remains in progress; Linux boot, SSH reconnect, native delegation/parallel acceptance, CI, and final closeout criteria remain open.
+
+## R9.4 progress — documentation alignment
+
+- Updated `README.md`, `docs/architecture.md`, `docs/plan.md`, `docs/tasks.md`, `docs/decisions.md`, and this handoff to describe schema v16, T8.1–T8.4 behavior, the manual merge boundary, and live GitHub/Linux limitations.
+- Added the acceptance inventory to the README's project document links. A broader command/platform/verification audit is still in progress.
+
+## R9.3 progress — macOS installation preparation
+
+- Added a runbook with Cargo install, update, and uninstall commands. These operate on the binary installation root and preserve project `.talos/` databases. It also documents backups, recovery, worktrees, GitHub workflow, and current platform limits.
+- Added `scripts/package-macos.sh` for ARM64 by default and optional Intel builds. The script requires a clean committed checkout, builds with `--locked`, records version/target/commit/source date/Rust compiler/Cargo.lock digest, copies README, and writes SHA-256 checksums to ignored `dist/` output.
+- Linux package generation remains after T6.5 native server acceptance; no Linux system was contacted or packaged.
+
+## R9.5 progress — macOS artifact preparation
+
+- Set `rust-version = "1.94"` in `Cargo.toml`; the installed compiler is Rust 1.94.0. An exact `rust-toolchain.toml` pin was removed because rustup tried to sync into the sandbox-protected `~/.rustup` directory. Cargo works with the existing installed toolchain.
+- The macOS package script records the inputs needed to compare builds, but no artifact has yet been generated from the current source and byte-for-byte reproducibility has not been checked. Linux artifacts wait for T6.5/T9.3 acceptance.
+- Script syntax, formatting, Clippy, `cargo check`, and `git diff --check` passed. Automated tests and Linux-native checks were not run.
+
 ## Next action
 
-Commit the T8.3 race/timeout fixes and T8.4 policy output, then proceed to R9.1 hardening/delivery inventory. R8 implementation is locally complete; live CLI and remote acceptance remain pending. T8.2 commits are `efaaa75` and `8728ce4`; T8.3 initial commit is `877ae10`. Do not create a repository, add a remote, or invoke GitHub operations; the user will provide the repository later. R6 gates remain open: T6.3 behavior/profile checks, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 TUI trust/handoff. R7 behavior/migration checks and native delegation acceptance remain open. Skip Linux connection/setup and defer Linux-native checks until the server is available. Keep work local on `master`.
+Commit the R9.1 inventory, R9.3 runbook/package script, and R9.4 documentation updates locally. Then run `scripts/package-macos.sh` to generate one native ARM64 artifact and record its checksum; leave byte-for-byte reproducibility and install lifecycle acceptance pending. R8 implementation is locally complete; live CLI and remote acceptance remain pending. T8.2 commits are `efaaa75` and `8728ce4`; T8.3 is `877ae10`; T8.4 is `6c6ba78`. Do not create a repository, add a remote, or invoke GitHub operations; the user will provide the repository later. R6/R7 behavior acceptance and native delegation gates remain open. Skip Linux connection/setup and defer Linux-native checks/artifacts until the server is available. Keep work local on `master`.
 
 ## Session close checklist
 

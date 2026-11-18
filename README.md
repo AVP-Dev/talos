@@ -59,7 +59,7 @@ Tasks can be linked into a directed acyclic graph. `task depends <TASK> --on <PR
 
 `talos doctor` reports native subagent invocation as advertised only when the installed CLI help exposes its public invocation tool. Otherwise the capability remains untested and native delegation stays disabled until the configured agent roster and a harmless invocation are verified. Manual child tasks remain available.
 
-`talos doctor` checks whether GitHub CLI (`gh`) is locally available and reports its version; it does not check authentication. `talos github status` also avoids a network call by default. Use `talos github status --check-auth` to explicitly check the active GitHub CLI authentication. During that check, `gh` may use its configured credentials. TALOS retains and reports only an aggregate state, discards raw CLI output, never invokes `gh auth token`, and does not parse, store, or expose credential values, login names, or token sources. Repository creation, remote setup, push, and PR operations remain separate and require the appropriate user direction.
+`talos doctor` checks whether GitHub CLI (`gh`) is locally available and reports its version; it does not check authentication. `talos github status` also avoids a network call by default. Use `talos github status --check-auth` to explicitly check the active GitHub CLI authentication. During that check, `gh` may use its configured credentials. TALOS retains and reports only an aggregate state, discards raw CLI output, never invokes `gh auth token`, and does not parse, store, or expose credential values, login names, or token sources. TALOS does not create the hosted repository or configure the remote. `publish` and `ci` require the user's explicit repository policy; live commands remain unverified until the repository exists.
 
 `talos github policy` shows the local publication policy. A schema-v3 `.talos/config.json` may include a `github` object with an `owner/repository`, remote name, `master` base, `talos/` feature prefix, and explicit `allow_push` / `allow_pull_request` flags. Both external-action flags default to false. It reports that merge is `manual_only` and remote branch deletion is `unsupported`. TALOS has no merge or remote branch deletion command. `talos github branch create <slug>` creates and switches to a clean local feature branch from `master`; it does not contact GitHub or push.
 
@@ -135,9 +135,11 @@ Example check configuration:
 
 ## Project documents
 
+- [Operator runbook](docs/operator-runbook.md)
 - [Plan and rounds](docs/plan.md)
 - [Task backlog](docs/tasks.md)
 - [Current status and session handoff](docs/state.md)
+- [End-to-end acceptance scenarios](docs/acceptance-scenarios.md)
 - [Architecture](docs/architecture.md)
 - [Design manifest](docs/design-manifest.md)
 - [Decisions](docs/decisions.md)
@@ -145,4 +147,4 @@ Example check configuration:
 - [pair-mailbox assessment matrix](docs/research/pair-mailbox-assessment.md)
 - [CLI research and unverified limits](docs/research/cli-spike.md)
 
-TALOS targets Rust stable. macOS is the verified development and runtime platform. Implement Linux-specific paths as their planned tasks are reached; defer checks that need a Linux environment to the user's server. Do not describe Linux as verified before that acceptance passes. R5 adds interactive Semi approval for Writer launch, automated project checks, and evidence-gated completion.
+TALOS targets Rust stable 1.94 or newer. macOS is the verified development and runtime platform. Implement Linux-specific paths as their planned tasks are reached; defer checks that need a Linux environment to the user's server. Do not describe Linux as verified before that acceptance passes. R5 added interactive Semi approval for Writer launch, automated project checks, and evidence-gated completion.
