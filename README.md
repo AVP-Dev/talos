@@ -55,7 +55,7 @@ curl -fsSL https://talos.avpdev.com/install.sh | bash
 ### Homebrew (macOS)
 
 ```sh
-brew install AVP-Dev/tap/talos
+brew install AVP-Dev/apps/talos
 ```
 
 ### From Source (Cargo)
