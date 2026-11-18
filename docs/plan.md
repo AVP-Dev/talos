@@ -312,13 +312,24 @@ Transform TALOS into a genuinely collaborative autonomous engineering team with 
 
 **Exit criteria:** A clean checkout stays clean after local setup and task reporting. Existing Git changes and missing agents have actionable recovery messages. Confirming a draft launches only that task. Two consecutive runs use fresh provider conversations, preserve results in History, and show the earlier Git changes in the cockpit. Stable releases generate a formula from the published archive checksums. Cross-repository tap proposals require explicit repository configuration or dispatch.
 
+### R19 — Resilient CLI Discovery, Adaptive Orchestration, Input History, and Slash Command Palette
+
+**Outcome:** Fix brittle version lock-in so CLI updates never hide adapters; provide smart dynamic orchestration between Pair and Team; deliver terminal-grade input history navigation; and provide an interactive slash-command palette.
+
+- **Resilient CLI Discovery:** In `src/app.rs`, decouple `Agy` availability from strict `"1.5.10"` equality using `is_verified_agy_version` and executable presence, ensuring `agy 1.5.11+` remains discoverable and selectable in Cockpit.
+- **Smart Adaptive Orchestration (`adaptive`):** Add `OrchestrationMode::Adaptive` as the intelligent default. Pre-flight triage classifies scope: simple tasks execute automatically via fast Pair mode, while complex tasks escalate to Team mode.
+- **TUI Input History ($\uparrow / \downarrow$):** Maintain Readline command history in Cockpit; navigating with $\uparrow / \downarrow$ scrolls through previous prompts and commands.
+- **Interactive Slash Command Palette (`/` Popup):** Typing `/` in the input bar opens an interactive floating menu with real-time filtering, descriptions, and arrow/Tab/Enter selection.
+
+**Exit criteria:** `agy 1.5.11+` is discoverable in TUI Settings and `/cli`; adaptive mode auto-selects Pair or Team based on complexity; $\uparrow / \downarrow$ scrolls input history; `/` triggers interactive command palette; all tests pass clean.
+
 ## 6. Dependency order
 
 ```text
 R0 → R1 → R2 → R3 → R4 → R5
                          └──→ R6
 R5 + R6 → R7 → R8 → R9
-R6 + R7 + R8 + R9 → R10 → R11 → R12 → R13 → R14 → R15 → R16 → R17
+R6 + R7 + R8 + R9 → R10 → R11 → R12 → R13 → R14 → R15 → R16 → R17 → R18 → R19
 ```
 
 Implementation details may change based on experiments. Preserve invariants and acceptance checks; update `docs/decisions.md`, `docs/tasks.md`, and `docs/state.md` when scope changes materially.

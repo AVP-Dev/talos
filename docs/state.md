@@ -4,7 +4,15 @@
 
 ## Current phase
 
-**v0.1.1 is published. The source branch includes a follow-up for narrow terminal panes.** Project selection, role and model settings, explicit task confirmation, actionable blockers, input editing, task history and saved changes, and fresh cockpit sessions are implemented. Reports are stored per task below `.talos/reports/`. A clean Git checkout remains clean after first-run setup and successful task completion.
+**Current phase is Round 18 closed, ADR-052 accepted by the user, and Round 19 planned for Resilient CLI Discovery, Adaptive Orchestration, Input History, and Slash Command Palette.**
+
+Key user-directed requirements recorded in **ADR-052**:
+1. **Resilient CLI Discovery vs. Brittle Version Pinning:** Decouple `Agy` detection in Cockpit (`src/app.rs:5580`) from exact `"1.5.10"` equality. Updating installed CLIs must never cause adapters to vanish from the TUI.
+2. **Smart Adaptive Orchestration (`adaptive`):** Auto-route tasks based on pre-flight triage: lightweight Pair mode for simple/local tasks, escalating to Team mode for multi-file/complex tasks.
+3. **Readline Input History ($\uparrow / \downarrow$):** In-memory prompt history in Cockpit with arrow-key navigation.
+4. **Interactive Slash Command Palette (`/` Popup):** Floating command picker overlay triggering upon `/` with live filtering and autocompletion.
+
+Next action: execute Round 19 tasks (**T19.1 — T19.4**). All 173 tests pass clean (`./scripts/verify-project.sh`).
 
 Verification on macOS Apple Silicon:
 

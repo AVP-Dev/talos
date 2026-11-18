@@ -489,3 +489,27 @@ No schema change for process identity is selected or implemented. The separate s
 - **Decision:** The cockpit shows project readiness, role settings, a reviewable task draft, and task history. Confirmation dispatches only the selected task. A new cockpit session clears the draft and feed, keeps project settings and durable history, and never resumes a previous provider conversation implicitly.
 - **Invariants:** Automatic startup and reports leave tracked project files untouched. Existing dirty paths still block a new run. Queue cancellation and dispatch must remain consistent under concurrent processes. A CLI found locally does not prove authentication. Release automation proposes tap changes only after the release binaries exist.
 - **Failure cases:** Show missing tools, invalid project state, checkout changes, launch failures, and failed checks with an action the operator can take. A failed start keeps the queued task available for an explicit retry or cancellation.
+
+## ADR-052 — Resilient CLI Version Tolerance, Adaptive Orchestration, Input History, and Slash Command Palette
+
+- **Status:** accepted by the user.
+- **Decision:** implement four ergonomic and architectural enhancements in Round 18:
+  1. **Resilient CLI Detection vs. Brittle Version Pinning:**
+     - Pinning an exact minor/patch CLI version string (such as `VERIFIED_AGY_WRITE_VERSION = "1.5.10"`) is explicitly identified as an anti-pattern: updating a local CLI must never cause the adapter to vanish from the TUI Cockpit or command palette.
+     - Decouple TUI discovery from rigid version equality. Adopt the standard multi-adapter pattern: if the binary is present and satisfies baseline headless compatibility (e.g. `is_verified_agy_version` or `--version` check), keep it available and selectable in TUI and `/cli`.
+  2. **Smart Adaptive Orchestration (`OrchestrationMode::Adaptive`):**
+     - Introduce `adaptive` orchestration mode as the primary intelligent workflow.
+     - Instead of forcing the operator to choose between rigid `pair` or `team` upfront, TALOS evaluates task scope through pre-flight triage:
+       - **Local / Trivial / Single-file tasks** automatically execute via the fast, lightweight **Pair** pipeline (no extra worktrees, no planning delay, minimal token overhead).
+       - **Complex / Multi-file / Architectural tasks** automatically escalate to the **Team** pipeline (Writer Lead decomposition, parallel worktree workers, Critic specialized audits, and rebuttal deliberation).
+     - Manual overrides (`--mode pair`, `--mode team`) remain fully supported for deterministic user control.
+  3. **TUI Input Readline History (Arrow Keys $\uparrow / \downarrow$):**
+     - Maintain an in-memory input history buffer (`Vec<String>`) in `TuiApp`.
+     - Submitting a prompt via `Enter` appends it to the history (skipping duplicate consecutive entries).
+     - When the cursor is in the input box, pressing `Up` navigates backward through previous tasks and commands, while `Down` navigates forward and restores any unsaved draft at the bottom.
+  4. **Interactive Slash Command Palette (`/` Popup Menu):**
+     - When the input line begins with `/`, open an interactive floating palette overlay directly above the input bar.
+     - Render available slash commands (`/cli`, `/mode`, `/task:test`, `/task:refactor`, `/task:fix`, `/task:bench`, `/diff`, `/feed`, `/audit`, `/commit`, `/stop`, `/pause`, `/resume`, `/help`) with brief descriptions.
+     - Support real-time fuzzy/prefix filtering as the user types, with single-key arrow navigation ($\uparrow / \downarrow$) and autocomplete on `Tab` or `Enter`.
+- **Reason:** user feedback confirmed that vanishing adapters after CLI updates is a defect/bad practice, requested terminal-grade command history ($\uparrow / \downarrow$), an interactive slash-command picker, and clarified that TALOS should intelligently choose between Pair and Team modes dynamically.
+- **Consequence:** Round 18 addresses these four items. Core durability, SQLite schema v19, and Git isolation remain unchanged.

@@ -228,6 +228,16 @@ Dependency: R6–R8.
 | T18.6 | done | Reconciled public docs with the CLI and cockpit. Captured Settings and task review screenshots and an animated walkthrough. Added versioned v0.1.1 release notes consumed by the release workflow. |
 | T18.7 | done | Live Feed wraps to its pane width, with visual-row scrolling. Input, drafts, review and diff views adapt to narrower terminals. Verified with automated rendering tests and Agterm with its sidebar open. |
 
+## R19 — Resilient CLI Discovery, Adaptive Orchestration, Input History, and Slash Command Palette
+**Status:** planned. Decoupling CLI detection from brittle version strings, smart auto-orchestration between Pair and Team, Readline-grade input history, and interactive command popup palette.
+
+| ID | Status | Task | Exit criteria |
+|---|---|---|---|
+| T19.1 | planned | Resilient Agy CLI detection without brittle version locking | In `src/app.rs:5580`, decouple `adapter_role_status` and cockpit availability from rigid `"1.5.10"` equality. Use `is_verified_agy_version` and executable probing so `agy 1.5.11+` remains available in TUI and `/cli`. |
+| T19.2 | planned | Smart Adaptive Orchestration Mode (`mode: adaptive`) | Add `OrchestrationMode::Adaptive` as default. Pre-flight triage classifies scope: simple/local tasks execute automatically via lightweight Pair mode, complex/multi-file tasks automatically escalate to Team mode. Manual overrides remain available. |
+| T19.3 | planned | TUI Readline input history ($\uparrow / \downarrow$) | Maintain `input_history` buffer in `TuiApp`. Pressing $\uparrow$ scrolls backward through previous prompts/commands, $\downarrow$ scrolls forward, restoring current draft at the bottom. |
+| T19.4 | planned | Interactive Slash Command Palette (`/` popup menu) | Typing `/` in Cockpit input opens a floating palette displaying slash commands (`/cli`, `/mode`, `/task:test`, `/diff`, `/help`, etc.) with real-time prefix filtering and arrow/Tab/Enter selection. |
+
 ## Required end-to-end scenarios from the original request
 
 First launch/repeat `up`; Writer/Critic success and justified rejection; child task; independent parallel work; adding a task while work is running; manual takeover; CLI recovery; orchestrator crash; SSH disconnect/reconnect; Linux reboot autostart; PR without merge; duplicate-execution prevention; and rechecking original acceptance criteria before closeout. Keep separate evidence for each scenario; do not combine them into a misleading test.
