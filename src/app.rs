@@ -2299,10 +2299,19 @@ fn task_handoff_next_action(
         "reviewing" if has_worktree && integration_state.is_none() => format!(
             "Integrate the managed worktree with `talos task worktree integrate {task_id}`, then review the integrated revision."
         ),
+        "reviewing" if integration_state == Some("applying") => format!(
+            "Inspect both worktrees, then reconcile the interrupted integration with `talos task worktree reconcile {task_id}` before review."
+        ),
         "reviewing" if integration_state == Some("needs_attention") => {
             "Inspect the recorded worktree integration mismatch before continuing.".to_owned()
         }
         "reviewing" => format!("Review the latest revision with `talos task review {task_id}`."),
+        "verifying"
+            if integration_state == Some("applying")
+                || integration_state == Some("needs_attention") =>
+        {
+            "Inspect and reconcile the managed worktree integration before verification.".to_owned()
+        }
         "verifying"
             if has_worktree
                 && integration_state == Some("pending")
