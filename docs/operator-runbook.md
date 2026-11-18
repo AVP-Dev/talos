@@ -54,6 +54,8 @@ Use an existing Git repository with a first commit. Install and configure at lea
 
 **Input editing** — use arrow keys, repeated Backspace, multiline paste, **Ctrl+W** or **Alt+Backspace** to delete a word, and **Esc** to clear the input. In the cockpit, `/pause`, `/resume`, `/stop`, `/help` and `/exit` are also available.
 
+**Narrow terminals** — the current source build wraps the Live Feed within its own panel, including when the terminal sidebar is open. Use ↑ and ↓ to scroll, Home for older output, and End to follow new output. Long drafts, diffs and results also wrap. The published v0.1.1 binary predates the pane wrapping fix.
+
 ## Configure project checks
 
 Set checks before you confirm a task so the review screen can show the commands. From a normal shell, for a Rust project:

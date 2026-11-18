@@ -23,7 +23,7 @@
   <img src="docs/media/cockpit.png" width="960" alt="TALOS Unified Feed, with Writes and Reviews roles, the task queue and the command line in Agterm">
 </div>
 
-<p align="center"><sub>TALOS v0.1.1 cockpit in Agterm, shown in Pair mode.</sub></p>
+<p align="center"><sub>TALOS cockpit in Agterm, shown in Pair mode.</sub></p>
 
 ## Install
 

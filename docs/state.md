@@ -4,18 +4,18 @@
 
 ## Current phase
 
-**The R18 cockpit, public guides and release notes are prepared for v0.1.1.** Project selection, role and model settings, explicit task confirmation, actionable blockers, input editing, task history and saved changes, and fresh cockpit sessions are implemented. Reports are stored per task below `.talos/reports/`. A clean Git checkout remains clean after first-run setup and successful task completion.
+**v0.1.1 is published. The source branch includes a follow-up for narrow terminal panes.** Project selection, role and model settings, explicit task confirmation, actionable blockers, input editing, task history and saved changes, and fresh cockpit sessions are implemented. Reports are stored per task below `.talos/reports/`. A clean Git checkout remains clean after first-run setup and successful task completion.
 
 Verification on macOS Apple Silicon:
 
 - `./scripts/verify-project.sh` passed. It ran `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --locked --all-targets` (169 passed, 2 ignored), `cargo build --locked --release`, and `./scripts/security-scan.sh`. The sandbox emitted Apple toolchain cache warnings during linking without failing the checks.
 - A disposable macOS pseudo-terminal ran `target/release/talos` with local fixture executables for Codex and Claude. It selected a project from outside its checkout, changed settings, rejected an uncommitted file without queuing the draft, ran two explicitly selected tasks in one TUI, rejected any implicit provider resume flags, opened the earlier Git diff in History, canceled the older queued task explicitly, and displayed sign-in guidance after a fixture authentication error. Git stayed clean after both successful tasks and the setup did not create a tracked ignore rule.
 - `bash -n install.sh` and `bash -n scripts/render-homebrew-formula.sh` passed. A local release archive exercised installation and atomic replacement. A checksum mismatch preserved the installed binary. The formula generator produced valid Ruby for four fixture archives and rejected a tampered archive. The release workflow YAML parsed locally.
-- GitHub Actions and the external Homebrew tap have not been run for this release. Live provider authentication and an Agterm key repeat walkthrough were not exercised. The local Agterm socket was unavailable to the sandbox. Repeat and Unicode editing passed automated tests.
+- [The v0.1.1 release workflow](https://github.com/AVP-Dev/talos/actions/runs/44407320497) completed successfully and published four archives, four checksum files and the generated formula. The downloaded Apple Silicon archive matched its SHA-256 file and reported version 0.1.1. The external Homebrew tap has its own release lifecycle. Live provider authentication remains separate from fixture evidence.
 
-The public README, architecture and operator guide were checked against the current CLI and terminal flow. The archived website architecture still describes the initial Agy-only milestone. The current repository includes seven adapters. The [versioned release description](releases/v0.1.1.md) ships with the tagged source. The terminal assets in `docs/media/` were captured from the built binary with local fixture agents and a real, configured project check.
+The public README, architecture and operator guide were checked against the current CLI and terminal flow. The archived website architecture still describes the initial Agy-only milestone. The current repository includes seven adapters. The [versioned release description](releases/v0.1.1.md) ships with the tagged source. The terminal assets in `docs/media/` are native Agterm captures from the current source build. The demo uses local fixture agents and a real configured project check.
 
-**Release verification:** After publishing the tag, use the release workflow to verify all four archives and the generated Homebrew formula. The published tap and website have separate update lifecycles.
+**Cockpit follow-up:** The Live Feed renders wrapped rows to the available width, and autoscroll follows the last rendered row. The input editor, drafts, diff, dialogue and checks also adapt to narrow panes. Verified the complete Feed message in Agterm with its sidebar visible, and ran `./scripts/verify-project.sh` again on the follow-up build (173 tests passed, 2 ignored). The published tag continues to identify the original v0.1.1 binaries. The tap and website are separate.
 
 ## R17 closure
 

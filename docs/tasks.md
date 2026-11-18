@@ -224,8 +224,9 @@ Dependency: R6–R8.
 | T18.2 | done | Settings opens from the cockpit, with separate roles, models and orchestration mode. Agent discovery uses the current user's installation. |
 | T18.3 | done | Draft review, explicit single-task dispatch, blocker guidance, task-specific retries and queued cancellation. |
 | T18.4 | done | Unicode input editing, repeated deletion, paste, fresh sessions and durable task history with saved changes. |
-| T18.5 | implemented | Release version 0.1.1, four build targets, checksum-bound formula generation and opt-in tap PR. GitHub Actions and the external tap require release-time validation. |
+| T18.5 | published | GitHub release v0.1.1 contains four binary archives, matching SHA-256 files and a generated formula. The external tap has its own release lifecycle. |
 | T18.6 | done | Reconciled public docs with the CLI and cockpit. Captured Settings and task review screenshots and an animated walkthrough. Added versioned v0.1.1 release notes consumed by the release workflow. |
+| T18.7 | done | Live Feed wraps to its pane width, with visual-row scrolling. Input, drafts, review and diff views adapt to narrower terminals. Verified with automated rendering tests and Agterm with its sidebar open. |
 
 ## Required end-to-end scenarios from the original request
 
