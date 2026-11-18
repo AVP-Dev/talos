@@ -327,7 +327,7 @@ No schema change for process identity is selected or implemented. The separate s
 
 ## ADR-040 — Reconcile paused task approvals with bounded memory
 
-- **Status:** implementation in progress; transactional behavior acceptance pending.
+- **Status:** implemented in T9.2; transactional behavior acceptance pending.
 - **Invariants:** resume holds an immediate SQLite transaction while it counts verifying tasks, captures at most 50 preview IDs, reopens every verifying task for a fresh Critic review, and appends exactly one task event per changed task. The task update and all task/project control events commit together. The complete count remains available even when the ID preview is truncated.
 - **Decision:** perform the status change and task-event insertion with set-based SQL. Choose a timestamp greater than every existing task `updated_at_ms`, then use that unique timestamp to select exactly the rows changed by the set-based update. Do not materialize all reopened task IDs in Rust memory.
 - **Failure handling:** reject count or timestamp overflow. Compare the update row count with the prior verifying count and the inserted event count with the update count. Any mismatch or SQL/serialization error aborts the transaction; the paused queue and prior task states remain intact.
@@ -336,7 +336,7 @@ No schema change for process identity is selected or implemented. The separate s
 
 ## ADR-041 — Bound Git revision capture before buffering
 
-- **Status:** implementation in progress; behavior acceptance pending.
+- **Status:** implemented in T9.2; behavior acceptance pending.
 - **Invariants:** a Critic revision is either captured in full within the configured patch/path limits or rejected. TALOS never hashes, stores, reviews, or marks an over-limit revision as if it were complete. Path identity remains exact for every accepted revision.
 - **Decision:** stream Git stdout into bounded buffers. Keep the existing 64 KiB patch limit; cap changed paths at 4096 entries, each at 1024 bytes; cap each Git path-list response at 128 KiB and serialized changed-path metadata at 256 KiB. For dirty-base, worktree-removal, and tracked-runtime-state probes, read only enough output to establish that the operation must be rejected. Do not accumulate every status row or path merely to return an error.
 - **Failure handling:** when a capture exceeds its limit or cannot be parsed, terminate and reap the Git child where possible and fail the task operation without truncating the revision or persisting partial evidence. Git status parse failures remain errors rather than a false clean result.
