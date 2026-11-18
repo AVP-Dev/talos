@@ -196,6 +196,7 @@ pub struct TuiApp {
     task_input: Option<(String, usize)>,
     selection: usize,
     available: Vec<AdapterKind>,
+    custom_adapters: bool,
     history: Vec<RecentTask>,
     history_before: Option<i64>,
     history_selection: usize,
@@ -232,10 +233,19 @@ pub struct TuiApp {
 impl TuiApp {
     pub fn new(project: Project) -> Result<Self> {
         let available = available_adapters(&project);
-        Self::with_adapters(project, available)
+        Self::create(project, available, false)
     }
 
+    #[cfg(test)]
     fn with_adapters(project: Project, available: Vec<AdapterKind>) -> Result<Self> {
+        Self::create(project, available, true)
+    }
+
+    fn create(
+        project: Project,
+        available: Vec<AdapterKind>,
+        custom_adapters: bool,
+    ) -> Result<Self> {
         let mut config = if matches!(project.discovery, DiscoveryMethod::Git) {
             ProjectConfig::load(&project)?
         } else {
@@ -284,6 +294,7 @@ impl TuiApp {
             task_input: None,
             selection: 0,
             available,
+            custom_adapters,
             history: Vec::new(),
             history_before: None,
             history_selection: 0,
@@ -920,8 +931,18 @@ impl TuiApp {
         }
     }
 
+    fn refresh_available(&mut self) {
+        if self.custom_adapters {
+            return;
+        }
+        let discovered = available_adapters(&self.project);
+        if !discovered.is_empty() || self.available.is_empty() {
+            self.available = discovered;
+        }
+    }
+
     fn open_settings(&mut self) {
-        self.available = available_adapters(&self.project);
+        self.refresh_available();
         self.draft = None;
         self.settings = Some(self.config.clone());
         self.selection = 0;
@@ -1762,7 +1783,7 @@ impl TuiApp {
                         self.change_setting(true)?
                     }
                     KeyCode::Char('r' | 'R') if !repeat => {
-                        self.available = available_adapters(&self.project);
+                        self.refresh_available();
                         self.notice("Checked for installed agent CLIs.");
                     }
                     _ => {}
@@ -1927,7 +1948,7 @@ impl TuiApp {
     }
 
     fn retry_selected_task(&mut self) -> Result<()> {
-        self.available = available_adapters(&self.project);
+        self.refresh_available();
         self.refresh_state()?;
         anyhow::ensure!(self.can_retry_task(), "The task status changed.");
         if let Some(blocker) = self.run_blocker(self.task_view) {

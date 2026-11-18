@@ -28,6 +28,7 @@ Verification on macOS Apple Silicon:
   3. `cargo test --locked --all-targets` passed (177 passed, 0 failed, 2 ignored).
   4. `cargo build --locked --release` passed.
   5. `./scripts/security-scan.sh` clean.
+- Fixed CI test isolation in `src/tui.rs`: ensured `TuiApp` created with fixture adapters (`with_adapters`) or host probe retains its configured adapters across settings opening (`open_settings`), CLI rescan (`r`), and retry (`retry_selected_task`), avoiding clearing fixture state on bare CI runners lacking installed CLI binaries.
 - Crate version remains 0.1.1 as specified by the user. Ready for git push and tag update.
 
 Verification on macOS Apple Silicon:
