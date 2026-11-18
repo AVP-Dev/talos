@@ -4,7 +4,22 @@
 
 ## Current phase
 
-**Current phase is system audit completed and ADR-050 accepted by the user for Round 17: Autonomous Engineering Team Evolution.**
+**The R18 cockpit, public guides and release notes are prepared for v0.1.1.** Project selection, role and model settings, explicit task confirmation, actionable blockers, input editing, task history and saved changes, and fresh cockpit sessions are implemented. Reports are stored per task below `.talos/reports/`. A clean Git checkout remains clean after first-run setup and successful task completion.
+
+Verification on macOS Apple Silicon:
+
+- `./scripts/verify-project.sh` passed. It ran `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets --all-features -- -D warnings`, `cargo test --locked --all-targets` (169 passed, 2 ignored), `cargo build --locked --release`, and `./scripts/security-scan.sh`. The sandbox emitted Apple toolchain cache warnings during linking without failing the checks.
+- A disposable macOS pseudo-terminal ran `target/release/talos` with local fixture executables for Codex and Claude. It selected a project from outside its checkout, changed settings, rejected an uncommitted file without queuing the draft, ran two explicitly selected tasks in one TUI, rejected any implicit provider resume flags, opened the earlier Git diff in History, canceled the older queued task explicitly, and displayed sign-in guidance after a fixture authentication error. Git stayed clean after both successful tasks and the setup did not create a tracked ignore rule.
+- `bash -n install.sh` and `bash -n scripts/render-homebrew-formula.sh` passed. A local release archive exercised installation and atomic replacement. A checksum mismatch preserved the installed binary. The formula generator produced valid Ruby for four fixture archives and rejected a tampered archive. The release workflow YAML parsed locally.
+- GitHub Actions and the external Homebrew tap have not been run for this release. Live provider authentication and an Agterm key repeat walkthrough were not exercised. The local Agterm socket was unavailable to the sandbox. Repeat and Unicode editing passed automated tests.
+
+The public README, architecture and operator guide were checked against the current CLI and terminal flow. The archived website architecture still describes the initial Agy-only milestone. The current repository includes seven adapters. The [versioned release description](releases/v0.1.1.md) ships with the tagged source. The terminal assets in `docs/media/` were captured from the built binary with local fixture agents and a real, configured project check.
+
+**Release verification:** After publishing the tag, use the release workflow to verify all four archives and the generated Homebrew formula. The published tap and website have separate update lifecycles.
+
+## R17 closure
+
+**Round 17 closed with the user-approved Autonomous Engineering Team Evolution in ADR-050.**
 
 All 7 AI CLI adapters (`agy`, `codex`, `omp`, `pi`, `kilo`, `opencode`, `claude`), TUI Cockpit (`ratatui`/`crossterm`), rate-limit detection with adaptive backoff, deliverable summary artifacts (`TALOS_SUMMARY.md`), `/cli` dynamic configuration, and operator ergonomics (Tab-completion, task presets, diff curation) are verified and operational.
 
@@ -19,7 +34,7 @@ Additionally, ADR-050 mandates:
 - Retaining non-critical Critic findings (`Minor`, `Note`, and out-of-scope files) in persistent backlog storage and `TALOS_SUMMARY.md`.
 - Anti-stagnation loop detection across fix rounds.
 
-**Next action:** Round 17 execution is complete: T17.1 (verification defect fix verified by regression test), T17.2 (resilient normalization of text lengths and line 0), T17.3 (activated Writer Lead deliberation and rebuttal loop in `run_team_task` with ADR-050 architectural invariant that passing tests do not dismiss Critic remarks), T17.4 (recommendation-based pre-flight task triage advising depth and posture without rigid locks), T17.5 (non-critical backlog curation into `TALOS_SUMMARY.md`), and T17.6 (anti-stagnation loop detection across fix rounds in `run_pair_task` and `run_team_task`). Toolchain: stable Rust 1.100.0 (`rust-version = "1.100"` in `Cargo.toml`). `./scripts/verify-project.sh` passes clean (166 tests passed, 0 failures, clippy clean, format clean, release build passed, security scan clean). Ready for user review / next phase.
+**Round 17 completion:** T17.1 (verification defect fix verified by regression test), T17.2 (resilient normalization of text lengths and line 0), T17.3 (activated Writer Lead deliberation and rebuttal loop in `run_team_task` with ADR-050 architectural invariant that passing tests do not dismiss Critic remarks), T17.4 (recommendation-based pre-flight task triage advising depth and posture without rigid locks), T17.5 (non-critical backlog curation into `TALOS_SUMMARY.md`), and T17.6 (anti-stagnation loop detection across fix rounds in `run_pair_task` and `run_team_task`). Toolchain: stable Rust 1.100.0 (`rust-version = "1.100"` in `Cargo.toml`). `./scripts/verify-project.sh` passes clean (166 tests passed, 0 failures, clippy clean, format clean, release build passed, security scan clean). Ready for user review / next phase.
 
 ## Goal and fixed direction
 

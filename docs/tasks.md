@@ -71,7 +71,7 @@ Dependency: R3.
 | T4.3 | done | Run independent review through an available CLI | `task review` uses a fresh Antigravity process without the Writer conversation. A live approval and a live `request_changes` result were schema-validated and tied to exact revision IDs. Process/parse failures never approve. |
 | T4.4 | done | Implement reject → fix → review again | A live Critic finding moved a deliberately defective task to `implementing`; a fake Writer fix created attempt 2 linked to review 1 and kept the original base. Database tests recorded the later approval and confirmed prior review rows cannot be updated or deleted. |
 | T4.5 | done | Keep task open for unresolved findings or an active Writer | Active/unresolved Writer state blocks review; approval moves only to `verifying`, never `complete`. Database tests cover the global active-Writer gate and state transition. |
-| T4.6 | done | Select verified Writer and Critic roles per project | `.talos/config.json` has independent role fields and `doctor` reports them. Both currently resolve only to Agy. This task delivered role selection, not additional CLI adapters; R10 now owns multi-CLI profiles. |
+| T4.6 | done | Select verified Writer and Critic roles per project | `.talos/config.json` has independent role fields and `doctor` reports them. At the R4 milestone both resolved to Agy. This task delivered role selection; R10 now owns multi-CLI profiles. |
 
 ## R5 — Verification evidence and permissions
 
@@ -215,6 +215,17 @@ Dependency: R6–R8.
 | T17.4 | complete | Recommendation-based pre-flight task triage | Read-only analysis of task requirements and repository structure recommending analysis depth and team posture without rigid hardcoded selection rules. |
 | T17.5 | complete | Backlog curation for non-critical findings and technical debt | Capture `Minor` and `Note` findings into persistent backlog storage upon Critic approval; include deferred items in `TALOS_SUMMARY.md`. |
 | T17.6 | complete | Anti-stagnation loop detection across fix rounds | Compare diff hash and verification output across fix iterations; abort futile stagnant loops early without wasting token budgets. |
+
+## R18 — Guided first run and repeatable cockpit sessions
+
+| ID | Status | Outcome |
+|---|---|---|
+| T18.1 | done | Project selection and initial role suggestions. Startup excludes runtime files locally and generated reports are per task. |
+| T18.2 | done | Settings opens from the cockpit, with separate roles, models and orchestration mode. Agent discovery uses the current user's installation. |
+| T18.3 | done | Draft review, explicit single-task dispatch, blocker guidance, task-specific retries and queued cancellation. |
+| T18.4 | done | Unicode input editing, repeated deletion, paste, fresh sessions and durable task history with saved changes. |
+| T18.5 | implemented | Release version 0.1.1, four build targets, checksum-bound formula generation and opt-in tap PR. GitHub Actions and the external tap require release-time validation. |
+| T18.6 | done | Reconciled public docs with the CLI and cockpit. Captured Settings and task review screenshots and an animated walkthrough. Added versioned v0.1.1 release notes consumed by the release workflow. |
 
 ## Required end-to-end scenarios from the original request
 

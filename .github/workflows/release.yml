@@ -98,7 +98,12 @@ jobs:
           else
             bash scripts/render-homebrew-formula.sh "$RELEASE_TAG" archives > talos.rb
             ruby -c talos.rb
-            gh release create "$RELEASE_TAG" --verify-tag --generate-notes archives/* talos.rb
+            notes_path="docs/releases/$RELEASE_TAG.md"
+            notes=(--generate-notes)
+            if [ -f "$notes_path" ]; then
+              notes=(--notes-file "$notes_path")
+            fi
+            gh release create "$RELEASE_TAG" --verify-tag --title "TALOS $RELEASE_TAG" "${notes[@]}" archives/* talos.rb
           fi
       - uses: actions/upload-artifact@v4
         with:

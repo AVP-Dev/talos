@@ -12,7 +12,7 @@ Thank you for your interest in contributing to TALOS! We welcome contributions, 
 
 ### Prerequisites
 
-- Rust stable (1.94 or newer)
+- Rust stable (1.100 or newer)
 - Git (2.38+ for worktree support)
 - SQLite 3 (bundled with `rusqlite`)
 
@@ -28,7 +28,7 @@ cargo fmt --all -- --check
 cargo clippy --locked --all-targets --all-features -- -D warnings
 
 # 3. Run all unit and integration tests
-cargo test --all-targets
+cargo test --locked --all-targets
 
 # 4. Security scan
 ./scripts/security-scan.sh

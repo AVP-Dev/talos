@@ -61,7 +61,7 @@ Deterministic acceptance rules:
 - Persist only the validated structured result and bounded task/revision metadata. Do not persist the full prompt, patch, or CLI transcript in SQLite.
 - The response schema rejects unknown fields, including `patch`; Critic output is findings-only and TALOS has no Critic patch-application route.
 - `request_changes` requires at least one `blocker` or `major` finding on changed files. If Critic requests changes with only non-blocking findings (`minor`, `note`, or out-of-scope), the decision is gracefully downgraded to `approve` with remarks.
-- `approve` is accepted only when no `blocker` or `major` findings remain. `minor`, `note`, and out-of-scope findings are recorded as non-blocking observations and preserved in the task backlog and deliverable summary (`TALOS_SUMMARY.md`).
+- `approve` is accepted only when no `blocker` or `major` findings remain. `minor`, `note`, and out-of-scope findings are recorded as non-blocking observations and preserved in the task backlog and per-task report (`.talos/reports/task-<id>.md`).
 - Passing unit tests provide empirical evidence during deliberation, but do NOT automatically dismiss Critic's architectural concerns.
 - Findings are immutable historical records tied to one revision. A later fix and review create a new record; they do not edit or delete earlier findings.
 - A rejection moves the task back to `implementing`; a valid approval moves it to `verifying`. R5 completion requires separately recorded project-check evidence for this exact approved Git revision.

@@ -47,10 +47,11 @@ Database entities: project/configuration; tasks with acceptance criteria and dep
 
 A rejected review returns the task to `implementing`, with findings attached and the revision incremented. A process failure leaves a recoverable state. On macOS, where a supported public process-identity API has not been confirmed, TALOS quarantines unfinished attempts and requires an auditable operator attestation before recording any resolution authorization. Recovery never uses private `libproc` interfaces, parses `ps`, sends process signals, or retries automatically. Any later action requires its own explicit command. An ambiguous side effect is never repeated automatically.
 
-### CLI surface: implemented and planned commands
+### CLI surface and historical milestones
 
 ```text
-talos up --auto             # implemented in R3: one explicit call processes at most one eligible task
+talos up --auto             # process the runnable queue
+talos up --auto --task <ID> # dispatch one selected runnable task
 talos up --semi             # implemented in R5; prompts before one Writer launch
 talos task add "..."        # add a task with a verifiable goal
 talos task run <ID>         # implemented in R3 for the verified Writer
@@ -83,7 +84,7 @@ Each round ends with a usable, verifiable result, an updated backlog, and a sess
 | R1 | CLI spike | Headless JSON and same-ID resume verified for Antigravity; TUI handoff and native delegation remain deferred. R1 is complete; R3 later verified the write boundary. |
 | R2 | Core and durable state | Buildable Rust CLI, project discovery, SQLite WAL, schema migration, task queue/transitions, event journal, leases, status/doctor. Complete. |
 | R3 | One autonomous Writer | One verified adapter completes one safe local task per explicit `up --auto` invocation from a clean temporary Git project. Complete for the initial macOS target. |
-| R4 | Independent Critic | Read-only review, real blocker finding, denied write probe, linked Writer fix, immutable review history, and role fields. Only `agy` is implemented and accepted; the role fields do not constitute multi-CLI support. |
+| R4 | Independent Critic | Read-only review, real blocker finding, denied write probe, linked Writer fix, immutable review history, and role fields. At this milestone only `agy` had been implemented and accepted. R10 added the other adapters. |
 | R5 | Verification and permissions | Configured checks, exact Git facts, Auto/Semi policy, redaction, and evidence-gated completion. Complete on macOS; see R5 acceptance below. |
 | R6 | Persistent runtime and recovery | In progress: T6.1 adds a project-scoped tmux control shell; T6.2 adds durable pause/resume and manual-change reconciliation; T6.3 adds cooperative stop and safer recovery; T6.6 adds a bounded new-context packet. Process/recovery and macOS SSH behavior acceptance remain open. T6.5 Linux implementation exists; native server acceptance is deferred until access is available. |
 | R7 | Decomposition and parallel work | T7.1–T7.5 implementation includes schema-v18 durable Writer slots and opt-in concurrency up to three distinct managed worktrees. Migration and behavior acceptance remain open; native delegation stays disabled and the three-agent scenario is unverified. |
@@ -305,6 +306,12 @@ Transform TALOS into a genuinely collaborative autonomous engineering team with 
 
 **Exit criteria:** Rebuttal loop functions in team orchestration; brittle formatting bails replaced; verification failure test confirmed; non-critical findings preserved in summary; all unit and integration tests pass with 0 warnings.
 
+### R18 — Guided first run and repeatable cockpit sessions
+
+**Outcome:** A first-time operator can install TALOS, select a Git project, see the agent roles, review and run a task, and start a fresh task without restarting the cockpit.
+
+**Exit criteria:** A clean checkout stays clean after local setup and task reporting. Existing Git changes and missing agents have actionable recovery messages. Confirming a draft launches only that task. Two consecutive runs use fresh provider conversations, preserve results in History, and show the earlier Git changes in the cockpit. Stable releases generate a formula from the published archive checksums. Cross-repository tap proposals require explicit repository configuration or dispatch.
+
 ## 6. Dependency order
 
 ```text
@@ -328,4 +335,4 @@ Implementation details may change based on experiments. Preserve invariants and 
 
 ## 8. Current continuation point
 
-R10 delivered all 7 multi-CLI adapter profiles with live verification. R11 delivered Hybrid Team Orchestration with schema v19, team subtasks table, Writer Lead decomposition and worker assistance, Critic Team multi-angle evaluation and consolidated review, rebuttal loop, and full backward-compatible pair mode preservation. Next action: proceed with ongoing task execution and user requests.
+R10 delivered all 7 multi-CLI adapter profiles with live verification. R11 added Team orchestration and schema v19. R17 extended deliberation and verification failure handling. R18 delivered the guided cockpit and repeatable task sessions. See [the current checkpoint](state.md) and [operator guide](operator-runbook.md) for the release state.
