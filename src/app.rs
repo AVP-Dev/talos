@@ -8,6 +8,7 @@ use std::{
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use serde_json::json;
+use tokio::time::{Instant, sleep};
 
 use crate::{
     adapter::agy::AgyProbe,
@@ -18,9 +19,9 @@ use crate::{
     },
     config::{AdapterKind, AgentRole, GithubPolicy, ProjectConfig},
     db::{
-        Database, GithubPublicationInput, GithubPublicationRecord, ProjectControlEvent,
-        QueueSummary, ResumeProjectOutcome, StopRequestOutcome, TaskEvent, TaskRecord,
-        WriterResolutionAction, WriterResolutionRecord,
+        Database, GithubCiCheckRecord, GithubCiSnapshotInput, GithubPublicationInput,
+        GithubPublicationRecord, ProjectControlEvent, QueueSummary, ResumeProjectOutcome,
+        StopRequestOutcome, TaskEvent, TaskRecord, WriterResolutionAction, WriterResolutionRecord,
     },
     github::{self, GithubProbe},
     policy::{self, Action as PolicyAction, Authorization, ExecutionMode},
@@ -94,7 +95,8 @@ pub async fn run(cli: Cli) -> Result<()> {
             GithubCommand::Policy
             | GithubCommand::Branch { .. }
             | GithubCommand::Publish { .. }
-            | GithubCommand::Reconcile { .. } => {}
+            | GithubCommand::Reconcile { .. }
+            | GithubCommand::Ci { .. } => {}
         }
     }
 
@@ -118,7 +120,9 @@ pub async fn run(cli: Cli) -> Result<()> {
             GithubCommand::Status { .. } => {
                 bail!("GitHub status was not dispatched before project discovery");
             }
-            GithubCommand::Publish { .. } | GithubCommand::Reconcile { .. } => {}
+            GithubCommand::Publish { .. }
+            | GithubCommand::Reconcile { .. }
+            | GithubCommand::Ci { .. } => {}
         }
     }
 
@@ -853,6 +857,23 @@ pub async fn run(cli: Cli) -> Result<()> {
                 )
                 .await?;
             }
+            GithubCommand::Ci {
+                publication_id,
+                wait,
+                timeout_seconds,
+                interval_seconds,
+            } => {
+                run_github_ci(
+                    cli.json,
+                    &project,
+                    &mut database,
+                    publication_id,
+                    wait,
+                    timeout_seconds,
+                    interval_seconds,
+                )
+                .await?;
+            }
             _ => bail!("GitHub command was not dispatched before runtime initialization"),
         },
     }
@@ -1459,6 +1480,230 @@ async fn run_github_reconcile_under_lease(
         }
     }
     print_github_publication(json_output, &record)?;
+    Ok(())
+}
+
+async fn run_github_ci(
+    json_output: bool,
+    project: &Project,
+    database: &mut Database,
+    publication_id: i64,
+    wait_for_checks: bool,
+    timeout_seconds: u64,
+    interval_seconds: u64,
+) -> Result<()> {
+    if wait_for_checks
+        && (!(1..=3_600).contains(&timeout_seconds) || !(5..=120).contains(&interval_seconds))
+    {
+        bail!("CI wait requires a timeout of 1–3600 seconds and an interval of 5–120 seconds");
+    }
+    let publication = database
+        .github_publication(publication_id)?
+        .with_context(|| format!("GitHub publication #{publication_id} does not exist"))?;
+    if publication.state != "open" {
+        bail!("GitHub CI status requires a recorded open pull request");
+    }
+    let policy = ProjectConfig::load(project)?
+        .github
+        .context("No GitHub publication policy is configured")?;
+    if !publication
+        .repository
+        .eq_ignore_ascii_case(&policy.repository)
+        || publication.remote_name != policy.remote
+        || publication.base_branch != policy.base_branch
+    {
+        bail!("Recorded GitHub publication does not match the current local policy");
+    }
+    github::validate_remote_identity(
+        &project.root,
+        &publication.remote_name,
+        &publication.repository,
+    )?;
+
+    let verified_pr_number = verify_github_publication_pr_head(&project.root, &publication).await;
+
+    let deadline = Instant::now() + Duration::from_secs(timeout_seconds.max(1));
+    let mut result = "unknown";
+    let mut checks = Vec::new();
+    if let Some(pull_request_number) = verified_pr_number {
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if wait_for_checks && remaining.is_zero() {
+                result = "timeout";
+                break;
+            }
+            let query_timeout = if wait_for_checks {
+                remaining
+            } else {
+                Duration::from_secs(60)
+            };
+            match github::pull_request_checks(
+                &publication.repository,
+                pull_request_number,
+                query_timeout,
+            )
+            .await
+            {
+                Some(observed) if github_ci_checks_are_safe(&observed) => {
+                    checks = observed;
+                    result = classify_github_ci_checks(&checks);
+                }
+                _ => {
+                    result = if wait_for_checks && Instant::now() >= deadline {
+                        "timeout"
+                    } else {
+                        "unknown"
+                    };
+                    checks.clear();
+                }
+            }
+            if !wait_for_checks || result != "pending" {
+                break;
+            }
+            let now = Instant::now();
+            if now >= deadline {
+                result = "timeout";
+                break;
+            }
+            sleep(Duration::from_secs(interval_seconds).min(deadline - now)).await;
+        }
+    }
+    if verified_pr_number.is_some()
+        && verify_github_publication_pr_head(&project.root, &publication).await
+            != verified_pr_number
+    {
+        result = "unknown";
+        checks.clear();
+    }
+    let snapshot = database.record_github_ci_snapshot(&GithubCiSnapshotInput {
+        publication_id,
+        head_commit: &publication.head_commit,
+        result,
+        checks: &checks,
+    })?;
+    print_github_ci_snapshot(json_output, &snapshot, wait_for_checks)
+}
+
+async fn verify_github_publication_pr_head(
+    project_root: &std::path::Path,
+    publication: &GithubPublicationRecord,
+) -> Option<u32> {
+    let recorded_pr_number = publication
+        .pull_request_url
+        .as_deref()
+        .and_then(|url| url.rsplit("/pull/").next())
+        .and_then(|number| number.parse::<u32>().ok());
+    if !github::remote_ref_sha(
+        project_root,
+        &publication.remote_name,
+        &publication.head_branch,
+    )
+    .await
+    .is_ok_and(|head| head.as_deref() == Some(publication.head_commit.as_str()))
+    {
+        return None;
+    }
+    match github::find_matching_open_pull_request(
+        &publication.repository,
+        &publication.head_branch,
+        &publication.base_branch,
+        &publication.head_commit,
+    )
+    .await
+    {
+        github::PullRequestInspection::MatchingOpen { number, .. }
+            if Some(number) == recorded_pr_number =>
+        {
+            Some(number)
+        }
+        _ => None,
+    }
+}
+
+fn github_ci_checks_are_safe(checks: &[GithubCiCheckRecord]) -> bool {
+    checks.len() <= 128
+        && checks.iter().all(|check| {
+            matches!(
+                check.bucket.as_str(),
+                "pass" | "fail" | "pending" | "skipping" | "cancel"
+            ) && !check.name.trim().is_empty()
+                && check.name.len() <= 256
+                && !contains_sensitive(&check.name)
+                && !check.state.trim().is_empty()
+                && check.state.len() <= 64
+                && !contains_sensitive(&check.state)
+                && check.workflow.as_ref().is_none_or(|workflow| {
+                    !workflow.trim().is_empty()
+                        && workflow.len() <= 256
+                        && !contains_sensitive(workflow)
+                })
+                && check
+                    .started_at
+                    .as_ref()
+                    .is_none_or(|timestamp| !timestamp.trim().is_empty() && timestamp.len() <= 64)
+                && check
+                    .completed_at
+                    .as_ref()
+                    .is_none_or(|timestamp| !timestamp.trim().is_empty() && timestamp.len() <= 64)
+        })
+}
+
+fn classify_github_ci_checks(checks: &[GithubCiCheckRecord]) -> &'static str {
+    if checks.is_empty() {
+        return "no_checks";
+    }
+    if checks
+        .iter()
+        .any(|check| matches!(check.bucket.as_str(), "fail" | "cancel"))
+    {
+        return "fail";
+    }
+    if checks.iter().any(|check| check.bucket == "pending") {
+        return "pending";
+    }
+    if checks
+        .iter()
+        .any(|check| !matches!(check.bucket.as_str(), "pass" | "skipping"))
+    {
+        return "unknown";
+    }
+    if checks.iter().any(|check| check.bucket == "pass") {
+        "pass"
+    } else {
+        "no_checks"
+    }
+}
+
+fn print_github_ci_snapshot(
+    json_output: bool,
+    snapshot: &crate::db::GithubCiSnapshotRecord,
+    wait_for_checks: bool,
+) -> Result<()> {
+    if json_output {
+        print_json(snapshot)?;
+    } else {
+        println!(
+            "GitHub CI snapshot #{}: {} ({} check(s), commit {})",
+            snapshot.id,
+            snapshot.result,
+            snapshot.checks.len(),
+            snapshot.head_commit
+        );
+        if snapshot.result == "pending" {
+            println!(
+                "Checks are still running; use `talos github ci {} --wait` to continue polling.",
+                snapshot.publication_id
+            );
+        } else if matches!(
+            snapshot.result.as_str(),
+            "unknown" | "timeout" | "no_checks"
+        ) {
+            println!("This snapshot is incomplete and does not count as passing CI.");
+        }
+        if !wait_for_checks && snapshot.result == "pending" {
+            println!("The status was queried once; no polling was requested.");
+        }
+    }
     Ok(())
 }
 

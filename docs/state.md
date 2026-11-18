@@ -4,7 +4,7 @@
 
 ## Current phase
 
-**R6–R8 implementation remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. R7.1–R7.5 code is implemented or in progress, with behavior/migration acceptance still open; native subagent delegation and three-agent acceptance remain unavailable until verified. T8.1 diagnostics and T8.2 policy-gated GitHub publication code are implemented, but CLI behavior acceptance is pending; no GitHub authentication, repository, push, or PR operation has been performed. T8.3 CI evidence remains next. Linux access and native checks are deferred to the user's server. Backlog count must be recalculated after the current batch.
+**R6–R8 implementation remains in progress.** T6.1 and T6.2 are complete. T6.3 behavior/profile verification, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 interactive handoff remain open. R7.1–R7.5 code is implemented or in progress, with behavior/migration acceptance still open; native subagent delegation and three-agent acceptance remain unavailable until verified. T8.1 diagnostics, T8.2 policy-gated publication, and T8.3 commit-bound CI snapshots are implemented locally, but command, migration, and remote behavior acceptance remains pending. No GitHub authentication or remote operation has been performed. Linux access and native checks are deferred to the user's server. Backlog count must be recalculated after the current batch.
 
 ## Goal and fixed direction
 
@@ -307,11 +307,20 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 - A read-only code review caught two edge cases before continuing: Git's `push.followTags` configuration could add annotated tags, and case differences in the configured repository name could prevent recognition of a successful PR. The push now explicitly disables tag following; PR URL parsing compares repository identity case-insensitively while requiring the exact numeric PR path.
 - Reviewed the state transitions and consolidated CLI arguments to satisfy Clippy. Updated README and plan/task/decision/handoff docs. No repository or remote exists in the workspace, so no auth, network read, push, or PR operation has been invoked.
 - Current macOS checks after the review fixes: `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo check --all-targets --all-features`, and `git diff --check` passed. Automated tests and Linux-native checks were not run.
-- The first T8.2 implementation is committed locally as `efaaa75` (`feat: add policy-gated GitHub publishing`). The two review fixes and this handoff update are awaiting a follow-up local commit.
+- The initial T8.2 implementation is committed as `efaaa75` (`feat: add policy-gated GitHub publishing`). Read-only review identified tag following and case-sensitive PR URL matching; both were fixed and committed as `8728ce4` (`fix: restrict GitHub publication side effects`).
+
+## R8.3 progress — commit-bound CI snapshots
+
+- Added `talos github ci <publication_id>` for an already open recorded PR. Before and after reading CI status, TALOS checks that the remote feature ref and the single matching open PR still use the immutable recorded commit and branch/base identity. If the commit moves during polling, CI rows are discarded and the saved outcome is `unknown`.
+- Added optional `--wait` polling with a 1–3600-second polling window and 5–120-second interval. Each `gh pr checks --json bucket,completedAt,name,startedAt,state,workflow` request is capped at the smaller of 60 seconds and the remaining polling window, and output is capped at 32 KiB. Exit code 8 is accepted as a pending result; other command errors and malformed output produce an `unknown` snapshot.
+- The polling window bounds only repeated CI status queries. Pre/post branch and PR identity checks are separate bounded calls and may add up to roughly four minutes in a slow network case.
+- Schema v16 stores compact, append-only CI snapshots bound to the open publication's exact head commit. Identical summaries are deduplicated. Snapshot records include only check name, workflow, bucket, state, and timestamps. Raw output, descriptions, links, and credential metadata are not stored. `pass` requires at least one passing check and no failed/cancelled/pending checks; no-checks, timeout, pending, and unknown remain incomplete. CI evidence does not change task status.
+- ADR-036 records schema invariants and failure handling before the migration. Official GitHub CLI `gh pr checks` docs were fetched with Context7 and specify the JSON fields, buckets, and pending exit code. No repository/auth/network operation or test was run.
+- `cargo fmt --all`, `cargo clippy --all-targets --all-features -- -D warnings`, `cargo check --all-targets --all-features`, and `git diff --check` passed on macOS after the schema-v16 and CLI changes. SQLite migration behavior is not yet runtime-verified.
 
 ## Next action
 
-Commit the completed T8.2 implementation locally, then continue sequentially with T8.3 CI status/evidence and T8.4 merge safeguards. Do not create a repository, add a remote, or invoke GitHub operations; the user will provide the repository later. Keep remote acceptance explicitly pending. R6 gates remain open: T6.3 behavior/profile checks, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 TUI trust/handoff. R7 behavior/migration checks and native delegation acceptance remain open. Skip Linux connection/setup and defer Linux-native checks until the server is available. Keep work local on `master`.
+Commit the T8.3 code/docs locally, then continue to T8.4 merge safeguards. T8.2 commits are `efaaa75` and `8728ce4`; the latter contains the reviewed tag and PR URL fixes. Do not create a repository, add a remote, or invoke GitHub operations; the user will provide the repository later. Keep remote acceptance explicitly pending. R6 gates remain open: T6.3 behavior/profile checks, T6.4 macOS SSH reconnect, T6.5 Linux server acceptance, and T6.6 TUI trust/handoff. R7 behavior/migration checks and native delegation acceptance remain open. Skip Linux connection/setup and defer Linux-native checks until the server is available. Keep work local on `master`.
 
 ## Session close checklist
 

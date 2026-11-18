@@ -14,12 +14,13 @@ use tokio::{
     time::timeout,
 };
 
-use crate::process_group::ProcessGroupGuard;
+use crate::{db::GithubCiCheckRecord, process_group::ProcessGroupGuard};
 
 const COMMAND_TIMEOUT: Duration = Duration::from_secs(15);
 const NETWORK_READ_TIMEOUT: Duration = Duration::from_secs(60);
 const NETWORK_WRITE_TIMEOUT: Duration = Duration::from_secs(5 * 60);
 const PULL_REQUEST_TIMEOUT: Duration = Duration::from_secs(2 * 60);
+const CI_QUERY_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_CAPTURE_BYTES: usize = 32 * 1024;
 
 #[derive(Clone, Debug, Serialize)]
@@ -411,6 +412,44 @@ pub async fn find_matching_open_pull_request(
     } else {
         PullRequestInspection::OtherOrAmbiguous
     }
+}
+
+pub async fn pull_request_checks(
+    repository: &str,
+    pull_request_number: u32,
+    timeout: Duration,
+) -> Option<Vec<GithubCiCheckRecord>> {
+    let number = pull_request_number.to_string();
+    let arguments = [
+        "pr",
+        "checks",
+        &number,
+        "--repo",
+        repository,
+        "--json",
+        "bucket,completedAt,name,startedAt,state,workflow",
+    ];
+    let CommandResult::Output {
+        status,
+        stdout,
+        output_truncated: false,
+    } = run_bounded_command(
+        "gh",
+        &arguments,
+        None,
+        timeout.min(CI_QUERY_TIMEOUT),
+        false,
+        None,
+    )
+    .await
+    else {
+        return None;
+    };
+    if !matches!(status.code(), Some(0 | 8)) {
+        return None;
+    }
+    let checks = serde_json::from_slice::<Vec<GithubCiCheckRecord>>(&stdout).ok()?;
+    (checks.len() <= 128).then_some(checks)
 }
 
 pub async fn push_process_result(

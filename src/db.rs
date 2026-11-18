@@ -6,7 +6,8 @@ use std::{
 
 use anyhow::{Context, Result, bail};
 use rusqlite::{Connection, OpenFlags, OptionalExtension, TransactionBehavior, params};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::{
     checks::{CheckExecution, ProjectCheck, validate_project_checks},
@@ -15,7 +16,7 @@ use crate::{
     secrets::contains_sensitive,
 };
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 const MAX_CHILD_TASK_ALLOWED_PATHS: usize = 64;
 const MAX_CHILD_TASK_SCOPE_BYTES: usize = 16 * 1024;
 const MIN_CHILD_TASK_TIMEOUT_MS: i64 = 1_000;
@@ -151,6 +152,36 @@ pub struct GithubPublicationInput<'a> {
     pub base_commit: &'a str,
     pub head_commit: &'a str,
     pub diff_sha256: &'a str,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub struct GithubCiCheckRecord {
+    pub bucket: String,
+    pub name: String,
+    pub state: String,
+    pub workflow: Option<String>,
+    #[serde(rename = "startedAt")]
+    pub started_at: Option<String>,
+    #[serde(rename = "completedAt")]
+    pub completed_at: Option<String>,
+}
+
+#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+pub struct GithubCiSnapshotRecord {
+    pub id: i64,
+    pub publication_id: i64,
+    pub head_commit: String,
+    pub result: String,
+    pub snapshot_sha256: String,
+    pub checks: Vec<GithubCiCheckRecord>,
+    pub checked_at_ms: i64,
+}
+
+pub struct GithubCiSnapshotInput<'a> {
+    pub publication_id: i64,
+    pub head_commit: &'a str,
+    pub result: &'a str,
+    pub checks: &'a [GithubCiCheckRecord],
 }
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
@@ -1360,6 +1391,92 @@ impl Database {
             .query_map([publication_id], map_github_publication_event)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(events)
+    }
+
+    pub fn record_github_ci_snapshot(
+        &mut self,
+        input: &GithubCiSnapshotInput<'_>,
+    ) -> Result<GithubCiSnapshotRecord> {
+        validate_git_revision(input.head_commit)?;
+        if !matches!(
+            input.result,
+            "pass" | "fail" | "pending" | "timeout" | "unknown" | "no_checks"
+        ) {
+            bail!("Unsupported GitHub CI snapshot result");
+        }
+        validate_github_ci_checks(input.checks)?;
+        let checks_json = serde_json::to_string(input.checks)?;
+        let snapshot_sha256 =
+            github_ci_snapshot_sha256(input.head_commit, input.result, &checks_json);
+
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .context("Cannot start GitHub CI snapshot record")?;
+        let publication: Option<(String, String)> = transaction
+            .query_row(
+                "SELECT state, head_commit FROM github_publications WHERE id = ?1",
+                [input.publication_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((state, recorded_head_commit)) = publication else {
+            bail!(
+                "GitHub publication #{} does not exist",
+                input.publication_id
+            );
+        };
+        if state != "open" || recorded_head_commit != input.head_commit {
+            bail!("CI evidence requires the exact commit of a recorded open pull request");
+        }
+        let checked_at_ms = now_ms()?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO github_ci_snapshots
+                 (publication_id, head_commit, result, snapshot_sha256, checks_json, checked_at_ms)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                input.publication_id,
+                input.head_commit,
+                input.result,
+                snapshot_sha256,
+                checks_json,
+                checked_at_ms,
+            ],
+        )?;
+        transaction
+            .commit()
+            .context("Cannot commit GitHub CI snapshot")?;
+        self.connection
+            .query_row(
+                "SELECT id, publication_id, head_commit, result, snapshot_sha256,
+                        checks_json, checked_at_ms
+                 FROM github_ci_snapshots
+                 WHERE publication_id = ?1 AND head_commit = ?2 AND snapshot_sha256 = ?3",
+                params![input.publication_id, input.head_commit, snapshot_sha256],
+                map_github_ci_snapshot,
+            )
+            .optional()?
+            .context("GitHub CI snapshot disappeared after insertion")
+    }
+
+    pub fn latest_github_ci_snapshot(
+        &self,
+        publication_id: i64,
+    ) -> Result<Option<GithubCiSnapshotRecord>> {
+        if self.github_publication(publication_id)?.is_none() {
+            bail!("GitHub publication #{publication_id} does not exist");
+        }
+        self.connection
+            .query_row(
+                "SELECT id, publication_id, head_commit, result, snapshot_sha256,
+                        checks_json, checked_at_ms
+                 FROM github_ci_snapshots WHERE publication_id = ?1
+                 ORDER BY id DESC LIMIT 1",
+                [publication_id],
+                map_github_ci_snapshot,
+            )
+            .optional()
+            .context("Cannot read GitHub CI snapshot")
     }
 
     pub fn transition_github_publication(
@@ -4540,6 +4657,46 @@ fn migrate(connection: &mut Connection) -> Result<()> {
             .context("Cannot add durable GitHub publication records")?;
         migrated_version = 15;
     }
+    if migrated_version == 15 {
+        transaction
+            .execute_batch(
+                "CREATE TABLE github_ci_snapshots (
+                     id INTEGER PRIMARY KEY AUTOINCREMENT,
+                     publication_id INTEGER NOT NULL REFERENCES github_publications(id) ON DELETE RESTRICT,
+                     head_commit TEXT NOT NULL CHECK(length(head_commit) IN (40, 64)),
+                     result TEXT NOT NULL CHECK(result IN (
+                         'pass', 'fail', 'pending', 'timeout', 'unknown', 'no_checks'
+                     )),
+                     snapshot_sha256 TEXT NOT NULL CHECK(length(snapshot_sha256) = 71),
+                     checks_json TEXT NOT NULL CHECK(length(CAST(checks_json AS BLOB)) <= 32768),
+                     checked_at_ms INTEGER NOT NULL,
+                     UNIQUE(publication_id, head_commit, snapshot_sha256)
+                 );
+                 CREATE INDEX github_ci_snapshots_publication_id_id
+                     ON github_ci_snapshots(publication_id, id);
+                 CREATE TRIGGER github_ci_snapshots_head_matches_publication
+                     BEFORE INSERT ON github_ci_snapshots
+                     WHEN NOT EXISTS (
+                         SELECT 1 FROM github_publications
+                         WHERE id = NEW.publication_id
+                           AND state = 'open'
+                           AND head_commit = NEW.head_commit
+                     ) BEGIN
+                         SELECT RAISE(ABORT, 'GitHub CI evidence must match an open published commit');
+                     END;
+                 CREATE TRIGGER github_ci_snapshots_no_update
+                     BEFORE UPDATE ON github_ci_snapshots BEGIN
+                         SELECT RAISE(ABORT, 'GitHub CI snapshots are append-only');
+                     END;
+                 CREATE TRIGGER github_ci_snapshots_no_delete
+                     BEFORE DELETE ON github_ci_snapshots BEGIN
+                         SELECT RAISE(ABORT, 'GitHub CI snapshots are append-only');
+                     END;
+                 PRAGMA user_version = 16;",
+            )
+            .context("Cannot add immutable GitHub CI evidence")?;
+        migrated_version = 16;
+    }
     if migrated_version != SCHEMA_VERSION {
         bail!("Cannot migrate database from unsupported schema version {migrated_version}");
     }
@@ -4775,6 +4932,22 @@ fn map_github_publication_event(
     })
 }
 
+fn map_github_ci_snapshot(row: &rusqlite::Row<'_>) -> rusqlite::Result<GithubCiSnapshotRecord> {
+    let checks_json: String = row.get(5)?;
+    let checks = serde_json::from_str(&checks_json).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(5, rusqlite::types::Type::Text, Box::new(error))
+    })?;
+    Ok(GithubCiSnapshotRecord {
+        id: row.get(0)?,
+        publication_id: row.get(1)?,
+        head_commit: row.get(2)?,
+        result: row.get(3)?,
+        snapshot_sha256: row.get(4)?,
+        checks,
+        checked_at_ms: row.get(6)?,
+    })
+}
+
 fn map_critic_review_record(row: &rusqlite::Row<'_>) -> rusqlite::Result<CriticReviewRecord> {
     Ok(CriticReviewRecord {
         id: row.get(0)?,
@@ -4891,6 +5064,53 @@ fn validate_sha256_id(value: &str, label: &str) -> Result<()> {
         bail!("{label} must use sha256:<64 lowercase hex characters>");
     };
     validate_sha256_digest(digest, label)
+}
+
+fn validate_github_ci_checks(checks: &[GithubCiCheckRecord]) -> Result<()> {
+    if checks.len() > 128 {
+        bail!("GitHub CI snapshots may include at most 128 checks");
+    }
+    for check in checks {
+        validate_record_text("GitHub CI check name", &check.name, 256)?;
+        validate_record_text("GitHub CI check state", &check.state, 64)?;
+        if !matches!(
+            check.bucket.as_str(),
+            "pass" | "fail" | "pending" | "skipping" | "cancel"
+        ) {
+            bail!("GitHub CI check has an unsupported status bucket");
+        }
+        if contains_sensitive(&check.name) || contains_sensitive(&check.state) {
+            bail!("GitHub CI check metadata contains secret-like text");
+        }
+        if let Some(workflow) = &check.workflow {
+            validate_record_text("GitHub CI workflow name", workflow, 256)?;
+            if contains_sensitive(workflow) {
+                bail!("GitHub CI workflow name contains secret-like text");
+            }
+        }
+        for timestamp in [&check.started_at, &check.completed_at]
+            .into_iter()
+            .flatten()
+        {
+            validate_record_text("GitHub CI timestamp", timestamp, 64)?;
+        }
+    }
+    Ok(())
+}
+
+fn github_ci_snapshot_sha256(head_commit: &str, result: &str, checks_json: &str) -> String {
+    let mut digest = Sha256::new();
+    digest.update(head_commit.as_bytes());
+    digest.update([0]);
+    digest.update(result.as_bytes());
+    digest.update([0]);
+    digest.update(checks_json.as_bytes());
+    let encoded = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    format!("sha256:{encoded}")
 }
 
 fn validate_sha256_digest(value: &str, label: &str) -> Result<()> {
@@ -5261,7 +5481,7 @@ mod tests {
     fn initialization_is_idempotent_and_uses_wal() {
         let project = temp_project();
         let first = Database::open(&project).expect("initialize database");
-        assert_eq!(first.schema_version().expect("read schema version"), 15);
+        assert_eq!(first.schema_version().expect("read schema version"), 16);
         assert_eq!(
             first
                 .journal_mode()
@@ -5272,7 +5492,7 @@ mod tests {
         drop(first);
 
         let second = Database::open(&project).expect("open database again");
-        assert_eq!(second.schema_version().expect("read schema version"), 15);
+        assert_eq!(second.schema_version().expect("read schema version"), 16);
         drop(second);
         cleanup(&project);
     }
@@ -5299,7 +5519,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema-v5 duration fields");
-        assert_eq!(migrated.schema_version().unwrap(), 15);
+        assert_eq!(migrated.schema_version().unwrap(), 16);
         let columns: (i64, i64) = migrated
             .connection
             .query_row(
@@ -5338,7 +5558,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v6");
-        assert_eq!(migrated.schema_version().unwrap(), 15);
+        assert_eq!(migrated.schema_version().unwrap(), 16);
         assert_eq!(migrated.list_tasks().unwrap()[0].id, task.id);
         assert!(!migrated.project_control_state().unwrap().queue_paused);
         cleanup(&project);
@@ -5363,7 +5583,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v7");
-        assert_eq!(migrated.schema_version().unwrap(), 15);
+        assert_eq!(migrated.schema_version().unwrap(), 16);
         assert_eq!(
             migrated
                 .project_control_state()
@@ -5392,7 +5612,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v8");
-        assert_eq!(migrated.schema_version().unwrap(), 15);
+        assert_eq!(migrated.schema_version().unwrap(), 16);
         assert!(
             migrated
                 .writer_attempts(None)
@@ -5420,7 +5640,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v9");
-        assert_eq!(migrated.schema_version().unwrap(), 15);
+        assert_eq!(migrated.schema_version().unwrap(), 16);
         let dependencies_table_exists: bool = migrated
             .connection
             .query_row(
@@ -5449,7 +5669,7 @@ mod tests {
         drop(database);
 
         let migrated = Database::open(&project).expect("migrate schema v10");
-        assert_eq!(migrated.schema_version().unwrap(), 15);
+        assert_eq!(migrated.schema_version().unwrap(), 16);
         let contracts_table_exists: bool = migrated
             .connection
             .query_row(
@@ -5805,7 +6025,7 @@ mod tests {
         drop(database);
 
         let mut migrated = Database::open(&project).expect("migrate the v4 approval");
-        assert_eq!(migrated.schema_version().unwrap(), 15);
+        assert_eq!(migrated.schema_version().unwrap(), 16);
         assert_eq!(
             migrated.list_tasks().unwrap()[0].status,
             TaskStatus::Reviewing
@@ -5989,7 +6209,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate existing database");
-        assert_eq!(database.schema_version().expect("read schema version"), 15);
+        assert_eq!(database.schema_version().expect("read schema version"), 16);
         let tasks = database.list_tasks().expect("read preserved tasks");
         assert_eq!(tasks.len(), 1);
         assert_eq!(tasks[0].title, "Existing v1 task");
@@ -6285,7 +6505,7 @@ mod tests {
         drop(connection);
 
         let database = Database::open(&project).expect("migrate v2 database");
-        assert_eq!(database.schema_version().expect("read schema version"), 15);
+        assert_eq!(database.schema_version().expect("read schema version"), 16);
         assert!(
             database
                 .has_unresolved_writer_attempts()

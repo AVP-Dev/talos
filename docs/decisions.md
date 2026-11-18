@@ -285,3 +285,11 @@ No schema change for process identity is selected or implemented. The separate s
 - **Reason:** branch policy must not infer a target or turn a locally selected task branch into an implicit push. The project's default branch remains `master` as requested. An interrupted network operation must not become an automatic duplicate push or PR.
 - **Consequence:** push/PR remain opt-in and merge remains unavailable to TALOS. Append-only publication events record pending, confirmed, and uncertain states. Reconciliation reads the remote and permits only a matching recorded result; it stops for manual inspection when the result is absent, conflicting, or unverifiable. No remote behavior has been accepted until a user-provided repository is available.
 - **References:** [Git branch validation](https://git-scm.com/docs/git-check-ref-format), [Git switch](https://git-scm.com/docs/git-switch), [Git push refspecs](https://git-scm.com/docs/git-push), and [GitHub CLI PR creation](https://cli.github.com/manual/gh_pr_create).
+
+## ADR-036 — Bind CI evidence to an immutable published commit
+
+- **Status:** implemented in T8.3; local compile/lint checked, live behavior pending.
+- **Invariants:** CI evidence belongs only to a recorded open PR and the exact head commit already stored for that publication. Snapshot rows are bounded, append-only, and deduplicated by publication, commit, and summary digest. `pending`, `timeout`, `unknown`, and `no_checks` never count as passing. CI evidence never completes or merges a TALOS task.
+- **Failure handling:** a remote branch or PR head that differs from the recorded commit produces an incomplete observation; it cannot be recorded as a pass. GitHub CLI errors, malformed/oversized output, and API uncertainty remain visibly unknown. `--wait` bounds only the CI polling window; pre/post identity checks are separate calls bounded to 60 seconds each. The final compact snapshot is saved once, with no poll-by-poll event rows.
+- **Retention:** persist check names, workflow names, states/buckets, and timestamps only; omit descriptions, links, raw CLI output, account data, and credentials. Deduplicate identical summaries to limit database growth.
+- **Reference:** [GitHub CLI `gh pr checks`](https://cli.github.com/manual/gh_pr_checks).

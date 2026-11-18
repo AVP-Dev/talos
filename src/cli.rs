@@ -93,6 +93,20 @@ pub enum GithubCommand {
         #[arg(long)]
         body: Option<String>,
     },
+    /// Record the status of checks for a previously published pull request.
+    Ci {
+        /// ID of the recorded GitHub publication.
+        publication_id: i64,
+        /// Poll while checks remain pending.
+        #[arg(long)]
+        wait: bool,
+        /// Maximum CI polling window in seconds with `--wait` (1–3600); bounded pre/post identity checks are separate.
+        #[arg(long, default_value_t = 900)]
+        timeout_seconds: u64,
+        /// Delay between status requests in seconds when `--wait` is set (5–120).
+        #[arg(long, default_value_t = 15)]
+        interval_seconds: u64,
+    },
 }
 
 #[derive(Debug, Subcommand)]
