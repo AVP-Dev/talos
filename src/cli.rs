@@ -36,6 +36,24 @@ pub enum Command {
     Doctor,
     /// Create or reconnect to this project's persistent tmux control shell.
     Attach,
+    /// Inspect the local GitHub CLI and optionally check its active authentication.
+    Github(GithubArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct GithubArgs {
+    #[command(subcommand)]
+    pub command: GithubCommand,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum GithubCommand {
+    /// Report local `gh` availability; contact GitHub only with `--check-auth`.
+    Status {
+        /// Explicitly check the active GitHub CLI authentication state.
+        #[arg(long)]
+        check_auth: bool,
+    },
 }
 
 #[derive(Debug, Args)]

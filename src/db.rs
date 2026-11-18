@@ -20,6 +20,7 @@ const MAX_CHILD_TASK_ALLOWED_PATHS: usize = 64;
 const MAX_CHILD_TASK_SCOPE_BYTES: usize = 16 * 1024;
 const MIN_CHILD_TASK_TIMEOUT_MS: i64 = 1_000;
 const MAX_CHILD_TASK_TIMEOUT_MS: i64 = 30 * 60 * 1_000;
+type FinalizeReviewRow = (i64, String, String, String, Option<String>, Option<String>);
 
 #[derive(Clone, Debug, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -986,12 +987,12 @@ impl Database {
                 |row| row.get(0),
             )
             .optional()?;
-        let valid_transition = match (current.as_deref(), target_state) {
+        let valid_transition = matches!(
+            (current.as_deref(), target_state),
             (Some("applying"), "pending" | "needs_attention")
-            | (Some("pending"), "needs_attention")
-            | (Some("needs_attention"), "pending") => true,
-            _ => false,
-        };
+                | (Some("pending"), "needs_attention")
+                | (Some("needs_attention"), "pending")
+        );
         if !valid_transition {
             bail!("Task #{task_id} has no worktree integration in progress");
         }
@@ -1087,14 +1088,23 @@ impl Database {
         if task_status.as_deref() != Some(TaskStatus::Verifying.as_str()) {
             bail!("Task #{task_id} must remain verifying until integration is finalized");
         }
-        let review: Option<(i64, String, String, String, Option<String>, Option<String>)> = transaction
-                .query_row(
-                    "SELECT id, decision, base_revision, revision_id, patch_sha256, changed_paths_json
+        let review: Option<FinalizeReviewRow> = transaction
+            .query_row(
+                "SELECT id, decision, base_revision, revision_id, patch_sha256, changed_paths_json
                      FROM critic_reviews WHERE task_id = ?1 ORDER BY id DESC LIMIT 1",
-                    [task_id],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?, row.get(4)?, row.get(5)?)),
-                )
-                .optional()?;
+                [task_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
         let Some((review_id, decision, review_base, review_revision, review_patch, review_paths)) =
             review
         else {
@@ -1999,12 +2009,11 @@ impl Database {
         if worktree_record
             .as_ref()
             .is_some_and(|(state, _)| state == TaskWorktreeState::Retired.as_str())
+            && integration_state.is_some()
         {
-            if integration_state.is_some() {
-                bail!(
-                    "Task #{task_id} has integration history for its retired worktree and requires reconciliation"
-                );
-            }
+            bail!(
+                "Task #{task_id} has integration history for its retired worktree and requires reconciliation"
+            );
         }
         if worktree_record
             .as_ref()

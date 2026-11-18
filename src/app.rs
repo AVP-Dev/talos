@@ -12,12 +12,13 @@ use serde_json::json;
 use crate::{
     adapter::agy::AgyProbe,
     checks::{CheckExecution, ProjectCheck, run_project_check, validate_selected_checks},
-    cli::{Cli, Command, ResolveAction, TaskCommand, TaskWorktreeCommand},
+    cli::{Cli, Command, GithubCommand, ResolveAction, TaskCommand, TaskWorktreeCommand},
     config::{AdapterKind, AgentRole, ProjectConfig},
     db::{
         Database, ProjectControlEvent, QueueSummary, ResumeProjectOutcome, StopRequestOutcome,
         TaskEvent, TaskRecord, WriterResolutionAction, WriterResolutionRecord,
     },
+    github::{self, GithubProbe},
     policy::{self, Action as PolicyAction, Authorization, ExecutionMode},
     project::{DiscoveryMethod, Project},
     revision::{RevisionSnapshot, git_head},
@@ -60,10 +61,20 @@ struct DoctorReport {
     project_checks: Vec<String>,
     tmux: TmuxProbe,
     antigravity: AgyProbe,
+    github: GithubProbe,
     git: &'static str,
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
+    if let Command::Github(arguments) = &cli.command {
+        match &arguments.command {
+            GithubCommand::Status { check_auth } => {
+                run_github_status(cli.json, *check_auth).await?;
+                return Ok(());
+            }
+        }
+    }
+
     let working_directory = env::current_dir().context("Cannot read current directory")?;
     let project = Project::discover(&working_directory)?;
 
@@ -657,6 +668,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                     .collect(),
                 tmux: TmuxClient::default().probe(),
                 antigravity,
+                github: github::probe_local().await,
                 git,
             };
             if cli.json {
@@ -683,6 +695,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                     (true, Some(version)) => println!("tmux: {version}"),
                     (true, None) => println!("tmux: available, version unknown"),
                     (false, _) => println!("tmux: unavailable; foreground mode remains available"),
+                }
+                match (report.github.status, &report.github.version) {
+                    ("available", Some(version)) => {
+                        println!("GitHub CLI: {version}; authentication not checked")
+                    }
+                    ("unavailable", _) => println!("GitHub CLI: unavailable"),
+                    ("timeout", _) => println!("GitHub CLI: version probe timed out"),
+                    _ => println!("GitHub CLI: local probe failed"),
                 }
                 println!("Antigravity CLI: {}", report.antigravity.status.as_str());
                 if let Some(executable) = &report.antigravity.executable {
@@ -748,6 +768,34 @@ pub async fn run(cli: Cli) -> Result<()> {
             }
         }
         Command::Attach => bail!("Attach command was not dispatched before runtime initialization"),
+        Command::Github(_) => {
+            bail!("GitHub command was not dispatched before runtime initialization")
+        }
+    }
+    Ok(())
+}
+
+async fn run_github_status(json_output: bool, check_auth: bool) -> Result<()> {
+    let report = github::status_report(check_auth).await;
+    if json_output {
+        print_json(&report)?;
+        return Ok(());
+    }
+
+    match (report.gh.status, &report.gh.version) {
+        ("available", Some(version)) => println!("GitHub CLI: {version}"),
+        ("unavailable", _) => println!("GitHub CLI: unavailable"),
+        ("timeout", _) => println!("GitHub CLI: version probe timed out"),
+        _ => println!("GitHub CLI: local probe failed"),
+    }
+    match report.auth_status {
+        "not_checked" => println!("Authentication: not checked; pass --check-auth to query GitHub"),
+        "gh_unavailable" => println!("Authentication: not checked because gh is unavailable"),
+        "authenticated" => println!("Authentication: active account is authenticated"),
+        "not_authenticated" => println!("Authentication: no active authenticated account"),
+        "needs_attention" => println!("Authentication: active account needs attention"),
+        "timeout" => println!("Authentication: status check timed out"),
+        _ => println!("Authentication: status unknown"),
     }
     Ok(())
 }
@@ -1895,9 +1943,9 @@ fn acquire_recovery_lease(
         if !database.expire_supervisor_lease_if_matches(&current, now)? {
             bail!("The supervisor lease changed while checking its owner; retry recovery");
         }
-        return database
+        database
             .acquire_supervisor_lease(owner_id, now, duration_ms)?
-            .context("Another TALOS supervisor acquired the project lease during recovery");
+            .context("Another TALOS supervisor acquired the project lease during recovery")
     }
 
     #[cfg(not(unix))]

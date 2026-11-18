@@ -4,6 +4,7 @@ pub mod checks;
 pub mod cli;
 pub mod config;
 pub mod db;
+pub mod github;
 pub mod policy;
 pub mod process_group;
 pub mod project;
