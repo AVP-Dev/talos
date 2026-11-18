@@ -12,7 +12,7 @@
 5. GitHub Draft PR publication policy enforcement: remote git preflight validation, branch preparation (`talos/task-1`), and strict prohibition of auto-merge.
 6. Cross-platform execution on Linux (Ubuntu x86_64 server `nyxos`): toolchains, SQLite WAL, Codex Writer + Codex Critic execution, and task completion verified live on Linux.
 
-**Next action:** user confirmation and ongoing project task execution. Release v0.1.0 published on GitHub; README streamlined with centered aesthetic header, quick start, command reference, and author signature.
+**Next action:** user confirmation and ongoing project task execution. Release v0.1.0 published on GitHub with full open-source scaffolding (Apache-2.0 LICENSE, CONTRIBUTING.md, SECURITY.md, issue templates, PR template, CI workflow).
 
 ## Goal and fixed direction
 
