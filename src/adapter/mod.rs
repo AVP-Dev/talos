@@ -2,10 +2,13 @@ pub mod agy;
 pub mod agy_process;
 pub mod claude;
 pub mod codex;
+pub mod detector;
 pub mod kilo;
 pub mod omp;
 pub mod opencode;
 pub mod pi;
+
+pub use detector::{ModelMirrorInfo, detect_model_info};
 
 pub(crate) fn mentions_authentication_failure(text: &str) -> bool {
     let text = text.to_ascii_lowercase();

@@ -335,6 +335,18 @@ Transform TALOS into a genuinely collaborative autonomous engineering team with 
 
 **Exit criteria:** Mouse selection in terminal captures clean text without box borders; `y` / `Ctrl+Y` / `/copy` copies active view to system clipboard; pinned goal & stage progress banner renders active task context; `p` opens Plan & Tasks view with subtask checklist; `Continue task` in History compiles context pack and resumes execution with smart next-step routing; all unit and integration tests pass clean.
 
+### R21 — Zero-Friction Native Passthrough, Model & Reasoning Mirroring, Untracked-Safe Git Stash, Semantic Visual Accents, and Session History
+
+**Outcome:** Eliminate user deadlocks on dirty checkouts, integrate seamlessly with multi-model/multi-provider CLIs (Pi, OMP, OpenCode, Codex, Claude) through native CLI passthrough and passive configuration mirroring, add vibrant semantic color accents across the cockpit, and present task history as discrete autonomous sessions.
+
+- **Untracked-Safe Git Stash & Blocker Resolution:** Update Git stash execution to include untracked and newly created files (`git stash push -u`). When task submission is blocked by uncommitted or untracked paths, provide instant 1-key action `[s] Stash & Run` in Work view and submit prompt. Add `/stash` and `/unstash` slash commands and `[s]` / `[u]` hotkeys in Changes tab (`Alt+3`).
+- **Passive Native CLI Model & Reasoning Mirroring:** Inspect native configs (`~/.pi/agent/settings.json`, `~/.claude.json`, `~/.codex/config.json`, `~/.config/omp/config.json`, etc.) to extract active provider, model, and reasoning effort (`thinking` tokens, `reasoning_effort`). Mirror active badges in header (`Writes: pi [openrouter/deepseek-r1 · 🧠 high]`) and F2 Settings without obsolete hardcoded lists.
+- **Native CLI Passthrough Subshell (`/native` & Settings):** Implement `TerminalSuspensionGuard` to suspend Ratatui, launch the native CLI interactive session or config tool with inherited stdio, wait for exit, restore raw terminal mode and alternate screen, clear buffer, and refresh state and model detection. Add `/native` slash command and `[p] Launch native CLI` in F2 Settings.
+- **Vibrant Semantic Color Accents & Feed Hierarchy:** Distinguish roles, stages, and output in the TUI: Header roles (`Writes` in green, `Reviews` in magenta, `Mode` in blue/cyan), Feed/Logs role tags (`[WRITER]` in bold green, `[CRITIC]` in bold magenta, `[TEST]`/`[CHECK]` in light cyan, `[ERROR]`/`[FAIL]` in red, `[DONE]`/`[APPROVED]` in green), and Work view blocker warnings.
+- **Session-Oriented History View:** Render history items as structured Sessions (`Session #<id> · [<status>] · <time> · <task_title>`) with color-coded status badges, making task history read as a sequence of autonomous sessions rather than raw messages.
+
+**Exit criteria:** Untracked files like `.gitignore` are cleanly stashed via single-key `s` or `/stash` with immediate unblock; native configs for Pi, Codex, Claude, OMP, OpenCode are inspected and active model + reasoning badges mirrored in header and settings; `/native` launches interactive CLI and returns cleanly to restored TUI; semantic colors clearly separate Writer, Critic, Errors, Checks, and Badges; History displays session-structured cards; all unit and integration tests pass clean.
+
 ## 6. Dependency order
 
 ```text

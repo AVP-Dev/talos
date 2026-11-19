@@ -21,7 +21,26 @@ Key implementations delivered and verified:
 3. **Readline Input History (T19.3):** Maintained `input_history`, `history_index`, and `saved_draft` in `TuiApp`. Pressing $\uparrow$ scrolls backward through previously submitted prompts and commands, $\downarrow$ scrolls forward, restoring the unsaved draft at the bottom. De-duplicates consecutive identical submissions. Verified with unit test `tui_input_history_navigation_with_arrows`.
 4. **Interactive Slash Command Palette (T19.4):** Typing `/` in the Cockpit input bar opens an interactive floating popup overlay displaying available slash commands (`/cli`, `/mode`, `/task:test`, `/diff`, `/feed`, `/commit`, `/help`, etc.) with real-time prefix and substring filtering, descriptions, arrow navigation ($\uparrow / \downarrow$), and Tab/Enter autocompletion. Verified with unit test `interactive_slash_command_palette_filtering_and_selection`.
 
-### Round 20 Closure: Clean Borderless Workspace, Goal & Stage Progress Tracker, One-Key Clipboard Yank, and Context-Aware Task Continuation (`Continue Task`)
+### Round 21 Closure: Zero-Friction Native Passthrough, Model & Reasoning Mirroring, Untracked-Safe Git Stash, Semantic Visual Accents, and Session History
+
+**Current phase is Round 21 (ADR-054) fully delivered, closed, and verified across all five pillars (T21.1 — T21.5).**
+
+Delivered and verified in Round 21:
+1. **Untracked-Safe Git Stash & Blocker Resolution (T21.1):** Fixed Git stash execution to include untracked and new files (`git stash push -u -m ...`), resolving the blocker where untracked files like `.gitignore` wedged task start. When uncommitted changes are present, Work tab displays `⚠️ Blocked: Uncommitted changes detected` with instant single-key action `[s] Stash changes & run`, `/stash` and `/unstash` slash commands, and `[s]` / `[u]` hotkeys in Changes tab (`Alt+3`).
+2. **Passive Native CLI Model & Reasoning Mirroring (T21.2):** Implemented `src/adapter/detector.rs` inspecting native configs (`~/.pi/agent/settings.json`, `~/.claude.json`, `~/.codex/config.json`, `~/.config/omp/config.json`, `~/.config/opencode/config.json`, `~/.config/kilo/config.json`, `~/.gemini/antigravity/settings.json`) to extract active provider, model, and reasoning effort (`thinking` tokens, `reasoning_effort: high/medium/low`). Mirrored active badges directly in the header (`Writes: pi [openrouter/deepseek-r1 · 🧠 high]`) and F2 Settings without fragile hardcoded lists.
+3. **Native CLI Passthrough Subshell (T21.3):** Implemented `launch_native_passthrough` in `src/tui.rs` that suspends Ratatui (leaves alternate screen, disables raw mode, shows cursor), runs the native interactive CLI session or config tool with inherited stdio, waits for exit, restores raw mode, re-enters alternate screen, clears terminal buffer, and triggers state and model reflection upon return. Accessible via `/native` slash command and `p` / `P` in F2 Settings.
+4. **Vibrant Semantic Color Accents & Visual Hierarchy (T21.4):** Applied distinct visual accents across Cockpit: Header displays `TALOS` in bold cyan, `Writes` in green with model badges in light green, `Reviews` in magenta with reviewer badge in light magenta, Mode in bold light cyan. Feed and Logs render clear color tags: `[WRITER]` in bold green, `[CRITIC]` in bold magenta, `[SUPERVISOR]` in bold light blue, `[TEST]`/`[CHECK]` in light cyan, `[ERROR]`/`[FAIL]` in red, `[DONE]`/`[APPROVED]` in green, `[STASH]` in yellow.
+5. **Session-Oriented History View (T21.5):** Refactored History list items to discrete autonomous Sessions (`Session #<id> · [<status>] · <task_title>`) with color-coded status badges (`resolved` in green, `failed` in red, `active` in yellow, `queued` in cyan).
+
+Verification on macOS Apple Silicon:
+- `./scripts/verify-project.sh` passed clean across all 5 verification layers:
+  1. `cargo fmt --all -- --check` passed.
+  2. `cargo clippy --locked --all-targets --all-features -- -D warnings` passed (0 warnings).
+  3. `cargo test --locked --all-targets` passed (186 passed, 0 failed, 2 ignored).
+  4. `cargo build --locked --release` passed.
+  5. `./scripts/security-scan.sh` clean.
+- Unit test `untracked_stash_and_model_mirroring_and_native_passthrough` verifies unblocking stash, unstash, model badge detection, and passthrough queuing.
+- Local release binary updated in `/opt/homebrew/Cellar/talos/0.1.1/bin/talos` and `~/.local/bin/talos`. Crate version remains 0.1.1.
 
 **Current phase is Round 20 (ADR-053) fully delivered, closed, and verified across all five pillars (T20.1 — T20.5).**
 

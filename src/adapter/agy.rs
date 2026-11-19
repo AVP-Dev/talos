@@ -349,6 +349,10 @@ fn first_line(stdout: &[u8], stderr: &[u8]) -> Option<String> {
     None
 }
 
+pub fn resolve_agy_executable() -> Option<PathBuf> {
+    find_executable("agy")
+}
+
 fn find_executable(name: &str) -> Option<PathBuf> {
     let path = env::var_os("PATH")?;
     env::split_paths(&path)

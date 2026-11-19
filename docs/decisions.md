@@ -556,3 +556,29 @@ No schema change for process identity is selected or implemented. The separate s
        - Assembles the **Structured Context Handoff Pack** for the agent prompt, ensuring fresh agent sessions never hallucinate or restart from scratch.
 - **Reason:** user requested eliminating box-drawing clutter during mouse copy, adding instant 1-key clipboard copy, providing a continuous view of the main goal and current subtask/phase progress, tracking multi-message session threads, and enabling intelligent task continuation from History with context rehydration.
 - **Consequence:** Round 20 implements these five pillars. Core SQLite storage, adapter supervision, and Git worktree isolation remain untouched.
+
+## ADR-054 — Zero-Friction Native Passthrough, Model & Reasoning Mirroring, Untracked-Safe Git Stash, Semantic Visual Accents, and Session History
+
+- **Status:** accepted by the user.
+- **Decision:** implement five foundational ergonomics and autonomy enhancements in Round 21:
+  1. **Working-Tree Blocker Resolution & Untracked-Safe Stash (T21.1):**
+     - Update Git stash execution to include untracked and newly created files (`git stash push --include-untracked -m "TALOS stash before task"`).
+     - Provide single-key unblock action `[s] Stash & Run` directly in the Work tab when uncommitted or untracked files (such as `.gitignore`) block task execution.
+     - Add `/stash` and `/unstash` slash commands (with Russian aliases `/стэш`, `/вернуть-стэш`) and `[s]` / `[u]` hotkeys in the Changes tab (`Alt+3`).
+  2. **Active Model & Reasoning Mirroring (T21.2):**
+     - Rather than hardcoding obsolete static model lists, passively inspect each installed CLI's native configuration (`~/.pi/agent/settings.json`, `~/.claude.json`, `~/.codex/config.json`, `~/.config/omp/config.json`, `~/.config/opencode/config.json`, `~/.config/kilo/config.json`, `~/.gemini/antigravity/settings.json`).
+     - Extract and mirror active provider, model name, and reasoning effort (`thinking` tokens, `reasoning_effort: high/medium/low`).
+     - Display badges directly in the header and settings (e.g. `Writes: pi [openrouter/deepseek-r1 · 🧠 high]`).
+  3. **Native CLI Passthrough Subshell (T21.3):**
+     - Implement `TerminalSuspensionGuard` to suspend Ratatui (leave alternate screen, disable raw mode, show cursor), run the adapter's native interactive session or configuration tool with inherited stdio, and seamlessly restore raw mode, alternate screen, and clear the terminal buffer upon exit.
+     - Provide `/native` slash command and an action in F2 Settings (`[p] Launch native CLI`) to change models, reasoning, and providers inside the native CLI without quitting TALOS.
+     - Trigger state refresh and config re-detection upon return to immediately mirror updated settings in TALOS.
+  4. **Vibrant Semantic Color Accents & Visual Hierarchy (T21.4):**
+     - Distinguish roles, stages, and output in the TUI:
+       * Header: `TALOS` in bold cyan, `Writes` in green with model badge in light green, `Reviews` in magenta with badge in light magenta, Mode in bold blue/cyan.
+       * Feed & Logs: role tags `[WRITER]` in bold green, `[CRITIC]` in bold magenta, `[TEST]`/`[CHECK]` in bold light cyan, `[ERROR]`/`[FAIL]` in bold red, `[APPROVED]`/`[DONE]` in bold green, `[STASH]` in bold yellow.
+       * Work view when blocked: eye-catching amber warning badge with `[s] Stash & Run` action.
+  5. **Session-Oriented History (T21.5):**
+     - Structure History list as discrete Sessions (`Session #<id> · [<status>] · <time> · <task_title>`) with color-coded status badges, making History a clean record of whole task runs rather than fragmented raw messages.
+- **Reason:** user reported being blocked by untracked `.gitignore` with no one-key recovery, requested avoiding obsolete hardcoded model lists in favor of native CLI configuration and model/reasoning mirroring, asked for distinct visual color accents across roles and logs, and requested session-oriented history.
+- **Consequence:** eliminates user deadlocks on dirty checkouts, provides seamless multi-model/multi-provider integration via native CLIs, elevates cockpit visual ergonomics, and maintains deterministic state management.

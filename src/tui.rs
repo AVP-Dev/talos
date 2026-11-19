@@ -100,6 +100,18 @@ pub struct SlashCommandItem {
 
 pub const PALETTE_COMMANDS: &[SlashCommandItem] = &[
     SlashCommandItem {
+        cmd: "/native",
+        description: "Drop into native CLI session to configure model/provider: /native [adapter]",
+    },
+    SlashCommandItem {
+        cmd: "/stash",
+        description: "Stash uncommitted and untracked changes to unblock task run",
+    },
+    SlashCommandItem {
+        cmd: "/unstash",
+        description: "Restore previously stashed changes",
+    },
+    SlashCommandItem {
         cmd: "/cli",
         description: "Switch CLI adapters: /cli <writer> [critic]",
     },
@@ -241,6 +253,7 @@ pub struct TuiApp {
     dirty_paths: GitStatusPaths,
     is_in_tmux: bool,
     pub should_exit: bool,
+    pub pending_passthrough: Option<AdapterKind>,
 }
 
 impl TuiApp {
@@ -337,6 +350,7 @@ impl TuiApp {
             dirty_paths,
             is_in_tmux,
             should_exit: false,
+            pending_passthrough: None,
         };
 
         if matches!(app.project.discovery, DiscoveryMethod::Git) {
@@ -822,6 +836,67 @@ impl TuiApp {
         self.status_message = Some((message.into(), Instant::now()));
     }
 
+    pub fn perform_stash(&mut self) -> Result<()> {
+        let mut stash_cmd = std::process::Command::new("git");
+        stash_cmd
+            .args(["stash", "push", "-u", "-m", "TALOS stash before task"])
+            .current_dir(&self.project.root);
+        match stash_cmd.output() {
+            Ok(out) => {
+                let err = String::from_utf8_lossy(&out.stderr);
+                if out.status.success() {
+                    self.notice("✓ Stashed uncommitted changes (including untracked files). Use /unstash to restore.");
+                } else if !err.trim().is_empty() {
+                    self.notice(format!("Git stash: {}", err.trim()));
+                } else {
+                    self.notice("✓ Stash updated.");
+                }
+                self.refresh_state()?;
+            }
+            Err(e) => {
+                self.notice(format!("Failed to execute git stash: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn perform_unstash(&mut self) -> Result<()> {
+        let mut stash_cmd = std::process::Command::new("git");
+        stash_cmd
+            .args(["stash", "pop"])
+            .current_dir(&self.project.root);
+        match stash_cmd.output() {
+            Ok(out) => {
+                let msg = String::from_utf8_lossy(&out.stdout);
+                let err = String::from_utf8_lossy(&out.stderr);
+                if out.status.success() {
+                    self.notice("✓ Stashed changes restored successfully.");
+                } else {
+                    let detail = if !err.trim().is_empty() {
+                        err.trim()
+                    } else {
+                        msg.trim()
+                    };
+                    self.notice(format!("Git stash pop: {detail}"));
+                }
+                self.refresh_state()?;
+            }
+            Err(e) => {
+                self.notice(format!("Failed to execute git stash pop: {e}"));
+            }
+        }
+        Ok(())
+    }
+
+    pub fn request_native_passthrough(&mut self, adapter: Option<AdapterKind>) {
+        if self.supervisor_running {
+            self.notice("Cannot launch native CLI while a background task is running.");
+            return;
+        }
+        let target = adapter.unwrap_or(self.config.writer);
+        self.pending_passthrough = Some(target);
+    }
+
     fn clear_input(&mut self) {
         self.input.clear();
         self.cursor = 0;
@@ -918,7 +993,7 @@ impl TuiApp {
             retry.is_some_and(|id| self.active_tasks.iter().any(|task| task.id == id));
         if !retry_in_progress && !self.dirty_paths.is_empty() {
             return Some(format!(
-                "Commit or stash your uncommitted changes before running. Alt+3 opens Changes. {}",
+                "Commit or stash your uncommitted changes before running. Press [s] to stash or use /stash. Alt+3 opens Changes. {}",
                 self.dirty_paths.display_preview()
             ));
         }
@@ -1655,14 +1730,18 @@ impl TuiApp {
                 self.clear_input();
             }
             "/stash" | "/стэш" => {
-                let mut stash_cmd = std::process::Command::new("git");
-                stash_cmd.arg("stash").current_dir(&self.project.root);
-                if let Ok(out) = stash_cmd.output() {
-                    let msg = String::from_utf8_lossy(&out.stdout);
-                    self.status_message =
-                        Some((format!("Git stash: {}", msg.trim()), Instant::now()));
-                    self.refresh_state()?;
-                }
+                self.perform_stash()?;
+            }
+            "/unstash" | "/вернуть-стэш" | "/поп" => {
+                self.perform_unstash()?;
+            }
+            "/native" | "/натив" | "/shell" | "/пасс" => {
+                let target = if arg.is_empty() {
+                    None
+                } else {
+                    AdapterKind::parse(arg)
+                };
+                self.request_native_passthrough(target);
             }
             "/status" | "/статус" => {
                 self.status_message = Some((
@@ -2175,6 +2254,16 @@ impl TuiApp {
                     KeyCode::Right | KeyCode::Char('e' | 'E') if !repeat => {
                         self.change_setting(true)?
                     }
+                    KeyCode::Char('p' | 'P') if !repeat => {
+                        let config = self.settings.as_ref().unwrap_or(&self.config);
+                        let target = if self.selection < 2 {
+                            config.writer
+                        } else {
+                            config.critic
+                        };
+                        self.screen = Screen::Main;
+                        self.request_native_passthrough(Some(target));
+                    }
                     KeyCode::Char('r' | 'R') if !repeat => {
                         self.refresh_available();
                         self.notice("Checked for installed agent CLIs.");
@@ -2192,7 +2281,29 @@ impl TuiApp {
 
     fn handle_work_key(&mut self, key: KeyEvent, repeat: bool) -> Result<()> {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
+        if alt && matches!(key.code, KeyCode::Char('s' | 'S')) {
+            self.perform_stash()?;
+            return Ok(());
+        }
+        if alt && matches!(key.code, KeyCode::Char('u' | 'U')) {
+            self.perform_unstash()?;
+            return Ok(());
+        }
         match key.code {
+            KeyCode::Char('s' | 'S')
+                if self.input.is_empty()
+                    && (!self.dirty_paths.is_empty() || self.active_tab == ActiveTab::Diff)
+                    && !repeat =>
+            {
+                self.perform_stash()?;
+                return Ok(());
+            }
+            KeyCode::Char('u' | 'U')
+                if self.input.is_empty() && self.active_tab == ActiveTab::Diff && !repeat =>
+            {
+                self.perform_unstash()?;
+                return Ok(());
+            }
             KeyCode::Char('p' | 'P') if self.input.is_empty() && !repeat => {
                 self.open_plan();
                 return Ok(());
@@ -2502,6 +2613,9 @@ async fn run_app_loop(
     let mut last_tick = Instant::now();
     let tick_rate = Duration::from_millis(300);
     while !app.should_exit {
+        if let Some(target) = app.pending_passthrough.take() {
+            launch_native_passthrough(terminal, app, target)?;
+        }
         terminal.draw(|frame| ui(frame, app))?;
         if event::poll(tick_rate.saturating_sub(last_tick.elapsed()))? {
             match event::read()? {
@@ -2521,6 +2635,81 @@ async fn run_app_loop(
             last_tick = Instant::now();
         }
     }
+    Ok(())
+}
+
+fn launch_native_passthrough(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut TuiApp,
+    adapter: AdapterKind,
+) -> Result<()> {
+    let executable = match adapter {
+        AdapterKind::Pi => crate::adapter::pi::resolve_pi_executable(),
+        AdapterKind::Codex => crate::adapter::codex::resolve_codex_executable(),
+        AdapterKind::Claude => crate::adapter::claude::resolve_claude_executable(),
+        AdapterKind::Omp => crate::adapter::omp::resolve_omp_executable(),
+        AdapterKind::OpenCode => crate::adapter::opencode::resolve_opencode_executable(),
+        AdapterKind::Kilo => crate::adapter::kilo::resolve_kilo_executable(),
+        AdapterKind::Agy => crate::adapter::agy::resolve_agy_executable(),
+    };
+
+    let Some(bin) = executable else {
+        app.notice(format!(
+            "{} executable not found on host. Check PATH or install it.",
+            adapter.as_str()
+        ));
+        return Ok(());
+    };
+
+    // Suspend TUI
+    execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen,
+        crossterm::cursor::Show
+    )?;
+    disable_raw_mode()?;
+
+    println!(
+        "\x1b[1;36m=== TALOS Native Passthrough: {} ===\x1b[0m",
+        adapter.as_str()
+    );
+    println!(
+        "\x1b[90mInteracting directly with native CLI. Configure models or run commands.\x1b[0m"
+    );
+    println!("\x1b[90mExit the tool (Ctrl+C, /exit, or quit) to return to TALOS.\x1b[0m\n");
+
+    let status = std::process::Command::new(&bin)
+        .current_dir(&app.project.root)
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status();
+
+    // Restore TUI
+    enable_raw_mode()?;
+    execute!(
+        terminal.backend_mut(),
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        crossterm::cursor::Hide
+    )?;
+    terminal.clear()?;
+
+    match status {
+        Ok(s) => {
+            app.notice(format!(
+                "✓ Returned from {} session (code {:?}). Config reloaded.",
+                adapter.as_str(),
+                s.code()
+            ));
+        }
+        Err(e) => {
+            app.notice(format!("Native CLI error: {e}"));
+        }
+    }
+
+    app.refresh_state()?;
     Ok(())
 }
 
@@ -2588,29 +2777,46 @@ fn render_header(frame: &mut Frame, app: &TuiApp, area: Rect) {
         OrchestrationMode::Pair => "Pair",
         OrchestrationMode::Team => "Team",
     };
+    let writer_info =
+        crate::adapter::detect_model_info(app.config.writer, app.config.writer_model.as_deref());
+    let critic_info =
+        crate::adapter::detect_model_info(app.config.critic, app.config.critic_model.as_deref());
+
     let header_line = Line::from(vec![
-        Span::styled("TALOS ", Style::default().bold().fg(Color::Cyan)),
+        Span::styled("TALOS", Style::default().bold().fg(Color::Cyan)),
+        Span::styled(" · ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("· {} ", project.to_string_lossy()),
+            format!("{} ", project.to_string_lossy()),
             Style::default().bold().fg(Color::White),
         ),
         Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Mode: ", Style::default().fg(Color::DarkGray)),
         Span::styled(
-            format!("Mode: {mode_str} "),
-            Style::default().fg(Color::Yellow),
+            format!("{mode_str} "),
+            Style::default().bold().fg(Color::LightCyan),
         ),
         Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Writes: ", Style::default().fg(Color::Green)),
         Span::styled(
-            format!("Writes: {} ", app.config.writer.as_str()),
-            Style::default().fg(Color::Green),
+            format!("{} ", app.config.writer.as_str()),
+            Style::default().bold().fg(Color::Green),
+        ),
+        Span::styled(
+            format!("[{}] ", writer_info.short_badge()),
+            Style::default().fg(Color::LightGreen),
         ),
         Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+        Span::styled("Reviews: ", Style::default().fg(Color::Magenta)),
         Span::styled(
-            format!("Reviews: {} ", app.config.critic.as_str()),
-            Style::default().fg(Color::Magenta),
+            format!("{} ", app.config.critic.as_str()),
+            Style::default().bold().fg(Color::Magenta),
+        ),
+        Span::styled(
+            format!("[{}] ", critic_info.short_badge()),
+            Style::default().fg(Color::LightMagenta),
         ),
         Span::styled("│ ", Style::default().fg(Color::DarkGray)),
-        Span::styled("F2 Settings", Style::default().fg(Color::DarkGray)),
+        Span::styled("F2 Settings", Style::default().bold().fg(Color::DarkGray)),
     ]);
     frame.render_widget(Paragraph::new(header_line), area);
 }
@@ -2764,11 +2970,13 @@ fn render_workflow(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
             let config = app.settings.as_ref().unwrap_or(&app.config);
             let writer = adapter_label(config.writer, &app.available);
             let critic = adapter_label(config.critic, &app.available);
+            let writer_info = crate::adapter::detect_model_info(config.writer, config.writer_model.as_deref());
+            let critic_info = crate::adapter::detect_model_info(config.critic, config.critic_model.as_deref());
             let rows = [
                 format!("Writes code        {writer}"),
-                format!("Writer model       {}", config.writer_model.as_deref().unwrap_or("CLI default")),
+                format!("Writer model       {}", writer_info.display_badge()),
                 format!("Reviews changes    {critic}"),
-                format!("Reviewer model     {}", config.critic_model.as_deref().unwrap_or("CLI default")),
+                format!("Reviewer model     {}", critic_info.display_badge()),
                 format!("Mode               {}", match config.orchestration.mode {
                     OrchestrationMode::Adaptive => "Adaptive · select Pair or Team for each task",
                     OrchestrationMode::Pair => "Pair · write, review, verify",
@@ -2803,7 +3011,7 @@ fn render_workflow(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
             let actions = if editing {
                 "Enter  Apply model   Esc  Cancel edit"
             } else {
-                "↑ ↓  Select   ← →  Change / edit   Enter  Save   R  Check again   Esc  Back"
+                "↑ ↓ Select   ← → Change   p Launch native CLI   Enter Save   R Rescan   Esc Back"
             };
             ("Settings", body, actions.to_owned())
         }
@@ -3044,6 +3252,39 @@ fn render_work_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
         } else if app.active_tasks.iter().any(|task| task.id == id) {
             lines.push(Line::from("/stop Request stop"));
         }
+    } else if !app.dirty_paths.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled(
+                "⚠️ Blocked: Uncommitted changes detected ",
+                Style::default().bold().fg(Color::Yellow),
+            ),
+            Span::styled(
+                format!("({})", app.dirty_paths.total_count),
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("Action: ", Style::default().bold().fg(Color::White)),
+            Span::styled(
+                "[s] Stash changes & run ",
+                Style::default().bold().fg(Color::Cyan),
+            ),
+            Span::styled(
+                "· [d] View diff · /unstash to restore",
+                Style::default().fg(Color::Gray),
+            ),
+        ]));
+        lines.push(Line::default());
+        lines.push(Line::from(vec![
+            Span::styled("Dirty files: ", Style::default().fg(Color::DarkGray)),
+            Span::styled(
+                app.dirty_paths.display_preview(),
+                Style::default().fg(Color::Yellow),
+            ),
+        ]));
+        lines.push(Line::from(
+            "Describe a change to make in this project or press [s] to stash.",
+        ));
     } else {
         let status = if blocker.is_some() {
             "Blocked"
@@ -3055,6 +3296,7 @@ fn render_work_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     }
 
     if let Some(blocker) = blocker
+        && app.dirty_paths.is_empty()
         && !app.supervisor_running
         && app.active_tasks.is_empty()
         && app.status_message.is_none()
@@ -3097,15 +3339,29 @@ fn render_history_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
             ratatui::widgets::ListState::default().with_selected(Some(app.history_selection));
         let items = app.history.iter().map(|entry| {
             let task = &entry.task;
-            let status = if entry.cancelled {
-                "cancelled"
+            let (status_str, status_color) = if entry.cancelled {
+                ("cancelled", Color::Red)
             } else {
-                task.status.as_str()
+                match task.status {
+                    TaskStatus::Complete => ("resolved", Color::Green),
+                    TaskStatus::Failed | TaskStatus::Blocked => ("failed", Color::Red),
+                    TaskStatus::Implementing | TaskStatus::Reviewing | TaskStatus::Verifying => {
+                        ("active", Color::Yellow)
+                    }
+                    TaskStatus::Queued | TaskStatus::Planning => ("queued", Color::Cyan),
+                }
             };
-            ListItem::new(safe_display(&format!(
-                "#{} · {status} · {}",
-                task.id, task.title
-            )))
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("Session #{} ", task.id),
+                    Style::default().bold().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!("[{status_str}] "),
+                    Style::default().bold().fg(status_color),
+                ),
+                Span::styled(safe_display(&task.title), Style::default().fg(Color::White)),
+            ]))
         });
         frame.render_stateful_widget(
             List::new(items)
@@ -3196,15 +3452,29 @@ fn render_history_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
             ratatui::widgets::ListState::default().with_selected(Some(app.history_selection));
         let items = app.history.iter().map(|entry| {
             let task = &entry.task;
-            let status = if entry.cancelled {
-                "cancelled"
+            let (status_str, status_color) = if entry.cancelled {
+                ("cancelled", Color::Red)
             } else {
-                task.status.as_str()
+                match task.status {
+                    TaskStatus::Complete => ("resolved", Color::Green),
+                    TaskStatus::Failed | TaskStatus::Blocked => ("failed", Color::Red),
+                    TaskStatus::Implementing | TaskStatus::Reviewing | TaskStatus::Verifying => {
+                        ("active", Color::Yellow)
+                    }
+                    TaskStatus::Queued | TaskStatus::Planning => ("queued", Color::Cyan),
+                }
             };
-            ListItem::new(safe_display(&format!(
-                "#{} · {status} · {}",
-                task.id, task.title
-            )))
+            ListItem::new(Line::from(vec![
+                Span::styled(
+                    format!("Session #{} ", task.id),
+                    Style::default().bold().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!("[{status_str}] "),
+                    Style::default().bold().fg(status_color),
+                ),
+                Span::styled(safe_display(&task.title), Style::default().fg(Color::White)),
+            ]))
         });
         frame.render_stateful_widget(
             List::new(items)
@@ -3223,11 +3493,11 @@ fn build_unified_feed_lines(app: &TuiApp) -> Vec<Line<'static>> {
     // 1. Convert recent SQLite task events to styled feed lines
     for event in &app.recent_events {
         let (actor_color, badge) = match event.actor.as_str() {
-            "writer" | "writer_lead" => (Color::Yellow, "[WRITER]"),
+            "writer" | "writer_lead" => (Color::Green, "[WRITER]"),
             "critic" | "critic_lead" => (Color::Magenta, "[CRITIC]"),
-            "supervisor" => (Color::Green, "[SUPERVISOR]"),
-            "git" => (Color::LightCyan, "[GIT]"),
-            "worktree" => (Color::Cyan, "[WORKTREE]"),
+            "supervisor" => (Color::LightBlue, "[SUPERVISOR]"),
+            "git" => (Color::Cyan, "[GIT]"),
+            "worktree" => (Color::LightCyan, "[WORKTREE]"),
             _ => (Color::White, "[TASK]"),
         };
 
@@ -3237,6 +3507,22 @@ fn build_unified_feed_lines(app: &TuiApp) -> Vec<Line<'static>> {
             let m = (secs % 3600) / 60;
             let s = secs % 60;
             format!("{:02}:{:02}:{:02}", h, m, s)
+        };
+
+        let event_type_style = if event.event_type.contains("fail")
+            || event.event_type.contains("reject")
+            || event.event_type.contains("error")
+        {
+            Style::default().fg(Color::Red).bold()
+        } else if event.event_type.contains("approve")
+            || event.event_type.contains("complete")
+            || event.event_type.contains("pass")
+        {
+            Style::default().fg(Color::LightGreen).bold()
+        } else if event.event_type.contains("check") || event.event_type.contains("test") {
+            Style::default().fg(Color::LightCyan).bold()
+        } else {
+            Style::default().fg(Color::White).bold()
         };
 
         let reason_clean = safe_display(&event.reason).replace('\n', " ");
@@ -3250,9 +3536,7 @@ fn build_unified_feed_lines(app: &TuiApp) -> Vec<Line<'static>> {
             ),
             Span::styled(
                 format!("#{} {}: ", event.task_id, event.event_type),
-                Style::default()
-                    .fg(Color::White)
-                    .add_modifier(Modifier::BOLD),
+                event_type_style,
             ),
             Span::styled(reason_clean, Style::default().fg(Color::Gray)),
         ]));
@@ -4542,6 +4826,75 @@ mod tests {
                 .as_ref()
                 .is_some_and(|(msg, _)| msg.contains("Continuing Task"))
         );
+
+        let _ = std::fs::remove_dir_all(&project.root);
+    }
+
+    #[test]
+    fn untracked_stash_and_model_mirroring_and_native_passthrough() {
+        let base_project = test_tui_project();
+        let git = |args: &[&str]| {
+            let output = std::process::Command::new("git")
+                .args(args)
+                .current_dir(&base_project.root)
+                .output()
+                .expect("run Git");
+            assert!(
+                output.status.success(),
+                "{}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+        };
+        git(&["init", "--quiet"]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--allow-empty",
+            "-m",
+            "Base",
+        ]);
+        let project = Project::discover(&base_project.root).expect("discover Git project");
+        ensure_talos_ignored(&project).expect("local exclusion");
+        let mut app = TuiApp::with_adapters(
+            project.clone(),
+            vec![AdapterKind::Codex, AdapterKind::Claude],
+        )
+        .expect("create TuiApp");
+        app.screen = Screen::Main;
+
+        // 1. Untracked file like local.txt is created
+        let new_file = project.root.join("local.txt");
+        std::fs::write(&new_file, "hello\n").expect("write untracked file");
+        app.refresh_state().expect("refresh state");
+        assert!(!app.dirty_paths.is_empty());
+        assert!(app.run_blocker(None).is_some());
+
+        // 2. perform_stash stashes untracked file
+        app.perform_stash().expect("stash with untracked files");
+        assert!(app.dirty_paths.is_empty());
+        assert!(app.run_blocker(None).is_none());
+
+        // 3. perform_unstash restores it
+        app.perform_unstash().expect("unstash");
+        assert!(!app.dirty_paths.is_empty());
+
+        // Clean up
+        let _ = std::fs::remove_file(&new_file);
+        app.refresh_state().expect("clean state");
+
+        // 4. Model mirroring returns non-empty badge for active adapters
+        let writer_info = crate::adapter::detect_model_info(app.config.writer, None);
+        assert!(!writer_info.model.is_empty());
+        let critic_info = crate::adapter::detect_model_info(app.config.critic, None);
+        assert!(!critic_info.model.is_empty());
+
+        // 5. Requesting native passthrough sets pending_passthrough
+        assert!(app.pending_passthrough.is_none());
+        app.request_native_passthrough(Some(AdapterKind::Codex));
+        assert_eq!(app.pending_passthrough, Some(AdapterKind::Codex));
 
         let _ = std::fs::remove_dir_all(&project.root);
     }
