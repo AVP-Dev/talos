@@ -239,6 +239,17 @@ Dependency: R6–R8.
 | T19.4 | done | Interactive Slash Command Palette (`/` popup menu) | Typing `/` in Cockpit input bar opens floating palette overlay displaying slash commands (`/cli`, `/mode`, `/task:test`, `/diff`, `/help`, etc.) with real-time prefix filtering, description metadata, and arrow/Tab/Enter selection. Verified with unit test `interactive_slash_command_palette_filtering_and_selection`. |
 | T19.5 | done | Keep task launch and progress on Work | One Enter launches the submitted local task. Work shows its status and keeps blocked input. Review, Changes, Logs, and History are tabs. Settings is the separate screen. Draft PR publishing and generated presets have inline confirmation. |
 
+## R20 — Clean Borderless Workspace, Goal & Stage Progress Tracker, One-Key Clipboard Yank, and Context-Aware Task Continuation (`Continue Task`)
+**Status:** open. Deliver uncluttered copy-friendly workspace without box-drawing traps, single-key system clipboard integration, persistent goal & subtask progress banner, interactive plan inspector, and intelligent task continuation from history.
+
+| ID | Status | Task | Exit criteria |
+|---|---|---|---|
+| T20.1 | open | Borderless Content Canvas & Native Mouse Copying | Remove vertical box-drawing borders (`│`) from reading areas (`Activity`, `Review`, `Diff`, `Logs`, `Plan`). Replace 4-sided `Block::bordered()` with clean top/bottom separators or open margins. Terminal mouse drag-selection copies 100% clean code, diffs, and logs without capturing vertical borders, line numbers, or box corners. |
+| T20.2 | open | One-Key System Clipboard Integration (`y` / `Ctrl+Y` / `/copy`) | Single-key instant export of the active view (diff, review analysis, plan, logs) to system clipboard via macOS `pbcopy` and ANSI OSC 52 escape sequences with visual confirmation toast `✓ Copied to clipboard!`. |
+| T20.3 | open | Pinned Active Goal & Stage Progress Tracker Banner | Persistent top card directly below header rendering root user prompt (`🎯 GOAL`), active stage/round (`📍 STAGE: [2 of 4] T19.2 Adaptive Mode · Phase: Writing`), and visual pipeline breadcrumb tracker (`[✓ T1] ──▶ [▶ T2] ──○ [T3] ──○ [T4]`). |
+| T20.4 | open | Dedicated Interactive Plan & Tasks View (`p` / `[Plan]` Tab) | Full inspection view accessible via `p` or mouse click on Goal banner showing original user request, definition of done, multi-message session thread, and living subtask checklist with worker/worktree assignments and status. |
+| T20.5 | open | Context Pack Assembly & Smart `Continue Task` Engine | History shows structured Resume Summary Card (goal, where it stopped, landed diff, open critic defects, failing check output, git drift). Action `[c] Continue Task` deterministically routes to next logical step (Critic review, Writer fix for open remarks, Writer test fix, or drift reconciliation) with structured context rehydration so agent sessions never restart from scratch. |
+
 ## Required end-to-end scenarios from the original request
 
 First launch/repeat `up`; Writer/Critic success and justified rejection; child task; independent parallel work; adding a task while work is running; manual takeover; CLI recovery; orchestrator crash; SSH disconnect/reconnect; Linux reboot autostart; PR without merge; duplicate-execution prevention; and rechecking original acceptance criteria before closeout. Keep separate evidence for each scenario; do not combine them into a misleading test.

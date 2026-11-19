@@ -514,3 +514,45 @@ No schema change for process identity is selected or implemented. The separate s
      - Support real-time fuzzy/prefix filtering as the user types, with single-key arrow navigation ($\uparrow / \downarrow$) and autocomplete on `Tab` or `Enter`.
 - **Reason:** user feedback confirmed that vanishing adapters after CLI updates is a defect/bad practice, requested terminal-grade command history ($\uparrow / \downarrow$), an interactive slash-command picker, and clarified that TALOS should intelligently choose between Pair and Team modes dynamically.
 - **Consequence:** Round 18 addresses these four items. Core durability, SQLite schema v19, and Git isolation remain unchanged.
+
+## ADR-053 — Clean Borderless Workspace, Goal & Stage Progress Tracker, One-Key Clipboard Yank, and Context-Aware Task Continuation (`Continue Task`)
+
+- **Status:** accepted by the user.
+- **Decision:** implement a clean, production-grade terminal workspace and task resumption engine across five interconnected capabilities in Round 20:
+  1. **Borderless Content Canvas & Clean Terminal Mouse Copying:**
+     - Remove vertical box-drawing borders (`│`) from content reading areas (`Activity`, `Review`, `Diff`, `Logs`, `Plan`).
+     - Replace full 4-sided `Block::bordered()` with clean top/bottom dividers (`Borders::TOP | Borders::BOTTOM`) or open margins.
+     - Terminal mouse drag-selection now copies 100% clean code, diffs, and logs without capturing vertical borders, line numbers, or box corners.
+  2. **One-Key System Clipboard Yank (`y` / `Ctrl+Y` / `/copy`):**
+     - Provide single-key instant clipboard export for the active view (clean diff, critic review analysis, plan, or logs).
+     - Implement multi-layered clipboard delivery using native macOS `pbcopy` and ANSI terminal escape sequence OSC 52 (works over tmux, SSH, and modern terminals).
+     - Display a brief unobtrusive toast notification: `✓ Copied to clipboard!`.
+  3. **Pinned Active Goal & Stage Progress Tracker Banner:**
+     - Render a persistent header card directly above the main workspace:
+       - `🎯 GOAL #ID`: original user request and objective.
+       - `📍 STAGE`: current active subtask / phase (`[2 of 4] T19.2 Adaptive Mode · Phase: Writing`).
+       - Visual pipeline breadcrumb tracker (`[✓ T1] ──▶ [▶ T2] ──○ [T3] ──○ [T4]`).
+     - Adapts dynamically to single tasks (Pair Mode: `Plan ──▶ Write ──▶ Review ──▶ Verify`) and team tasks (Team Mode: decomposed subtasks from SQLite `team_subtasks`).
+  4. **Interactive Plan & Task Decomposition View (`p` / `[Plan]` Tab):**
+     - Full inspection overlay or tab accessible via single-key `p` or mouse click on the Goal banner:
+       - Displays original user request and definition of done.
+       - Displays session message thread (chain of user follow-ups sent during the run).
+       - Displays living checklist of subtasks with status, assigned worker, worktree, dependencies, and result summary.
+  5. **Context-Aware Task Continuation (`Continue Task` in History):**
+     - Transform History from a passive log of past strings into an active resumption and time-machine engine.
+     - When inspecting any past task in History, display a structured **Resume Summary Card**:
+       - Original goal & acceptance criteria.
+       - Where execution stopped (e.g. Writer completed, Critic rejected with defects, verification checks failed).
+       - Git revision and accepted diff.
+       - Open Critic remarks (filtered: only unresolved defects!).
+       - Failed verification check command and failure stack trace.
+       - Git drift detection (divergence between the task's base revision and current working tree).
+     - Add `[c] Continue Task` action (hotkey `c` or `Enter` on task in History):
+       - Deterministically routes to the next logical step:
+         * Code written, review pending $\rightarrow$ dispatches Critic on the existing diff.
+         * Critic rejected $\rightarrow$ dispatches Writer with *only open remarks*.
+         * Tests failed $\rightarrow$ dispatches Writer with the exact failing command and error log.
+         * Git drifted $\rightarrow$ highlights divergence for operator reconciliation.
+       - Assembles the **Structured Context Handoff Pack** for the agent prompt, ensuring fresh agent sessions never hallucinate or restart from scratch.
+- **Reason:** user requested eliminating box-drawing clutter during mouse copy, adding instant 1-key clipboard copy, providing a continuous view of the main goal and current subtask/phase progress, tracking multi-message session threads, and enabling intelligent task continuation from History with context rehydration.
+- **Consequence:** Round 20 implements these five pillars. Core SQLite storage, adapter supervision, and Git worktree isolation remain untouched.

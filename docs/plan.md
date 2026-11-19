@@ -323,13 +323,25 @@ Transform TALOS into a genuinely collaborative autonomous engineering team with 
 
 **Exit criteria:** `agy 1.5.11+` is discoverable in TUI Settings and `/cli`; adaptive mode auto-selects Pair or Team based on complexity; $\uparrow / \downarrow$ scrolls input history; `/` triggers interactive command palette; all tests pass clean. (All 177 tests passing clean).
 
+### R20 — Clean Borderless Workspace, Goal & Stage Progress Tracker, One-Key Clipboard Yank, and Context-Aware Task Continuation (`Continue Task`)
+
+**Outcome:** Deliver an uncluttered, copy-friendly terminal workspace with continuous goal & subtask tracking, and transform History into an active context-aware resumption engine (`Continue task`).
+
+- **Borderless Reading Canvas:** Eliminate mouse-trap vertical borders (`│`) from reading areas (`Activity`, `Review`, `Diff`, `Logs`, `Plan`) so standard terminal mouse drag-selection captures 100% clean code and text without box-drawing clutter.
+- **One-Key Clipboard Yank (`y` / `Ctrl+Y` / `/copy`):** Provide single-key instant export of the active view (diff, review analysis, plan, logs) to system clipboard via macOS `pbcopy` and ANSI OSC 52 with visual confirmation.
+- **Pinned Goal & Stage Progress Tracker:** Persistent top card showing root user prompt (`🎯 GOAL`), current active stage (`📍 STAGE: [2 of 4] T19.2 Adaptive Mode`), and visual pipeline breadcrumbs (`[✓] ──▶ [▶] ──○ [○]`).
+- **Interactive Plan & Tasks View (`p` / `[Plan]` Tab):** Full inspection overlay showing original prompt, multi-message session thread, subtask checklist with worker/worktree assignments, and critic readiness.
+- **Context Pack & Smart `Continue Task` Engine:** History shows a structured Resume Summary Card (goal, where it stopped, landed diff, open critic defects, failing check output, git drift). Action `[c] Continue Task` deterministically routes to the next logical step (Critic review, Writer fix for open remarks, Writer test fix, or drift reconciliation) with structured context rehydration so agent sessions never restart from scratch.
+
+**Exit criteria:** Mouse selection in terminal captures clean text without box borders; `y` / `Ctrl+Y` / `/copy` copies active view to system clipboard; pinned goal & stage progress banner renders active task context; `p` opens Plan & Tasks view with subtask checklist; `Continue task` in History compiles context pack and resumes execution with smart next-step routing; all unit and integration tests pass clean.
+
 ## 6. Dependency order
 
 ```text
 R0 → R1 → R2 → R3 → R4 → R5
                          └──→ R6
 R5 + R6 → R7 → R8 → R9
-R6 + R7 + R8 + R9 → R10 → R11 → R12 → R13 → R14 → R15 → R16 → R17 → R18 → R19
+R6 + R7 + R8 + R9 → R10 → R11 → R12 → R13 → R14 → R15 → R16 → R17 → R18 → R19 → R20
 ```
 
 Implementation details may change based on experiments. Preserve invariants and acceptance checks; update `docs/decisions.md`, `docs/tasks.md`, and `docs/state.md` when scope changes materially.

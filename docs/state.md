@@ -21,6 +21,15 @@ Key implementations delivered and verified:
 3. **Readline Input History (T19.3):** Maintained `input_history`, `history_index`, and `saved_draft` in `TuiApp`. Pressing $\uparrow$ scrolls backward through previously submitted prompts and commands, $\downarrow$ scrolls forward, restoring the unsaved draft at the bottom. De-duplicates consecutive identical submissions. Verified with unit test `tui_input_history_navigation_with_arrows`.
 4. **Interactive Slash Command Palette (T19.4):** Typing `/` in the Cockpit input bar opens an interactive floating popup overlay displaying available slash commands (`/cli`, `/mode`, `/task:test`, `/diff`, `/feed`, `/commit`, `/help`, etc.) with real-time prefix and substring filtering, descriptions, arrow navigation ($\uparrow / \downarrow$), and Tab/Enter autocompletion. Verified with unit test `interactive_slash_command_palette_filtering_and_selection`.
 
+### Round 20 Planning: Clean Borderless Workspace, Goal & Stage Progress Tracker, One-Key Clipboard Yank, and Context-Aware Task Continuation (`Continue Task`)
+
+**Next phase is Round 20 (ADR-053). Scope and task breakdown:**
+- **T20.1 (Borderless Content Canvas):** Remove vertical box borders (`│`) from reading panes so standard terminal mouse drag-selection captures 100% clean code and text.
+- **T20.2 (One-Key Clipboard Yank):** Implement instant system clipboard export (`y` / `Ctrl+Y` / `/copy`) via macOS `pbcopy` and ANSI OSC 52.
+- **T20.3 (Pinned Goal & Stage Progress Tracker):** Render persistent top banner showing root prompt (`🎯 GOAL`), active stage (`📍 STAGE: [2 of 4]`), and visual pipeline breadcrumbs.
+- **T20.4 (Interactive Plan & Tasks View):** Dedicated view (`p` / `[Plan]` Tab) showing prompt, multi-message session thread, and decomposed subtasks checklist.
+- **T20.5 (Context Pack & Smart `Continue Task` Engine):** History displays structured Resume Summary Card; `[c] Continue Task` action deterministically routes to next logical step (Critic review, Writer fix for open remarks, Writer test fix, or drift reconciliation) with structured context rehydration.
+
 Verification on macOS Apple Silicon:
 - `./scripts/verify-project.sh` passed clean across all 5 verification layers:
   1. `cargo fmt --all -- --check` passed.
