@@ -138,6 +138,14 @@ talos doctor
 
 ## Install
 
+### Universal One-Liner (macOS & Linux)
+
+Install the latest verified release directly to `~/.local/bin/talos` (no `sudo` required):
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/AVP-Dev/talos/master/install.sh | bash
+```
+
 ### macOS via Homebrew
 
 ```sh
