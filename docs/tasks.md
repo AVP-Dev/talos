@@ -240,7 +240,7 @@ Dependency: R6–R8.
 | T19.5 | done | Keep task launch and progress on Work | One Enter launches the submitted local task. Work shows its status and keeps blocked input. Review, Changes, Logs, and History are tabs. Settings is the separate screen. Draft PR publishing and generated presets have inline confirmation. |
 
 ## R20 — Clean Borderless Workspace, Goal & Stage Progress Tracker, One-Key Clipboard Yank, and Context-Aware Task Continuation (`Continue Task`)
-**Status:** open. Deliver uncluttered copy-friendly workspace without box-drawing traps, single-key system clipboard integration, persistent goal & subtask progress banner, interactive plan inspector, and intelligent task continuation from history.
+**Status:** complete. Deliver uncluttered copy-friendly workspace without box-drawing traps, single-key system clipboard integration, persistent goal & subtask progress banner, interactive plan inspector, and intelligent task continuation from history.
 
 | ID | Status | Task | Exit criteria |
 |---|---|---|---|
@@ -248,7 +248,7 @@ Dependency: R6–R8.
 | T20.2 | complete | One-Key System Clipboard Integration (`y` / `Ctrl+Y` / `/copy`) | Single-key instant export of the active view (diff, review analysis, plan, logs) to system clipboard via macOS `pbcopy`, Linux clipboard tools, and ANSI OSC 52 escape sequences with visual confirmation toast `✓ Copied to clipboard!`. |
 | T20.3 | complete | Pinned Active Goal & Stage Progress Tracker Banner | Persistent top card directly below header rendering root user prompt (`🎯 GOAL`), active stage/round (`📍 STAGE`), status details, and visual quick actions (`[p] Plan  [d] Diff  [y] Copy`). |
 | T20.4 | complete | Dedicated Interactive Plan & Tasks View (`p` / `[Plan]` Tab) | Full inspection view accessible via `p` / `/plan` showing original user request, execution pipeline / subtask checklist with worker/role assignments and live status. |
-| T20.5 | open | Context Pack Assembly & Smart `Continue Task` Engine | History shows structured Resume Summary Card (goal, where it stopped, landed diff, open critic defects, failing check output, git drift). Action `[c] Continue Task` deterministically routes to next logical step (Critic review, Writer fix for open remarks, Writer test fix, or drift reconciliation) with structured context rehydration so agent sessions never restart from scratch. |
+| T20.5 | complete | Context Pack Assembly & Smart `Continue Task` Engine | History shows structured Resume Summary Card (goal, where it stopped, landed diff, open critic defects, failing check output, git drift). Action `[c] Continue Task` deterministically routes to next logical step (Critic review, Writer fix for open remarks, Writer test fix, or drift reconciliation) with structured context rehydration so agent sessions never restart from scratch. |
 
 ## Required end-to-end scenarios from the original request
 

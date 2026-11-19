@@ -33,7 +33,7 @@ const MAX_WAITING_PREREQUISITE_PREVIEW: usize = 10;
 type FinalizeReviewRow = (i64, String, String, String, Option<String>, Option<String>);
 type VerificationEvidenceRow = (VerificationRunRecord, String, String, String, String);
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskStatus {
     Queued,
@@ -2397,6 +2397,15 @@ impl Database {
             .query_map([], map_task_record)?
             .collect::<rusqlite::Result<Vec<_>>>()?;
         Ok(records)
+    }
+
+    pub fn update_task_acceptance_criteria(&mut self, task_id: i64, criteria: &str) -> Result<()> {
+        let now = now_ms()?;
+        self.connection.execute(
+            "UPDATE tasks SET acceptance_criteria = ?1, updated_at_ms = ?2 WHERE id = ?3",
+            params![criteria, now, task_id],
+        )?;
+        Ok(())
     }
 
     pub(crate) fn recent_tasks(

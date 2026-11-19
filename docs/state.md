@@ -21,32 +21,22 @@ Key implementations delivered and verified:
 3. **Readline Input History (T19.3):** Maintained `input_history`, `history_index`, and `saved_draft` in `TuiApp`. Pressing $\uparrow$ scrolls backward through previously submitted prompts and commands, $\downarrow$ scrolls forward, restoring the unsaved draft at the bottom. De-duplicates consecutive identical submissions. Verified with unit test `tui_input_history_navigation_with_arrows`.
 4. **Interactive Slash Command Palette (T19.4):** Typing `/` in the Cockpit input bar opens an interactive floating popup overlay displaying available slash commands (`/cli`, `/mode`, `/task:test`, `/diff`, `/feed`, `/commit`, `/help`, etc.) with real-time prefix and substring filtering, descriptions, arrow navigation ($\uparrow / \downarrow$), and Tab/Enter autocompletion. Verified with unit test `interactive_slash_command_palette_filtering_and_selection`.
 
-### Round 20: Clean Borderless Workspace, Goal & Stage Progress Tracker, One-Key Clipboard Yank, and Context-Aware Task Continuation (`Continue Task`)
+### Round 20 Closure: Clean Borderless Workspace, Goal & Stage Progress Tracker, One-Key Clipboard Yank, and Context-Aware Task Continuation (`Continue Task`)
 
-**Current phase is Round 20 (ADR-053). Step 1 (T20.1 — T20.4) is complete and fully verified.**
+**Current phase is Round 20 (ADR-053) fully delivered, closed, and verified across all five pillars (T20.1 — T20.5).**
 
-Delivered and verified in Step 1:
-1. **Borderless Content Canvas (T20.1):** Removed vertical box borders (`│`) from all content panes (`Work`, `Review`, `Diff`, `Logs`, `Plan`, `History`). Changed central content blocks to single top/bottom borders (`Borders::TOP`). Mouse drag-selection across terminal cells captures pure clean text and code without border glyphs or box corners.
+Delivered and verified in Round 20:
+1. **Borderless Content Canvas (T20.1):** Removed vertical box-drawing borders (`│`) from all reading areas (`Work`, `Review`, `Diff`, `Logs`, `Plan`, `History`). Changed central content blocks to single top/bottom borders (`Borders::TOP`). Mouse drag-selection across terminal cells captures pure clean text and code without border glyphs or box corners.
 2. **One-Key System Clipboard Integration (T20.2):** Implemented `copy_active_view_to_clipboard` with `y` / `Y` in Work tab, `Ctrl+Y` globally from any tab or screen, and `/copy` slash command. Dual export via macOS `pbcopy` (and Linux `wl-copy`/`xclip`) plus ANSI OSC 52 sequence with visual confirmation toast `✓ Copied to clipboard!`.
 3. **Pinned Goal & Stage Progress Tracker Banner (T20.3):** Added persistent top card directly below header rendering `🎯 GOAL #{id}: {title}`, current phase `📍 STAGE: {stage_label}`, and quick action breadcrumbs `[p] Plan  [d] Diff  [y] Copy`.
 4. **Interactive Plan & Tasks View (T20.4):** Implemented `Screen::Plan` accessible via `p` / `P`, `/plan`, or Goal card action, displaying root prompt, execution pipeline, and subtasks checklist. Closed via `Esc`, `p`, or `Enter`.
+5. **Context Pack Assembly & Smart `Continue Task` Engine (T20.5):** Implemented `TaskResumeContext` and `assemble_resume_context` in `src/summary.rs`. History tab renders an interactive **Resume Summary Card** for the selected task displaying root goal, where it stopped, landed diff summary, open Critic defects, failing check output, and git drift. Pressing `[c]` in History or typing `/continue [id]` (alias `/продолжить`) deterministically routes to the next logical stage (Critic review, Writer fix for open remarks, Writer test fix, or drift reconciliation) without restarting from scratch.
 
 Verification on macOS Apple Silicon:
 - `./scripts/verify-project.sh` passed clean across all 5 verification layers:
   1. `cargo fmt --all -- --check` passed.
   2. `cargo clippy --locked --all-targets --all-features -- -D warnings` passed (0 warnings).
-  3. `cargo test --locked --all-targets` passed (180 passed, 0 failed, 2 ignored).
-  4. `cargo build --locked --release` passed.
-  5. `./scripts/security-scan.sh` clean.
-
-Next step:
-- **T20.5 (Context Pack Assembly & Smart `Continue Task` Engine):** Implement History Resume Summary Card and `[c] Continue Task` action deterministically routing to the next logical step (Critic review, Writer fix for open remarks, Writer test fix, or drift reconciliation) without restarting from scratch.
-
-Verification on macOS Apple Silicon:
-- `./scripts/verify-project.sh` passed clean across all 5 verification layers:
-  1. `cargo fmt --all -- --check` passed.
-  2. `cargo clippy --locked --all-targets --all-features -- -D warnings` passed (0 warnings).
-  3. `cargo test --locked --all-targets` passed (177 passed, 0 failed, 2 ignored).
+  3. `cargo test --locked --all-targets` passed (182 passed, 0 failed, 2 ignored).
   4. `cargo build --locked --release` passed.
   5. `./scripts/security-scan.sh` clean.
 - Fixed CI test isolation in `src/tui.rs`: ensured `TuiApp` created with fixture adapters (`with_adapters`) or host probe retains its configured adapters across settings opening (`open_settings`), CLI rescan (`r`), and retry (`retry_selected_task`), avoiding clearing fixture state on bare CI runners lacking installed CLI binaries.

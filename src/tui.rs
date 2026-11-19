@@ -152,6 +152,10 @@ pub const PALETTE_COMMANDS: &[SlashCommandItem] = &[
         description: "Copy active view to system clipboard",
     },
     SlashCommandItem {
+        cmd: "/continue",
+        description: "Continue task from last confirmed stage (Context Pack)",
+    },
+    SlashCommandItem {
         cmd: "/commit",
         description: "Commit working tree changes",
     },
@@ -986,6 +990,135 @@ impl TuiApp {
         }
     }
 
+    pub fn continue_selected_task(&mut self, task_id: Option<i64>) -> Result<()> {
+        self.refresh_available();
+        self.refresh_state()?;
+        let id = task_id
+            .or_else(|| {
+                if self.active_tab == ActiveTab::History {
+                    self.history
+                        .get(self.history_selection)
+                        .map(|entry| entry.task.id)
+                } else {
+                    self.task_view
+                }
+            })
+            .context("No task selected to continue.")?;
+
+        let database = Database::open(&self.project)?;
+        let resume_context = crate::summary::assemble_resume_context(&self.project, &database, id)?;
+
+        let mut db = Database::open(&self.project)?;
+        match &resume_context.next_step {
+            crate::summary::ResumeNextStep::FixCriticDefects { open_remarks, .. } => {
+                let mut prompt = format!(
+                    "{}\n\n[CONTINUE TASK - FIX CRITIC DEFECTS]\nResolve the following open defects from peer review:\n",
+                    resume_context.acceptance_criteria
+                );
+                for r in open_remarks {
+                    prompt.push_str(&format!("- {r}\n"));
+                }
+                let _ = db.update_task_acceptance_criteria(id, &prompt);
+                let _ = db.transition_task(
+                    id,
+                    TaskStatus::Implementing,
+                    "talos_continue",
+                    "Resume task to fix Critic defects",
+                );
+                let _ = db.record_task_event(
+                    id,
+                    "talos_continue",
+                    "task.continue",
+                    &format!(
+                        "Resumed task #{id} to fix {} open Critic defect(s)",
+                        open_remarks.len()
+                    ),
+                    None,
+                );
+            }
+            crate::summary::ResumeNextStep::FixVerificationFailure {
+                failing_check_id,
+                exit_code,
+                ..
+            } => {
+                let _ = db.transition_task(
+                    id,
+                    TaskStatus::Implementing,
+                    "talos_continue",
+                    "Resume task to fix verification failure",
+                );
+                let _ = db.record_task_event(
+                    id,
+                    "talos_continue",
+                    "task.continue",
+                    &format!(
+                        "Resumed task #{id} to fix failing check '{failing_check_id}' (exit code {exit_code})"
+                    ),
+                    None,
+                );
+            }
+            crate::summary::ResumeNextStep::ReviewPending { .. } => {
+                let _ = db.transition_task(
+                    id,
+                    TaskStatus::Reviewing,
+                    "talos_continue",
+                    "Resume task for Critic review",
+                );
+                let _ = db.record_task_event(
+                    id,
+                    "talos_continue",
+                    "task.continue",
+                    &format!("Resumed task #{id} for Critic review"),
+                    None,
+                );
+            }
+            crate::summary::ResumeNextStep::ReconcileGitDrift { .. } => {
+                let _ = db.transition_task(
+                    id,
+                    TaskStatus::Queued,
+                    "talos_continue",
+                    "Resume task with git drift reconciliation",
+                );
+                let _ = db.record_task_event(
+                    id,
+                    "talos_continue",
+                    "task.continue",
+                    &format!("Resumed task #{id} with git drift reconciliation"),
+                    None,
+                );
+            }
+            crate::summary::ResumeNextStep::RetryTask { reason } => {
+                let _ = db.transition_task(
+                    id,
+                    TaskStatus::Queued,
+                    "talos_continue",
+                    "Retry task from History",
+                );
+                let _ = db.record_task_event(
+                    id,
+                    "talos_continue",
+                    "task.continue",
+                    &format!("Retried task #{id}: {reason}"),
+                    None,
+                );
+            }
+        }
+
+        self.task_view = Some(id);
+        self.task_title = resume_context.title.clone();
+        self.task_status = Some(TaskStatus::Queued);
+        self.task_cancelled = false;
+        self.verification_status = None;
+        self.result_diff = None;
+        self.select_tab(ActiveTab::Work);
+        self.start_selected_task(id)?;
+        self.notice(format!(
+            "✓ Continuing Task #{id}: {}",
+            resume_context.next_step.description()
+        ));
+        Ok(())
+    }
+
     pub fn get_active_view_text(&self) -> String {
         if self.screen == Screen::Plan {
             let (body, _) = self.build_plan_view_content();
@@ -1453,6 +1586,14 @@ impl TuiApp {
             "/copy" | "/копировать" | "/yank" => {
                 self.copy_active_view_to_clipboard();
             }
+            "/continue" | "/продолжить" | "/resume-task" => {
+                let target_id = if arg.is_empty() {
+                    None
+                } else {
+                    arg.parse::<i64>().ok()
+                };
+                self.continue_selected_task(target_id)?;
+            }
             "/diff" | "/дифф" => {
                 self.open_changes()?;
             }
@@ -1493,7 +1634,7 @@ impl TuiApp {
                     Instant::now(),
                 ));
             }
-            "/resume" | "/continue" | "/резюм" | "/продолжить" => {
+            "/resume" | "/резюм" => {
                 let mut database = Database::open(&self.project)?;
                 let revision_id = current_project_revision_id(&self.project);
                 let outcome = database.resume_project(revision_id.as_deref(), false)?;
@@ -2054,6 +2195,14 @@ impl TuiApp {
         match key.code {
             KeyCode::Char('p' | 'P') if self.input.is_empty() && !repeat => {
                 self.open_plan();
+                return Ok(());
+            }
+            KeyCode::Char('c' | 'C')
+                if self.active_tab == ActiveTab::History && self.input.is_empty() && !repeat =>
+            {
+                if let Err(e) = self.continue_selected_task(None) {
+                    self.notice(format!("Continue failed: {e}"));
+                }
                 return Ok(());
             }
             KeyCode::Char('y' | 'Y') if self.input.is_empty() && !repeat => {
@@ -2936,28 +3085,136 @@ fn render_history_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
         frame.render_widget(Paragraph::new("No tasks yet.").block(block), area);
         return;
     }
-    let mut state =
-        ratatui::widgets::ListState::default().with_selected(Some(app.history_selection));
-    let items = app.history.iter().map(|entry| {
-        let task = &entry.task;
-        let status = if entry.cancelled {
-            "cancelled"
-        } else {
-            task.status.as_str()
-        };
-        ListItem::new(safe_display(&format!(
-            "#{} · {status} · {}",
-            task.id, task.title
-        )))
-    });
-    frame.render_stateful_widget(
-        List::new(items)
-            .block(block)
-            .highlight_symbol("› ")
-            .highlight_style(Style::default().fg(Color::Cyan).bold()),
-        area,
-        &mut state,
-    );
+
+    let selected_entry = app.history.get(app.history_selection);
+
+    if area.height >= 12 && selected_entry.is_some() {
+        let card_height = 6.min(area.height.saturating_sub(6));
+        let chunks =
+            Layout::vertical([Constraint::Min(4), Constraint::Length(card_height)]).split(area);
+
+        let mut state =
+            ratatui::widgets::ListState::default().with_selected(Some(app.history_selection));
+        let items = app.history.iter().map(|entry| {
+            let task = &entry.task;
+            let status = if entry.cancelled {
+                "cancelled"
+            } else {
+                task.status.as_str()
+            };
+            ListItem::new(safe_display(&format!(
+                "#{} · {status} · {}",
+                task.id, task.title
+            )))
+        });
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(block)
+                .highlight_symbol("› ")
+                .highlight_style(Style::default().fg(Color::Cyan).bold()),
+            chunks[0],
+            &mut state,
+        );
+
+        // Render Resume Summary Card
+        if let Some(entry) = selected_entry
+            && let Ok(database) = Database::open(&app.project)
+            && let Ok(ctx) =
+                crate::summary::assemble_resume_context(&app.project, &database, entry.task.id)
+        {
+            let mut card_lines = Vec::new();
+            card_lines.push(Line::from(vec![
+                Span::styled("🎯 Task ", Style::default().fg(Color::Cyan).bold()),
+                Span::styled(
+                    format!("#{}: ", ctx.task_id),
+                    Style::default().fg(Color::White).bold(),
+                ),
+                Span::styled(
+                    safe_display(&ctx.title),
+                    Style::default().fg(Color::White).bold(),
+                ),
+            ]));
+            card_lines.push(Line::from(vec![
+                Span::styled("📍 Stopped at: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    safe_display(&ctx.where_stopped),
+                    Style::default().fg(Color::Yellow),
+                ),
+            ]));
+            if let Some(diff) = &ctx.landed_diff_summary {
+                card_lines.push(Line::from(vec![
+                    Span::styled("📄 Changes: ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(diff.as_str(), Style::default().fg(Color::Green)),
+                ]));
+            }
+            if !ctx.open_critic_remarks.is_empty() {
+                let preview = ctx
+                    .open_critic_remarks
+                    .first()
+                    .map(|s| s.as_str())
+                    .unwrap_or("");
+                card_lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("⚠️ Open remark ({}): ", ctx.open_critic_remarks.len()),
+                        Style::default().fg(Color::Red),
+                    ),
+                    Span::styled(safe_display(preview), Style::default().fg(Color::White)),
+                ]));
+            }
+            if let Some(check) = &ctx.failing_check {
+                card_lines.push(Line::from(vec![
+                    Span::styled("❌ Check: ", Style::default().fg(Color::Red)),
+                    Span::styled(check.as_str(), Style::default().fg(Color::White)),
+                ]));
+            }
+            if let Some(drift) = &ctx.git_drift {
+                card_lines.push(Line::from(vec![
+                    Span::styled("🔀 Drift: ", Style::default().fg(Color::Yellow)),
+                    Span::styled(drift.as_str(), Style::default().fg(Color::White)),
+                ]));
+            }
+            card_lines.push(Line::from(vec![
+                Span::styled("⚡ Action: ", Style::default().fg(Color::Cyan).bold()),
+                Span::styled(
+                    ctx.next_step.description(),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    " │ Press [c] to continue",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+
+            let card_block = Block::default()
+                .borders(Borders::TOP)
+                .border_style(Style::default().fg(Color::DarkGray))
+                .title(" Task Resume Card · [c] Continue Task · [y] Copy ");
+            frame.render_widget(Paragraph::new(card_lines).block(card_block), chunks[1]);
+        }
+    } else {
+        let mut state =
+            ratatui::widgets::ListState::default().with_selected(Some(app.history_selection));
+        let items = app.history.iter().map(|entry| {
+            let task = &entry.task;
+            let status = if entry.cancelled {
+                "cancelled"
+            } else {
+                task.status.as_str()
+            };
+            ListItem::new(safe_display(&format!(
+                "#{} · {status} · {}",
+                task.id, task.title
+            )))
+        });
+        frame.render_stateful_widget(
+            List::new(items)
+                .block(block)
+                .highlight_symbol("› ")
+                .highlight_style(Style::default().fg(Color::Cyan).bold()),
+            area,
+            &mut state,
+        );
+    }
 }
 
 fn build_unified_feed_lines(app: &TuiApp) -> Vec<Line<'static>> {
@@ -4237,6 +4494,54 @@ mod tests {
         assert!(rendered_text.contains("#42"));
         assert!(rendered_text.contains("Refactor cockpit UI"));
         assert!(rendered_text.contains("STAGE"));
+
+        let _ = std::fs::remove_dir_all(&project.root);
+    }
+
+    #[test]
+    fn continue_task_action_and_card_rendering() {
+        let project = test_tui_project();
+        let mut database = Database::open(&project).expect("open test database");
+        let task = database
+            .add_task("Fix parser bug", "Ensure valid ast generated")
+            .expect("add task");
+        let mut app = TuiApp::with_adapters(project.clone(), Vec::new()).expect("create TuiApp");
+        app.screen = Screen::Main;
+        app.refresh_state().expect("refresh state");
+
+        // 1. Switch to History tab
+        app.open_history(None).expect("open history");
+        assert_eq!(app.history.len(), 1);
+
+        // 2. Render History UI with Resume Card
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(100, 30)).expect("terminal");
+        terminal
+            .draw(|frame| ui(frame, &mut app))
+            .expect("render ui with history resume card");
+
+        let buffer = terminal.backend().buffer();
+        let rendered_text = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(rendered_text.contains("History"));
+        assert!(rendered_text.contains("Task Resume Card"));
+        assert!(rendered_text.contains("[c] Continue Task"));
+
+        // 3. Slash command /continue executes and switches to Work
+        app.execute_slash_command(&format!("/continue {}", task.id))
+            .expect("run /continue");
+        assert_eq!(app.active_tab, ActiveTab::Work);
+        assert_eq!(app.task_view, Some(task.id));
+        assert!(
+            app.status_message
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("Continuing Task"))
+        );
 
         let _ = std::fs::remove_dir_all(&project.root);
     }
