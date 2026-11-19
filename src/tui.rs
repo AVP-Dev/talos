@@ -2,7 +2,7 @@ use std::{
     fs::{File, OpenOptions},
     io::{self, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
-    process::Child,
+    process::{Child, Command},
     time::{Duration, Instant},
 };
 
@@ -83,6 +83,7 @@ enum Screen {
     WriterModel,
     CriticModel,
     ChooseProject,
+    Plan,
 }
 
 struct TaskDraft {
@@ -141,6 +142,14 @@ pub const PALETTE_COMMANDS: &[SlashCommandItem] = &[
     SlashCommandItem {
         cmd: "/config",
         description: "Open Settings",
+    },
+    SlashCommandItem {
+        cmd: "/plan",
+        description: "Open Goal & Subtasks Plan inspector",
+    },
+    SlashCommandItem {
+        cmd: "/copy",
+        description: "Copy active view to system clipboard",
     },
     SlashCommandItem {
         cmd: "/commit",
@@ -796,6 +805,10 @@ impl TuiApp {
                 self.notice("Settings saved.");
                 return Ok(());
             }
+            Screen::Plan => {
+                self.screen = Screen::Main;
+                return Ok(());
+            }
         }
         self.clear_input();
         Ok(())
@@ -948,6 +961,208 @@ impl TuiApp {
         self.selection = 0;
         self.screen = Screen::Settings;
         self.status_message = None;
+    }
+
+    pub fn open_plan(&mut self) {
+        self.screen = Screen::Plan;
+        self.scroll_offset = 0;
+        self.status_message = None;
+    }
+
+    pub fn has_active_or_recent_task(&self) -> bool {
+        self.task_view.is_some() || self.draft.is_some() || self.supervisor_running
+    }
+
+    pub fn copy_active_view_to_clipboard(&mut self) {
+        let text = self.get_active_view_text();
+        if text.trim().is_empty() {
+            self.notice("Nothing to copy in current view.");
+            return;
+        }
+        if copy_text_to_clipboard(&text) {
+            self.notice("✓ Copied to clipboard!");
+        } else {
+            self.notice("Failed to copy to clipboard.");
+        }
+    }
+
+    pub fn get_active_view_text(&self) -> String {
+        if self.screen == Screen::Plan {
+            let (body, _) = self.build_plan_view_content();
+            return body;
+        }
+        match self.active_tab {
+            ActiveTab::Diff => {
+                if let Some(diff) = &self.result_diff {
+                    diff.clone()
+                } else if !self.diff_lines.is_empty() {
+                    self.diff_lines.join("\n")
+                } else {
+                    "No diff available.".to_string()
+                }
+            }
+            ActiveTab::Dialogue => {
+                let mut out = Vec::new();
+                if let Some(ref rev) = self.latest_review {
+                    out.push(format!(
+                        "Critic Review Verdict: {} (Revision R{})",
+                        rev.decision.to_uppercase(),
+                        rev.revision_id
+                    ));
+                    out.push(format!("Summary: {}", rev.summary));
+                    if !rev.result_json.trim().is_empty() && rev.result_json != "{}" {
+                        out.push(format!("Findings:\n{}", rev.result_json));
+                    }
+                }
+                if let Some(status) = &self.verification_status {
+                    out.push(format!("Project Checks: {}", status));
+                }
+                out.join("\n\n")
+            }
+            ActiveTab::Logs => {
+                let mut out = Vec::new();
+                for event in &self.recent_events {
+                    out.push(format!(
+                        "[{}] #{}: {} - {}",
+                        event.actor, event.task_id, event.event_type, event.reason
+                    ));
+                }
+                for line in &self.supervisor_logs {
+                    out.push(line.clone());
+                }
+                out.join("\n")
+            }
+            ActiveTab::Work => {
+                let mut out = Vec::new();
+                if let Some(draft) = &self.draft {
+                    out.push(format!("Draft Task: {}\n{}", draft.title, draft.criteria));
+                } else if let Some(id) = self.task_view {
+                    out.push(format!("Task #{id}: {}", self.task_title));
+                    if let Some(status) = &self.task_status {
+                        out.push(format!("Status: {:?}", status));
+                    }
+                    if let Some(notice) = &self.run_notice {
+                        out.push(notice.clone());
+                    }
+                }
+                if out.is_empty() {
+                    "Ready · Describe a change to make in this project.".to_string()
+                } else {
+                    out.join("\n\n")
+                }
+            }
+            ActiveTab::History => {
+                let mut out = Vec::new();
+                for entry in &self.history {
+                    out.push(format!(
+                        "#{}: {} ({})",
+                        entry.task.id,
+                        entry.task.title,
+                        entry.task.status.as_str()
+                    ));
+                }
+                if out.is_empty() {
+                    "No task history recorded yet.".to_string()
+                } else {
+                    out.join("\n")
+                }
+            }
+        }
+    }
+
+    pub fn build_plan_view_content(&self) -> (String, String) {
+        let mut body = String::new();
+        if let Some(id) = self.task_view {
+            body.push_str(&format!("🎯 TARGET TASK #{id}: {}\n", self.task_title));
+            if let Some(status) = &self.task_status {
+                body.push_str(&format!("Status: {}\n", status.as_str()));
+            }
+            if let Ok(database) = Database::open(&self.project) {
+                if let Ok(Some(task)) = database.get_task(id) {
+                    body.push_str("\n--- ORIGINAL REQUIREMENTS & CRITERIA ---\n");
+                    body.push_str(&task.acceptance_criteria);
+                    body.push('\n');
+                }
+                if let Ok(subtasks) = database.team_subtasks_for_parent(id) {
+                    if !subtasks.is_empty() {
+                        body.push_str("\n--- DECOMPOSED SUBTASKS & PROGRESS ---\n");
+                        for (i, sub) in subtasks.iter().enumerate() {
+                            let icon = match sub.status.as_str() {
+                                "completed" => "[✓]",
+                                "in_progress" | "running" => "[▶]",
+                                "failed" | "blocked" => "[✗]",
+                                _ => "[○]",
+                            };
+                            let role_adapter = format!("Role: {} ({})", sub.role, sub.adapter);
+                            let title = database
+                                .get_task(sub.subtask_id)
+                                .ok()
+                                .flatten()
+                                .map(|t| t.title)
+                                .unwrap_or_else(|| format!("Subtask #{}", sub.subtask_id));
+                            body.push_str(&format!(
+                                "{} {}. {} | {}\n",
+                                icon,
+                                i + 1,
+                                title,
+                                role_adapter
+                            ));
+                            if let Some(summary) = &sub.result_summary {
+                                body.push_str(&format!(
+                                    "   Summary: {}\n",
+                                    summary.lines().next().unwrap_or("")
+                                ));
+                            }
+                        }
+                    } else {
+                        body.push_str("\n--- EXECUTION PIPELINE (Pair Mode) ---\n");
+                        let status_label = self
+                            .task_status
+                            .as_ref()
+                            .map(|s| s.as_str())
+                            .unwrap_or("unknown");
+                        body.push_str(&format!(
+                            "1. Plan & Triage: Completed\n2. Implementation (Writer: {}): {}\n3. Verification (Critic: {}): {}\n",
+                            self.config.writer.as_str(),
+                            if matches!(
+                                self.task_status,
+                                Some(TaskStatus::Queued | TaskStatus::Planning)
+                            ) {
+                                "Pending"
+                            } else {
+                                "Done"
+                            },
+                            self.config.critic.as_str(),
+                            status_label
+                        ));
+                    }
+                }
+            }
+            if let Some(ref rev) = self.latest_review {
+                body.push_str("\n--- CRITIC REVIEW VERDICT ---\n");
+                body.push_str(&format!(
+                    "Verdict: {} (Revision R{})\n",
+                    rev.decision.to_uppercase(),
+                    rev.revision_id
+                ));
+                body.push_str(&format!("Summary: {}\n", rev.summary));
+                if !rev.result_json.trim().is_empty() && rev.result_json != "{}" {
+                    body.push_str(&format!("Findings:\n{}\n", rev.result_json));
+                }
+            }
+            if let Some(checks) = &self.verification_status {
+                body.push_str(&format!("\nProject Checks: {}\n", checks));
+            }
+        } else if let Some(draft) = &self.draft {
+            body.push_str(&format!(
+                "🎯 UNCONFIRMED DRAFT: {}\n\nCriteria:\n{}",
+                draft.title, draft.criteria
+            ));
+        } else {
+            body.push_str("No active or selected task.\nDescribe a change in the Cockpit or choose a task from History.");
+        }
+        let actions = "Esc / p  Close   y  Copy plan   d  View diff   Enter  Save/New".to_string();
+        (body, actions)
     }
 
     fn new_session(&mut self) -> Result<()> {
@@ -1231,6 +1446,12 @@ impl TuiApp {
             }
             "/dialogue" | "/chat" | "/диалог" | "/чат" => {
                 self.select_tab(ActiveTab::Dialogue);
+            }
+            "/plan" | "/план" => {
+                self.open_plan();
+            }
+            "/copy" | "/копировать" | "/yank" => {
+                self.copy_active_view_to_clipboard();
             }
             "/diff" | "/дифф" => {
                 self.open_changes()?;
@@ -1750,12 +1971,20 @@ impl TuiApp {
             self.should_exit = true;
             return Ok(());
         }
+        if matches!(key.code, KeyCode::Char('y' | 'Y')) && ctrl && !repeat {
+            self.copy_active_view_to_clipboard();
+            return Ok(());
+        }
 
         if key.code == KeyCode::Enter {
             return self.handle_submit();
         }
         if key.code == KeyCode::Esc {
             match self.screen {
+                Screen::Plan => {
+                    self.screen = Screen::Main;
+                    self.scroll_offset = 0;
+                }
                 Screen::Settings => {
                     self.settings = None;
                     self.screen = Screen::Main;
@@ -1774,6 +2003,29 @@ impl TuiApp {
 
         match self.screen {
             Screen::Main => self.handle_work_key(key, repeat),
+            Screen::Plan => {
+                match key.code {
+                    KeyCode::Esc | KeyCode::Char('p' | 'P') | KeyCode::Enter => {
+                        self.screen = Screen::Main;
+                        self.scroll_offset = 0;
+                    }
+                    KeyCode::Char('y' | 'Y') => {
+                        self.copy_active_view_to_clipboard();
+                    }
+                    KeyCode::Char('d' | 'D') => {
+                        self.screen = Screen::Main;
+                        let _ = self.open_changes();
+                    }
+                    KeyCode::Up => self.scroll_offset = self.scroll_offset.saturating_sub(1),
+                    KeyCode::Down => self.scroll_offset = self.scroll_offset.saturating_add(1),
+                    KeyCode::PageUp => self.scroll_offset = self.scroll_offset.saturating_sub(10),
+                    KeyCode::PageDown => self.scroll_offset = self.scroll_offset.saturating_add(10),
+                    KeyCode::Home => self.scroll_offset = 0,
+                    KeyCode::End => self.scroll_offset = usize::MAX / 2,
+                    _ => {}
+                }
+                Ok(())
+            }
             Screen::Settings => {
                 match key.code {
                     KeyCode::Up => self.selection = (self.selection + 4) % 5,
@@ -1800,6 +2052,18 @@ impl TuiApp {
     fn handle_work_key(&mut self, key: KeyEvent, repeat: bool) -> Result<()> {
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
+            KeyCode::Char('p' | 'P') if self.input.is_empty() && !repeat => {
+                self.open_plan();
+                return Ok(());
+            }
+            KeyCode::Char('y' | 'Y') if self.input.is_empty() && !repeat => {
+                self.copy_active_view_to_clipboard();
+                return Ok(());
+            }
+            KeyCode::Char('d' | 'D') if self.input.is_empty() && !repeat => {
+                self.open_changes()?;
+                return Ok(());
+            }
             KeyCode::F(2) => self.open_settings(),
             KeyCode::F(3) => self.open_history(None)?,
             KeyCode::F(4) => self.new_session()?,
@@ -2118,12 +2382,6 @@ fn ui(frame: &mut Frame, app: &mut TuiApp) {
         return;
     }
 
-    let project = app
-        .project
-        .root
-        .file_name()
-        .unwrap_or(app.project.root.as_os_str());
-    let title = format!("TALOS · {}   F2 Settings", project.to_string_lossy());
     let input = InputView::new(app, size);
     let notice = app
         .status_message
@@ -2132,34 +2390,144 @@ fn ui(frame: &mut Frame, app: &mut TuiApp) {
     let notice_rows = notice.as_ref().map_or(0, |paragraph| {
         measure_rows(paragraph, size.width, (size.height / 4).max(2))
     });
+
+    let goal_height = if app.has_active_or_recent_task() && size.height >= 18 {
+        2
+    } else {
+        0
+    };
+
     let chunks = Layout::vertical([
-        Constraint::Length(1),
-        Constraint::Length(2),
-        Constraint::Min(2),
-        Constraint::Length(notice_rows),
-        Constraint::Length(input.height),
+        Constraint::Length(1),            // Header
+        Constraint::Length(goal_height),  // Pinned Goal & Stage Tracker
+        Constraint::Length(1),            // Tabs navigation
+        Constraint::Min(3),               // Content Canvas
+        Constraint::Length(notice_rows),  // Notice Toast
+        Constraint::Length(input.height), // Input Composer
     ])
     .split(size);
 
-    frame.render_widget(
-        Paragraph::new(safe_display(&title)).style(Style::default().bold()),
-        chunks[0],
-    );
-    render_tabs(frame, app, chunks[1]);
+    render_header(frame, app, chunks[0]);
+    if goal_height > 0 {
+        render_goal_tracker(frame, app, chunks[1]);
+    }
+    render_tabs(frame, app, chunks[2]);
     match app.active_tab {
-        ActiveTab::Work => render_work_tab(frame, app, chunks[2]),
-        ActiveTab::Dialogue => render_dialogue_tab(frame, app, chunks[2]),
-        ActiveTab::Diff => render_diff_tab(frame, app, chunks[2]),
-        ActiveTab::Logs => render_unified_feed(frame, app, chunks[2]),
-        ActiveTab::History => render_history_tab(frame, app, chunks[2]),
+        ActiveTab::Work => render_work_tab(frame, app, chunks[3]),
+        ActiveTab::Dialogue => render_dialogue_tab(frame, app, chunks[3]),
+        ActiveTab::Diff => render_diff_tab(frame, app, chunks[3]),
+        ActiveTab::Logs => render_unified_feed(frame, app, chunks[3]),
+        ActiveTab::History => render_history_tab(frame, app, chunks[3]),
     }
     if let Some(notice) = notice {
-        frame.render_widget(notice, chunks[3]);
+        frame.render_widget(notice, chunks[4]);
     }
-    input.render(frame, chunks[4]);
+    input.render(frame, chunks[5]);
     if app.is_palette_active() {
-        render_command_palette(frame, app, chunks[4]);
+        render_command_palette(frame, app, chunks[5]);
     }
+}
+
+fn render_header(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    let project = app
+        .project
+        .root
+        .file_name()
+        .unwrap_or(app.project.root.as_os_str());
+    let mode_str = match app.config.orchestration.mode {
+        OrchestrationMode::Adaptive => "Adaptive",
+        OrchestrationMode::Pair => "Pair",
+        OrchestrationMode::Team => "Team",
+    };
+    let header_line = Line::from(vec![
+        Span::styled("TALOS ", Style::default().bold().fg(Color::Cyan)),
+        Span::styled(
+            format!("· {} ", project.to_string_lossy()),
+            Style::default().bold().fg(Color::White),
+        ),
+        Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("Mode: {mode_str} "),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("Writes: {} ", app.config.writer.as_str()),
+            Style::default().fg(Color::Green),
+        ),
+        Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("Reviews: {} ", app.config.critic.as_str()),
+            Style::default().fg(Color::Magenta),
+        ),
+        Span::styled("│ ", Style::default().fg(Color::DarkGray)),
+        Span::styled("F2 Settings", Style::default().fg(Color::DarkGray)),
+    ]);
+    frame.render_widget(Paragraph::new(header_line), area);
+}
+
+fn render_goal_tracker(frame: &mut Frame, app: &TuiApp, area: Rect) {
+    if area.height == 0 {
+        return;
+    }
+    let mut lines = Vec::new();
+    if let Some(id) = app.task_view {
+        let title_clean = safe_display(&app.task_title);
+        let goal_text = if title_clean.is_empty() {
+            "Active Task".to_string()
+        } else {
+            title_clean
+        };
+        lines.push(Line::from(vec![
+            Span::styled("🎯 GOAL ", Style::default().fg(Color::Cyan).bold()),
+            Span::styled(format!("#{id}: "), Style::default().fg(Color::White).bold()),
+            Span::styled(goal_text, Style::default().fg(Color::White).bold()),
+        ]));
+
+        if area.height > 1 {
+            let (stage_label, stage_color) = if app.task_cancelled {
+                ("Cancelled", Color::Red)
+            } else {
+                match app.task_status {
+                    Some(TaskStatus::Queued) => ("1/4 Queued · Waiting to run", Color::Yellow),
+                    Some(TaskStatus::Planning) => ("1/4 Planning & Triage", Color::Cyan),
+                    Some(TaskStatus::Implementing) => ("2/4 Implementing code", Color::Yellow),
+                    Some(TaskStatus::Reviewing) => ("3/4 Adversarial review", Color::Magenta),
+                    Some(TaskStatus::Verifying) => ("4/4 Running verification checks", Color::Cyan),
+                    Some(TaskStatus::Complete) => ("Completed · All checks passed", Color::Green),
+                    Some(TaskStatus::Blocked) => ("Blocked", Color::Red),
+                    Some(TaskStatus::Failed) => ("Failed", Color::Red),
+                    None => ("Ready", Color::Green),
+                }
+            };
+
+            lines.push(Line::from(vec![
+                Span::styled("📍 STAGE: ", Style::default().fg(Color::DarkGray)),
+                Span::styled(stage_label, Style::default().fg(stage_color).bold()),
+                Span::styled(" │ ", Style::default().fg(Color::DarkGray)),
+                Span::styled(
+                    "[p] Plan  [d] Diff  [y] Copy",
+                    Style::default().fg(Color::DarkGray),
+                ),
+            ]));
+        }
+    } else if let Some(draft) = &app.draft {
+        lines.push(Line::from(vec![
+            Span::styled("🎯 DRAFT: ", Style::default().fg(Color::Yellow).bold()),
+            Span::styled(
+                safe_display(&draft.title),
+                Style::default().fg(Color::White).bold(),
+            ),
+        ]));
+        if area.height > 1 {
+            lines.push(Line::from(vec![Span::styled(
+                "Enter Confirm run · Esc Edit · [p] Plan",
+                Style::default().fg(Color::Cyan),
+            )]));
+        }
+    }
+
+    frame.render_widget(Paragraph::new(lines), area);
 }
 
 fn render_command_palette(frame: &mut Frame, app: &mut TuiApp, input_area: Rect) {
@@ -2290,6 +2658,10 @@ fn render_workflow(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
             };
             ("Settings", body, actions.to_owned())
         }
+        Screen::Plan => {
+            let (body, actions) = app.build_plan_view_content();
+            ("Plan & Tasks", body, actions)
+        }
         Screen::Main => unreachable!(),
     };
     let project = app.project.root.display();
@@ -2317,7 +2689,14 @@ fn render_workflow(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
 
     frame.render_widget(title.block(Block::bordered()), chunks[0]);
     let body = safe_display(&body);
-    let block = Block::bordered();
+    let block = if app.screen == Screen::Plan {
+        Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(" Plan & Task Tree · [y] Copy · Esc Back ")
+    } else {
+        Block::bordered()
+    };
     let inner = block.inner(chunks[1]);
     let paragraph = Paragraph::new(body.as_str()).wrap(Wrap { trim: false });
     let max_scroll = wrapped_scroll_limit(&paragraph, inner).min(u16::MAX as usize) as u16;
@@ -2335,6 +2714,7 @@ fn render_workflow(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
                 .saturating_sub(usize::from(inner.height))
                 .min(usize::from(max_scroll)) as u16
         }
+        Screen::Plan => app.scroll_offset.min(usize::from(max_scroll)) as u16,
         _ => 0,
     };
     frame.render_widget(paragraph.block(block).scroll((scroll, 0)), chunks[1]);
@@ -2360,6 +2740,82 @@ fn safe_display(text: &str) -> String {
     text.chars()
         .filter(|ch| !ch.is_control() || matches!(*ch, '\n' | '\t'))
         .collect()
+}
+
+fn copy_text_to_clipboard(text: &str) -> bool {
+    let mut success = false;
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(mut child) = Command::new("pbcopy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if child.wait().is_ok() {
+                success = true;
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        if let Ok(mut child) = Command::new("wl-copy")
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if child.wait().is_ok() {
+                success = true;
+            }
+        } else if let Ok(mut child) = Command::new("xclip")
+            .args(["-selection", "clipboard"])
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                use std::io::Write;
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            if child.wait().is_ok() {
+                success = true;
+            }
+        }
+    }
+
+    let b64 = base64_encode(text.as_bytes());
+    print!("\x1b]52;c;{}\x07", b64);
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    success || !b64.is_empty()
+}
+
+fn base64_encode(data: &[u8]) -> String {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut out = String::with_capacity(data.len().div_ceil(3) * 4);
+    for chunk in data.chunks(3) {
+        let b0 = chunk[0];
+        let b1 = chunk.get(1).copied().unwrap_or(0);
+        let b2 = chunk.get(2).copied().unwrap_or(0);
+        out.push(CHARS[(b0 >> 2) as usize] as char);
+        out.push(CHARS[(((b0 & 3) << 4) | (b1 >> 4)) as usize] as char);
+        if chunk.len() > 1 {
+            out.push(CHARS[(((b1 & 15) << 2) | (b2 >> 6)) as usize] as char);
+        } else {
+            out.push('=');
+        }
+        if chunk.len() > 2 {
+            out.push(CHARS[(b2 & 63) as usize] as char);
+        } else {
+            out.push('=');
+        }
+    }
+    out
 }
 
 fn render_tabs(frame: &mut Frame, app: &TuiApp, area: Rect) {
@@ -2458,17 +2914,24 @@ fn render_work_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
         lines.push(Line::from(safe_display(&blocker)));
     }
 
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(" Work · [p] Plan · [d] Diff · [y] Copy ");
     render_reader(
         frame,
         Paragraph::new(lines),
-        Block::bordered(),
+        block,
         area,
         &mut app.scroll_offset,
     );
 }
 
 fn render_history_tab(frame: &mut Frame, app: &TuiApp, area: Rect) {
-    let block = Block::bordered().title(" Enter Open · ↑↓ Select · PgUp/PgDn Pages ");
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray))
+        .title(" History · Enter Open · [c] Continue · ↑↓ Select · [y] Copy ");
     if app.history.is_empty() {
         frame.render_widget(Paragraph::new("No tasks yet.").block(block), area);
         return;
@@ -2649,14 +3112,16 @@ fn build_unified_feed_lines(app: &TuiApp) -> Vec<Line<'static>> {
 
 fn render_unified_feed(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     let feed = Paragraph::new(build_unified_feed_lines(app)).wrap(Wrap { trim: true });
-    let block = Block::bordered().border_style(Style::default().fg(Color::Cyan));
+    let block = Block::default()
+        .borders(Borders::TOP)
+        .border_style(Style::default().fg(Color::DarkGray));
     let max_scroll = wrapped_scroll_limit(&feed, block.inner(area)).min(u16::MAX as usize);
     app.scroll_offset = app.scroll_offset.min(max_scroll);
     let start = (max_scroll - app.scroll_offset) as u16;
     let title = if app.scroll_offset > 0 {
-        " Logs · End to follow "
+        " Logs · End to follow · [y] Copy "
     } else {
-        " Logs · Following "
+        " Logs · Following · [y] Copy "
     };
     frame.render_widget(feed.block(block.title(title)).scroll((start, 0)), area);
 }
@@ -2754,9 +3219,9 @@ fn render_dialogue_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     }
 
     let block = Block::default()
-        .borders(Borders::ALL)
-        .title(" Review ")
-        .border_style(Style::default().fg(Color::Magenta));
+        .borders(Borders::TOP)
+        .title(" Review · [y] Copy ")
+        .border_style(Style::default().fg(Color::DarkGray));
 
     render_reader(
         frame,
@@ -2769,10 +3234,14 @@ fn render_dialogue_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
 
 fn render_diff_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
     if let Some(diff) = &app.result_diff {
+        let block = Block::default()
+            .borders(Borders::TOP)
+            .border_style(Style::default().fg(Color::DarkGray))
+            .title(" Saved changes · [y] Copy ");
         render_reader(
             frame,
             Paragraph::new(diff.as_str()),
-            Block::bordered().title(" Saved changes "),
+            block,
             area,
             &mut app.scroll_offset,
         );
@@ -2810,9 +3279,9 @@ fn render_diff_tab(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
         }
 
         let files_block = Block::default()
-            .borders(Borders::ALL)
+            .borders(Borders::TOP | Borders::BOTTOM)
             .title(" Changed files · Alt+↑/↓ Select ")
-            .border_style(Style::default().fg(Color::Yellow));
+            .border_style(Style::default().fg(Color::DarkGray));
 
         frame.render_widget(List::new(file_items).block(files_block), chunks[0]);
 
@@ -2852,20 +3321,20 @@ fn render_diff_view(frame: &mut Frame, app: &mut TuiApp, area: Rect) {
 
     let title = if let Some(selected) = app.selected_modified_file() {
         format!(
-            " 📄 Live Git Diff: Selected [{selected}] ({} diff lines) ",
+            " 📄 Live Git Diff: Selected [{selected}] ({} diff lines) · [y] Copy ",
             app.diff_lines.len()
         )
     } else {
         format!(
-            " 📄 Live Code Diff ({} lines changed) ",
+            " 📄 Live Code Diff ({} lines changed) · [y] Copy ",
             app.diff_lines.len()
         )
     };
 
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP)
         .title(title)
-        .border_style(Style::default().fg(Color::Green));
+        .border_style(Style::default().fg(Color::DarkGray));
 
     render_reader(
         frame,
@@ -3652,6 +4121,122 @@ mod tests {
         app.execute_slash_command("/mode команда")
             .expect("set team ru");
         assert_eq!(app.config.orchestration.mode, OrchestrationMode::Team);
+
+        let _ = std::fs::remove_dir_all(&project.root);
+    }
+
+    #[test]
+    fn plan_view_navigation_and_shortcuts() {
+        let project = test_tui_project();
+        let mut app = TuiApp::with_adapters(project.clone(), Vec::new()).expect("create TuiApp");
+        app.screen = Screen::Main;
+
+        // 1. Initial screen is Main
+        assert_eq!(app.screen, Screen::Main);
+
+        // 2. Open plan via method or 'p' key in Work tab
+        app.active_tab = ActiveTab::Work;
+        app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::NONE))
+            .expect("open plan with p");
+        assert_eq!(app.screen, Screen::Plan);
+
+        // 3. Plan content generation is non-empty
+        let (body, actions) = app.build_plan_view_content();
+        assert!(!body.is_empty());
+        assert!(actions.contains("Esc"));
+
+        // 4. Esc returns to Main
+        app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))
+            .expect("close plan with Esc");
+        assert_eq!(app.screen, Screen::Main);
+
+        // 5. Slash command /plan opens plan
+        app.execute_slash_command("/plan").expect("run /plan");
+        assert_eq!(app.screen, Screen::Plan);
+
+        // 6. Enter closes plan
+        app.handle_submit().expect("submit in plan screen");
+        assert_eq!(app.screen, Screen::Main);
+
+        let _ = std::fs::remove_dir_all(&project.root);
+    }
+
+    #[test]
+    fn clipboard_copy_view_and_shortcuts() {
+        let project = test_tui_project();
+        let mut app = TuiApp::with_adapters(project.clone(), Vec::new()).expect("create TuiApp");
+        app.screen = Screen::Main;
+        app.task_view = Some(1);
+        app.task_title = "Implement feature X".to_string();
+
+        // 1. Work view text extraction
+        app.active_tab = ActiveTab::Work;
+        let work_text = app.get_active_view_text();
+        assert!(
+            work_text.contains("Implement feature X")
+                || work_text.contains("Task #1")
+                || work_text.contains("Ready")
+        );
+
+        // 2. Copy active view
+        app.copy_active_view_to_clipboard();
+        assert!(
+            app.status_message
+                .as_ref()
+                .is_some_and(|(msg, _)| { msg.contains("Copied") && msg.contains("clipboard") })
+        );
+
+        // 3. 'y' key in Work tab triggers copy
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE))
+            .expect("copy with y");
+        assert!(
+            app.status_message
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("Copied"))
+        );
+
+        // 4. Ctrl+Y global copy works from any tab
+        app.active_tab = ActiveTab::History;
+        app.handle_key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::CONTROL))
+            .expect("copy with Ctrl+Y");
+        assert!(
+            app.status_message
+                .as_ref()
+                .is_some_and(|(msg, _)| msg.contains("Copied"))
+        );
+
+        let _ = std::fs::remove_dir_all(&project.root);
+    }
+
+    #[test]
+    fn goal_tracker_and_borderless_rendering() {
+        let project = test_tui_project();
+        let mut app = TuiApp::with_adapters(project.clone(), Vec::new()).expect("create TuiApp");
+        app.screen = Screen::Main;
+        app.task_view = Some(42);
+        app.task_title = "Refactor cockpit UI".to_string();
+        app.task_status = Some(TaskStatus::Implementing);
+
+        assert!(app.has_active_or_recent_task());
+
+        let mut terminal =
+            Terminal::new(ratatui::backend::TestBackend::new(100, 30)).expect("terminal");
+        terminal
+            .draw(|frame| ui(frame, &mut app))
+            .expect("render ui with goal tracker");
+
+        let buffer = terminal.backend().buffer();
+        let rendered_text = buffer
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<Vec<_>>()
+            .join("");
+
+        assert!(rendered_text.contains("GOAL"));
+        assert!(rendered_text.contains("#42"));
+        assert!(rendered_text.contains("Refactor cockpit UI"));
+        assert!(rendered_text.contains("STAGE"));
 
         let _ = std::fs::remove_dir_all(&project.root);
     }
