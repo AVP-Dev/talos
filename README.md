@@ -143,7 +143,7 @@ talos doctor
 Install the latest verified release directly to `~/.local/bin/talos` (no `sudo` required):
 
 ```sh
-curl -fsSL https://raw.githubusercontent.com/AVP-Dev/talos/master/install.sh | bash
+curl -fsSL https://talos.avpdev.com/install.sh | bash
 ```
 
 ### macOS via Homebrew
