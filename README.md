@@ -206,11 +206,10 @@ talos up --auto --task 1
 
 ---
 
+TALOS is an open-source project by [Aliaksei Patskevich](https://avpdev.com/). [Apache 2.0 License](LICENSE)
+
+---
+
 <div align="center">
-  <p>TALOS is an open-source project by <a href="https://avpdev.com/">Aliaksei Patskevich (AVPDev)</a>.</p>
-  <p>
-    <a href="https://github.com/AVP-Dev">GitHub</a> ·
-    <a href="https://t.me/AVP_Dev">Telegram</a> ·
-    <a href="LICENSE">Apache 2.0 License</a>
-  </p>
+<sub>AVPdev · Software Development &amp; Automation · <a href="https://avpdev.com/">avpdev.com</a></sub>
 </div>
