@@ -4,6 +4,21 @@
 
 This record distinguishes observed live runs, deterministic fixture runs and code-level tests. A result applies to the configuration and build described in that row.
 
+## R22 experimental native workspace
+
+CI run [46075309815](https://github.com/AVP-Dev/talos/actions/runs/46075309815)
+passed the real tmux topology and process-identity reuse test with fixture
+executables on macOS and Ubuntu. It did not exercise provider accounts.
+
+Manual acceptance remains pending:
+
+1. Obtain the preview binary from a successful master CI run and verify its archive checksum.
+2. In a disposable Git project, configure two installed native CLIs and run `talos attach`.
+3. Confirm that each original CLI responds to its own input and settings, and the lower status panel stays compact.
+4. Switch panes, zoom and unzoom, and open and reopen the full cockpit without duplicating windows.
+5. Detach or disconnect SSH, reconnect from another terminal and confirm the same panes and conversations remain present.
+6. Exit a native CLI and confirm its pane stays available for manual restart. Do not infer managed task completion from native output.
+
 ## v0.1.1 cockpit acceptance
 
 | Scenario | Evidence |

@@ -265,8 +265,8 @@ Dependency: R6–R8.
 
 | ID | Status | Task | Exit criteria |
 |---|---|---|---|
-| T22.1 | in progress | Native Pair tmux workspace | Writer and Critic use original CLI executables; compact status panel; topology checked on reuse; incomplete sessions preserved. Rust validation pending. |
-| T22.2 | in progress | Native session acceptance | Added isolated tmux geometry and PID reuse test to macOS/Linux CI; fixture coverage includes missing/dead panes and cockpit window reuse. CI and actual SSH detach/reconnect, role configuration, zoom and CLI exit acceptance remain pending. |
+| T22.1 | done | Native Pair tmux workspace | CI run 46075309815 passed formatting, Clippy, 189 tests and isolated real-tmux geometry/PID-reuse test on Ubuntu and macOS. Merged as e87ac235. Native provider acceptance is T22.2. |
+| T22.2 | in progress | Native session acceptance | Automated layout and reuse passed on both platforms. Actual provider startup, SSH detach/reconnect, role configuration, zoom and CLI exit acceptance remain pending. |
 | T22.3 | planned | Managed/manual authority boundary | Define and verify provider-supported handoff without duplicating Writer execution or inferring evidence from screen contents. |
 
 ## Required end-to-end scenarios from the original request

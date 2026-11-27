@@ -13,23 +13,23 @@ workspace is a manual mode, not a claim of live managed agent coordination.
 No provider flags or prompts are injected into the native processes; native
 permissions apply. Existing tmux sessions are preserved on reconnect.
 
-T22.1 changes the launch path and adds fixture and isolated tmux tests. The
-Rust toolchain and tmux are absent in this execution environment; package
-installation was denied by filesystem permissions. `git diff --check` and
-`./scripts/security-scan.sh` passed. `cargo fmt --all -- --check` and
-`cargo test --locked --all-targets` could not start (`cargo` not found).
-T22.2 preparation now records the three pane IDs after successful setup,
-checks their liveness on reattachment, and leaves incomplete workspaces
-untouched for explicit operator recovery. New native workspace creation is
-blocked while the database reports active managed tasks. The compact pane
-targets its own tmux session and reuses one full cockpit window. Added
-topology/recovery fixture tests and a real isolated tmux CI check on Ubuntu
-and macOS that compares pane process IDs before and after workspace reuse.
-Build, formatting, actual pane geometry, CLI startup and SSH acceptance
-remain pending because the execution environment still lacks Rust and tmux.
-The CI check is authored, not yet executed. The modified CI YAML parsed,
-`git diff --check` passed, and `./scripts/security-scan.sh` passed again.
-Do not mark R22 complete.
+T22.1 records the three pane IDs after successful setup, checks their
+liveness on reattachment, and leaves incomplete workspaces untouched for
+explicit operator recovery. Session targets are resolved by exact name to
+numeric tmux IDs. The compact pane reuses one full cockpit window.
+
+On 2026-11-28, [CI run 46075309815](https://github.com/AVP-Dev/talos/actions/runs/46075309815)
+passed on Ubuntu and macOS at commit `1138393`. Each runner passed rustfmt,
+Clippy, 189 ordinary tests (2 ignored), one explicitly invoked isolated
+real-tmux geometry/PID reuse test, and the release build. PR #1 was merged
+as `e87ac235`. These are fixture-process results, not native provider or SSH
+acceptance. `git diff --check` and the local secret scan also passed.
+
+T22.2 still requires actual CLI startup, role settings, zoom and switching,
+and detach/reconnect over SSH. A CI preview archive will allow manual
+acceptance without publishing a stable release or updating Homebrew.
+Do not mark R22 complete before those checks and the managed/native boundary
+review are complete.
 
 ### Work and Settings cockpit update
 
@@ -705,11 +705,10 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 
 ## Next action
 
-Next action is **T22.1/T22.2**: run the Rust verification profile, isolated
-real-tmux layout/reuse test and native CLI startup checks on a host with the
-required tools. Then verify an actual SSH detach/reconnect scenario.
-Keep the native workspace on its dedicated branch until acceptance; do not
-push to remote or publish a PR without explicit user instruction.
+Next action is **T22.2**: use the CI preview binary on the operator's host to
+verify native CLI interaction and SSH detach/reconnect. Keep stable releases
+unchanged until the acceptance gate passes. The user authorized master and
+build changes for this work; PR #1 is merged.
 
 ## Session close checklist
 
