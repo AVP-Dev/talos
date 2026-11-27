@@ -39,10 +39,10 @@ impl TmuxClient {
     pub fn ensure_pair_workspace(&self, root: &Path, config: &ProjectConfig) -> Result<String> {
         let root = root.canonicalize().context("Cannot resolve project root")?;
         let name = project_session_name(&root);
-        if self.has_session(&name)? {
+        if let Some(session_id) = self.find_session_id(&name)? {
             self.validate_pair_workspace(&name).with_context(|| {
                 format!(
-                    "Workspace {name} is incomplete; inspect it with tmux attach-session -t ={name}. Existing panes were not changed"
+                    "Workspace {name} is incomplete; inspect it with tmux attach-session -t '{session_id}'. Existing panes were not changed"
                 )
             })?;
             return Ok(name);
@@ -159,7 +159,7 @@ impl TmuxClient {
         self.checked(self.command().args(["select-pane", "-t", writer_id]))?;
         // Publish topology only after all pane creation and configuration succeeded.
         // A failed or interrupted setup is never mistaken for a complete workspace.
-        let target = exact_session_target(name)?;
+        let target = self.session_target(name)?;
         let pane_ids = format!("{writer_id} {critic_id} {bottom_id}");
         self.checked(self.command().args([
             "set-option",
@@ -173,7 +173,7 @@ impl TmuxClient {
     }
 
     fn validate_pair_workspace(&self, name: &str) -> Result<()> {
-        let target = exact_session_target(name)?;
+        let target = self.session_target(name)?;
         let recorded = self.checked(self.command().args([
             "show-options",
             "-qv",
@@ -229,7 +229,7 @@ impl TmuxClient {
     }
 
     pub fn attach_project_session(&self, session_name: &str) -> Result<()> {
-        let target = exact_session_target(session_name)?;
+        let target = self.session_target(session_name)?;
         if env::var_os("TMUX").is_some() {
             let current = self
                 .command()
@@ -250,15 +250,30 @@ impl TmuxClient {
     }
 
     pub fn has_session(&self, session_name: &str) -> Result<bool> {
-        let target = exact_session_target(session_name)?;
+        Ok(self.find_session_id(session_name)?.is_some())
+    }
+
+    fn session_target(&self, session_name: &str) -> Result<String> {
+        self.find_session_id(session_name)?
+            .context("TALOS tmux session no longer exists")
+    }
+
+    fn find_session_id(&self, session_name: &str) -> Result<Option<String>> {
+        validate_session_name(session_name)?;
         let output = self
             .command()
-            .arg("has-session")
-            .arg("-t")
-            .arg(&target)
+            .args(["list-sessions", "-F", "#{session_id} #{session_name}"])
             .output()
             .context("Cannot run tmux; install tmux or use TALOS in the foreground")?;
-        Ok(output.status.success())
+        if !output.status.success() {
+            let error = safe_stderr(&output);
+            if error.contains("no server running") || error.contains("No such file or directory") {
+                return Ok(None);
+            }
+            bail!("Cannot list tmux sessions: {error}");
+        }
+        let sessions = String::from_utf8(output.stdout).context("Invalid tmux session list")?;
+        Ok(find_exact_session_id(&sessions, session_name)?.map(str::to_owned))
     }
 
     fn run_interactive(&self, subcommand: &str, target: &str) -> Result<()> {
@@ -337,7 +352,7 @@ pub fn project_session_name(project_root: &Path) -> String {
     format!("talos-pair-{suffix}")
 }
 
-fn exact_session_target(session_name: &str) -> Result<String> {
+fn validate_session_name(session_name: &str) -> Result<()> {
     if !session_name
         .strip_prefix("talos-pair-")
         .is_some_and(|suffix| {
@@ -346,7 +361,23 @@ fn exact_session_target(session_name: &str) -> Result<String> {
     {
         bail!("TALOS tmux session name is invalid");
     }
-    Ok(format!("={session_name}"))
+    Ok(())
+}
+
+fn find_exact_session_id<'a>(sessions: &'a str, name: &str) -> Result<Option<&'a str>> {
+    for line in sessions.lines() {
+        if let Some((id, observed_name)) = line.split_once(' ')
+            && observed_name == name
+        {
+            if !id.strip_prefix('$').is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+            }) {
+                bail!("Invalid tmux session identity");
+            }
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
 }
 
 fn safe_stderr(output: &Output) -> String {
@@ -369,8 +400,8 @@ mod tests {
     };
 
     use super::{
-        TmuxClient, exact_session_target, pane_id, parse_workspace_panes, project_session_name,
-        validate_live_panes,
+        TmuxClient, find_exact_session_id, pane_id, parse_workspace_panes, project_session_name,
+        validate_live_panes, validate_session_name,
     };
     use crate::config::ProjectConfig;
 
@@ -407,7 +438,7 @@ mod tests {
         let executable = root.join("tmux");
         let state_file = root.join("sessions");
         let script = format!(
-            "#!/bin/sh\nSTATE='{}'\ncase \"$1\" in\n  has-session) target=\"${{3#=}}\"; grep -Fx -- \"$target\" \"$STATE\" >/dev/null 2>&1 ;;\n  new-session) shift; while [ \"$#\" -gt 0 ]; do case \"$1\" in -s) session=\"$2\"; shift 2 ;; *) shift ;; esac; done; printf '%s\\n' \"$session\" >> \"$STATE\"; printf '%%0\\n' ;;\n  split-window) case \"$3\" in -v) printf '%%1\\n' ;; -h) printf '%%2\\n' ;; *) exit 2 ;; esac ;;\n  select-pane) exit 0 ;;\n  set-option) if [ \"$4\" = '@talos_pair_panes' ]; then printf '%s\\n' \"$5\" > \"$STATE.panes\"; fi ;;\n  show-options) if [ -f \"$STATE.panes\" ]; then cat \"$STATE.panes\"; fi ;;\n  list-panes) printf '%%0 0\\n%%1 0\\n%%2 0\\n' ;;\n  list-sessions) cat \"$STATE\" ;;\n  *) exit 2 ;;\nesac\n",
+            "#!/bin/sh\nSTATE='{}'\ncase \"$1\" in\n  has-session) target=\"${{3#=}}\"; grep -Fx -- \"$target\" \"$STATE\" >/dev/null 2>&1 ;;\n  new-session) shift; while [ \"$#\" -gt 0 ]; do case \"$1\" in -s) session=\"$2\"; shift 2 ;; *) shift ;; esac; done; printf '%s\\n' \"$session\" >> \"$STATE\"; printf '%%0\\n' ;;\n  split-window) case \"$3\" in -v) printf '%%1\\n' ;; -h) printf '%%2\\n' ;; *) exit 2 ;; esac ;;\n  select-pane) exit 0 ;;\n  set-option) if [ \"$4\" = '@talos_pair_panes' ]; then printf '%s\\n' \"$5\" > \"$STATE.panes\"; fi ;;\n  show-options) if [ -f \"$STATE.panes\" ]; then cat \"$STATE.panes\"; fi ;;\n  list-panes) printf '%%0 0\\n%%1 0\\n%%2 0\\n' ;;\n  list-sessions) if [ ! -f \"$STATE\" ]; then printf 'no server running\\n' >&2; exit 1; fi; if [ \"$#\" -gt 1 ]; then while IFS= read -r session; do printf '$0 %s\\n' \"$session\"; done < \"$STATE\"; else cat \"$STATE\"; fi ;;\n  *) exit 2 ;;\nesac\n",
             state_file.display()
         );
         fs::write(&executable, script).expect("write fake tmux executable");
@@ -425,8 +456,11 @@ mod tests {
         let name = project_session_name(&project);
         assert_eq!(name, project_session_name(&project));
         assert!(name.starts_with("talos-"));
-        assert_eq!(exact_session_target(&name).unwrap(), format!("={name}"));
-        assert!(exact_session_target("talos-bad/name").is_err());
+        assert!(validate_session_name(&name).is_ok());
+        assert!(validate_session_name("talos-bad/name").is_err());
+        let sessions = format!("$0 {name}-other\n$1 {name}\n");
+        assert_eq!(find_exact_session_id(&sessions, &name).unwrap(), Some("$1"));
+        assert_eq!(find_exact_session_id(&sessions, "other").unwrap(), None);
         assert_eq!(pane_id("%12\n").unwrap(), "%12");
         assert!(pane_id("%12:other").is_err());
     }
