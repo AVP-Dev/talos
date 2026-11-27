@@ -42,8 +42,11 @@ pub enum Command {
     Stop,
     /// Check local project and database readiness.
     Doctor,
-    /// Create or reconnect to this project's persistent tmux control shell.
+    /// Create or reconnect to this project's persistent native Pair workspace.
     Attach,
+    /// Show the compact workspace status panel.
+    #[command(hide = true)]
+    WorkspaceStatus,
     /// View or modify project configuration (.talos/config.json).
     Config(ConfigArgs),
     /// Launch the interactive terminal orchestrator dashboard.

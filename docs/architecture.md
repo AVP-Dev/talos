@@ -4,6 +4,13 @@
 
 TALOS is a local Rust orchestrator for installed AI coding CLIs. One executable owns project discovery, the cockpit and command-line interface, the task queue, process supervision, and review and verification gates. SQLite WAL is the durable state store. No separate TALOS server is required.
 
+R22 introduces a separate, experimental native Pair workspace. tmux keeps
+two original interactive CLI processes and a compact TALOS status pane alive
+across client disconnections. Native input, authentication and permissions
+are provider-owned. The status pane reads managed state; it does not parse
+interactive terminal output or silently assign work to these processes. The
+existing managed cockpit is still available with `talos tui`.
+
 ```text
 Cockpit or shell → Task queue and project configuration
                           ↓

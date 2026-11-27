@@ -18,6 +18,7 @@ pub mod team;
 pub mod tmux;
 pub mod tui;
 pub mod worktree;
+mod workspace;
 
 mod process_identity;
 

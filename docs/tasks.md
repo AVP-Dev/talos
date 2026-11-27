@@ -261,6 +261,14 @@ Dependency: R6–R8.
 | T21.4 | complete | Vibrant Semantic Color Accents & Feed Hierarchy | Apply distinct, tasteful colors across TUI: Header roles (`Writes` in green, `Reviews` in magenta, `Mode` in blue/cyan), Feed/Logs role tags (`[WRITER]` in bold green, `[CRITIC]` in bold magenta, `[TEST]`/`[CHECK]` in light cyan, `[ERROR]`/`[FAIL]` in red, `[DONE]`/`[APPROVED]` in green), and Work view blocker warnings. |
 | T21.5 | complete | Session-Oriented History View | Render history items as structured Sessions (`Session #<id> · [<status>] · <time> · <task_title>`) with color-coded status badges, making task history read as a sequence of autonomous sessions rather than raw messages. |
 
+## R22 — Native workspace
+
+| ID | Status | Task | Exit criteria |
+|---|---|---|---|
+| T22.1 | in progress | Native Pair tmux workspace | Writer and Critic use original CLI executables; compact status panel; topology checked on reuse; incomplete sessions preserved. Rust validation pending. |
+| T22.2 | in progress | Native session acceptance | Added isolated tmux geometry and PID reuse test to macOS/Linux CI; fixture coverage includes missing/dead panes and cockpit window reuse. CI and actual SSH detach/reconnect, role configuration, zoom and CLI exit acceptance remain pending. |
+| T22.3 | planned | Managed/manual authority boundary | Define and verify provider-supported handoff without duplicating Writer execution or inferring evidence from screen contents. |
+
 ## Required end-to-end scenarios from the original request
 
 First launch/repeat `up`; Writer/Critic success and justified rejection; child task; independent parallel work; adding a task while work is running; manual takeover; CLI recovery; orchestrator crash; SSH disconnect/reconnect; Linux reboot autostart; PR without merge; duplicate-execution prevention; and rechecking original acceptance criteria before closeout. Keep separate evidence for each scenario; do not combine them into a misleading test.

@@ -71,6 +71,40 @@
 
 ## Quick Start
 
+### Native Pair workspace (R22, experimental)
+
+On a host with tmux, an interactive `talos` launch inside a Git repository
+opens or reconnects to the project workspace. `talos attach` explicitly
+selects the workspace; `talos tui` still opens the standalone managed cockpit.
+
+Configure the two installed CLIs before the first launch:
+
+```sh
+talos config set writer codex
+talos config set critic claude
+talos attach
+```
+
+Writer and Critic are genuine interactive CLI processes in the upper panes.
+The lower pane is a compact TALOS status view. Use native model, login and
+permission commands inside each CLI. Use the tmux prefix (usually Ctrl+B)
+then an arrow to switch panes, `z` to zoom, and `d` to detach. Reconnect from
+another SSH client with `talos attach` in the same project. Existing native
+workspaces are reused; legacy `talos-*` sessions are left untouched. No session
+is restarted to apply a role change.
+If creation is interrupted or a pane is lost, TALOS reports the incomplete
+session and gives its exact tmux attach command for manual inspection. It
+does not restart surviving processes. New workspace creation is blocked while
+managed tasks are active. Press `c` in the status pane to reopen the existing
+full cockpit window instead of creating duplicates.
+
+This first slice is operator-controlled: native panes are not managed worker
+attempts, and the Critic label is not a read-only permission boundary. Do not
+run a managed Writer concurrently with manual edits. The status pane reports
+recorded TALOS tasks, not inferred progress from native CLI screens. Use
+`c` in the lower pane to open the full cockpit in a separate tmux window,
+or `talos tui` separately for managed tasks and detailed history.
+
 ### 1. Launch TALOS
 Inside any existing Git repository with at least one commit:
 ```sh
