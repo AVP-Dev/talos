@@ -347,6 +347,17 @@ Transform TALOS into a genuinely collaborative autonomous engineering team with 
 
 **Exit criteria:** Untracked files like `.gitignore` are cleanly stashed via single-key `s` or `/stash` with immediate unblock; native configs for Pi, Codex, Claude, OMP, OpenCode are inspected and active model + reasoning badges mirrored in header and settings; `/native` launches interactive CLI and returns cleanly to restored TUI; semantic colors clearly separate Writer, Critic, Errors, Checks, and Badges; History displays session-structured cards; all unit and integration tests pass clean.
 
+### R22 — Native Pair workspace
+
+Restore native CLI interaction as the primary workspace. Use tmux for durable
+terminal sessions, two side-by-side native agent panes and a compact bottom
+status panel. Keep existing standalone managed execution available explicitly.
+Native CLI permissions and conversations remain provider-owned. Do not infer
+completion from terminal output or treat a manual Critic as enforced read-only.
+The first slice establishes layout and reconnect; managed session handoff is
+a separate acceptance gate. Validate actual tmux layout, detach/reattach,
+and original CLI startup before calling the round complete.
+
 ## 6. Dependency order
 
 ```text

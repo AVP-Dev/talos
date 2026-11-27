@@ -4,6 +4,33 @@
 
 ## Current phase
 
+### R22 — Native Pair workspace (in progress)
+
+The user approved the native CLI workspace: two equal upper panes and a
+compact lower TALOS status pane in a persistent tmux session. The existing
+managed standalone cockpit remains available as `talos tui`. The native
+workspace is a manual mode, not a claim of live managed agent coordination.
+No provider flags or prompts are injected into the native processes; native
+permissions apply. Existing tmux sessions are preserved on reconnect.
+
+T22.1 changes the launch path and adds fixture and isolated tmux tests. The
+Rust toolchain and tmux are absent in this execution environment; package
+installation was denied by filesystem permissions. `git diff --check` and
+`./scripts/security-scan.sh` passed. `cargo fmt --all -- --check` and
+`cargo test --locked --all-targets` could not start (`cargo` not found).
+T22.2 preparation now records the three pane IDs after successful setup,
+checks their liveness on reattachment, and leaves incomplete workspaces
+untouched for explicit operator recovery. New native workspace creation is
+blocked while the database reports active managed tasks. The compact pane
+targets its own tmux session and reuses one full cockpit window. Added
+topology/recovery fixture tests and a real isolated tmux CI check on Ubuntu
+and macOS that compares pane process IDs before and after workspace reuse.
+Build, formatting, actual pane geometry, CLI startup and SSH acceptance
+remain pending because the execution environment still lacks Rust and tmux.
+The CI check is authored, not yet executed. The modified CI YAML parsed,
+`git diff --check` passed, and `./scripts/security-scan.sh` passed again.
+Do not mark R22 complete.
+
 ### Work and Settings cockpit update
 
 - T19.5 puts the task input, launch status, and result on Work. Review, Changes, Logs, and History are tabs. F2 opens Settings, including model edits and configured project checks.
@@ -678,7 +705,11 @@ Historical T3.6 identity-parser test slice on 2026-11-17 (schema-v2 checkpoint, 
 
 ## Next action
 
-Next action is **T17.3**: Activate Writer Lead deliberation and rebuttal loop in `run_team_task` by wiring `build_writer_lead_rebuttal_prompt`, recording technical decisions into summary data, and ensuring green verification checks inform but do not silently suppress Critic architectural guidance. Maintain local clean tree on `master`; do not push to remote or publish PR without explicit user instruction.
+Next action is **T22.1/T22.2**: run the Rust verification profile, isolated
+real-tmux layout/reuse test and native CLI startup checks on a host with the
+required tools. Then verify an actual SSH detach/reconnect scenario.
+Keep the native workspace on its dedicated branch until acceptance; do not
+push to remote or publish a PR without explicit user instruction.
 
 ## Session close checklist
 

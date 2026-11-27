@@ -140,12 +140,15 @@ struct GithubReconcileOptions<'a> {
 }
 
 pub async fn run(cli: Cli) -> Result<()> {
+    let implicit_workspace = cli.command.is_none() && !cli.tmux;
     let command = match cli.command {
         Some(cmd) => cmd,
         None => {
             if cli.json {
                 Command::Status
-            } else if cli.tmux {
+            } else if cli.tmux
+                || (io::stdout().is_terminal() && TmuxClient::default().probe().available)
+            {
                 Command::Attach
             } else {
                 Command::Tui
@@ -169,6 +172,12 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     let working_directory = env::current_dir().context("Cannot read current directory")?;
     let project = Project::discover(&working_directory)?;
+    if implicit_workspace
+        && matches!(&command, Command::Attach)
+        && !matches!(project.discovery, DiscoveryMethod::Git)
+    {
+        return crate::tui::run_tui(project).await;
+    }
 
     if let Some(cli_name) = &cli.cli {
         let adapter = crate::adapter::AdapterId::parse(cli_name).ok_or_else(|| {
@@ -224,7 +233,21 @@ pub async fn run(cli: Cli) -> Result<()> {
         if !probe.available {
             bail!("tmux is unavailable; use TALOS foreground commands or install tmux");
         }
-        let session_name = tmux.ensure_project_session(&project.root)?;
+        let root = project.root.canonicalize()?;
+        let expected_session = crate::tmux::project_session_name(&root);
+        if !tmux.has_session(&expected_session)? {
+            // Prepare durable state before the compact pane starts. Do not
+            // introduce a manual Writer while a managed task is active.
+            ensure_talos_ignored(&project)?;
+            let database = Database::open(&project)?;
+            if database.queue_summary()?.active > 0 {
+                bail!(
+                    "A managed task is active; finish or reconcile it before opening a new native workspace"
+                );
+            }
+        }
+        let config = ProjectConfig::load(&project)?;
+        let session_name = tmux.ensure_pair_workspace(&project.root, &config)?;
         if cli.json {
             print_json(&json!({
                 "mode": "tmux_attach",
@@ -241,6 +264,9 @@ pub async fn run(cli: Cli) -> Result<()> {
 
     if matches!(&command, Command::Tui) {
         return crate::tui::run_tui(project).await;
+    }
+    if matches!(&command, Command::WorkspaceStatus) {
+        return tokio::task::spawn_blocking(move || crate::workspace::run_status(project)).await?;
     }
 
     ensure_talos_ignored(&project)?;
@@ -1194,7 +1220,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Tui => unreachable!("TUI handled before database open"),
+        Command::Tui | Command::WorkspaceStatus => {
+            unreachable!("Terminal UI handled before database open")
+        }
     }
     Ok(())
 }

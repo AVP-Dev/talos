@@ -8,7 +8,9 @@ use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
 
-use crate::secrets::redact_sensitive;
+use crate::{adapter::AdapterId, config::ProjectConfig, secrets::redact_sensitive};
+
+const WORKSPACE_PANES_OPTION: &str = "@talos_pair_panes";
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TmuxProbe {
@@ -32,10 +34,178 @@ impl Default for TmuxClient {
 }
 
 impl TmuxClient {
+    /// Start native, operator-controlled terminals. No agent prompts or permission
+    /// overrides are injected. Existing sessions are never restarted.
+    pub fn ensure_pair_workspace(&self, root: &Path, config: &ProjectConfig) -> Result<String> {
+        let root = root.canonicalize().context("Cannot resolve project root")?;
+        let name = project_session_name(&root);
+        if let Some(session_id) = self.find_session_id(&name)? {
+            self.validate_pair_workspace(&name).with_context(|| {
+                format!(
+                    "Workspace {name} is incomplete; inspect it with tmux attach-session -t '{session_id}'. Existing panes were not changed"
+                )
+            })?;
+            return Ok(name);
+        }
+        let writer = native_executable(config.writer)?;
+        let critic = native_executable(config.critic)?;
+        let talos = env::current_exe().context("Cannot resolve TALOS executable")?;
+        self.create_pair_workspace(&root, &name, &writer, &critic, &talos, config)
+            .with_context(|| {
+                format!("Workspace {name} setup failed; inspect existing panes before retrying")
+            })?;
+        Ok(name)
+    }
+
+    fn create_pair_workspace(
+        &self,
+        root: &Path,
+        name: &str,
+        writer: &Path,
+        critic: &Path,
+        talos: &Path,
+        config: &ProjectConfig,
+    ) -> Result<()> {
+        // Multi-argument tmux commands preserve paths with spaces without shell
+        // interpolation. The shell fallback keeps a pane alive after CLI exit.
+        const NATIVE: &str = "\"$1\"; exec \"${SHELL:-/bin/sh}\"";
+        let first = self.checked(
+            self.command()
+                .args([
+                    "new-session",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-s",
+                    name,
+                    "-n",
+                    "pair",
+                    "-x",
+                    "120",
+                    "-y",
+                    "40",
+                    "-c",
+                ])
+                .arg(root)
+                .args(["sh", "-c", NATIVE, "talos-native"])
+                .arg(writer),
+        )?;
+        let writer_id = pane_id(&first)?;
+        // Split bottom first, then split the original top pane horizontally.
+        let bottom = self.checked(
+            self.command()
+                .args([
+                    "split-window",
+                    "-d",
+                    "-v",
+                    "-l",
+                    "7",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-t",
+                    writer_id,
+                    "-c",
+                ])
+                .arg(root)
+                .arg(talos)
+                .arg("workspace-status"),
+        )?;
+        let bottom_id = pane_id(&bottom)?;
+        let right = self.checked(
+            self.command()
+                .args([
+                    "split-window",
+                    "-d",
+                    "-h",
+                    "-l",
+                    "50%",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-t",
+                    writer_id,
+                    "-c",
+                ])
+                .arg(root)
+                .args(["sh", "-c", NATIVE, "talos-native"])
+                .arg(critic),
+        )?;
+        let critic_id = pane_id(&right)?;
+        for (id, title) in [
+            (writer_id, format!("Writer | {}", config.writer.as_str())),
+            (critic_id, format!("Critic | {}", config.critic.as_str())),
+            (bottom_id, "TALOS | Cockpit".to_owned()),
+        ] {
+            self.checked(self.command().args(["select-pane", "-t", id, "-T", &title]))?;
+        }
+        self.checked(self.command().args([
+            "set-option",
+            "-w",
+            "-t",
+            writer_id,
+            "pane-border-status",
+            "top",
+        ]))?;
+        self.checked(self.command().args([
+            "set-option",
+            "-w",
+            "-t",
+            writer_id,
+            "pane-border-format",
+            "#{pane_title}",
+        ]))?;
+        self.checked(self.command().args(["select-pane", "-t", writer_id]))?;
+        // Publish topology only after all pane creation and configuration succeeded.
+        // A failed or interrupted setup is never mistaken for a complete workspace.
+        let target = self.session_target(name)?;
+        let pane_ids = format!("{writer_id} {critic_id} {bottom_id}");
+        self.checked(self.command().args([
+            "set-option",
+            "-t",
+            &target,
+            WORKSPACE_PANES_OPTION,
+            &pane_ids,
+        ]))?;
+        self.validate_pair_workspace(name)?;
+        Ok(())
+    }
+
+    fn validate_pair_workspace(&self, name: &str) -> Result<()> {
+        let target = self.session_target(name)?;
+        let recorded = self.checked(self.command().args([
+            "show-options",
+            "-qv",
+            "-t",
+            &target,
+            WORKSPACE_PANES_OPTION,
+        ]))?;
+        let expected = parse_workspace_panes(&recorded)?;
+        let window_target = format!("{target}:");
+        let observed = self.checked(self.command().args([
+            "list-panes",
+            "-s",
+            "-t",
+            &window_target,
+            "-F",
+            "#{pane_id} #{pane_dead}",
+        ]))?;
+        validate_live_panes(&expected, &observed)
+    }
+
+    fn checked(&self, command: &mut Command) -> Result<String> {
+        let output = command.output().context("Cannot execute tmux command")?;
+        if !output.status.success() {
+            bail!("tmux command failed: {}", safe_stderr(&output));
+        }
+        String::from_utf8(output.stdout).context("Invalid tmux output")
+    }
+
     fn command(&self) -> Command {
         let mut command = Command::new(&self.executable);
         if let Some(socket) = &self.server_socket {
-            command.arg("-S").arg(socket);
+            command.arg("-S").arg(socket).args(["-f", "/dev/null"]);
         }
         command
     }
@@ -58,126 +228,8 @@ impl TmuxClient {
         }
     }
 
-    pub fn ensure_project_session(&self, project_root: &Path) -> Result<String> {
-        let project_root = project_root
-            .canonicalize()
-            .with_context(|| format!("Cannot resolve project root {}", project_root.display()))?;
-        let session_name = project_session_name(&project_root);
-        if self.has_session(&session_name)? {
-            return Ok(session_name);
-        }
-
-        let output = self
-            .command()
-            .arg("new-session")
-            .arg("-d")
-            .arg("-s")
-            .arg(&session_name)
-            .arg("-c")
-            .arg(&project_root)
-            .output()
-            .with_context(|| {
-                format!(
-                    "Cannot start tmux session {session_name}; install tmux or use TALOS in the foreground"
-                )
-            })?;
-        if output.status.success() || self.has_session(&session_name)? {
-            // Configure 3-pane interactive layout: top-left (Writer), top-right (Critic), bottom (Console)
-            let _ = self
-                .command()
-                .arg("split-window")
-                .arg("-v")
-                .arg("-p")
-                .arg("45")
-                .arg("-c")
-                .arg(&project_root)
-                .arg("-t")
-                .arg(format!("{session_name}:"))
-                .output();
-
-            let _ = self
-                .command()
-                .arg("split-window")
-                .arg("-h")
-                .arg("-p")
-                .arg("50")
-                .arg("-c")
-                .arg(&project_root)
-                .arg("-t")
-                .arg(format!("{session_name}:.top"))
-                .output();
-
-            let _ = self
-                .command()
-                .arg("select-pane")
-                .arg("-t")
-                .arg(format!("{session_name}:.top-left"))
-                .arg("-T")
-                .arg("Writer Stream")
-                .output();
-
-            let _ = self
-                .command()
-                .arg("select-pane")
-                .arg("-t")
-                .arg(format!("{session_name}:.top-right"))
-                .arg("-T")
-                .arg("Critic Stream")
-                .output();
-
-            let _ = self
-                .command()
-                .arg("select-pane")
-                .arg("-t")
-                .arg(format!("{session_name}:.bottom"))
-                .arg("-T")
-                .arg("Console")
-                .output();
-
-            let _ = self
-                .command()
-                .arg("send-keys")
-                .arg("-t")
-                .arg(format!("{session_name}:.top-left"))
-                .arg("echo '=== TALOS WRITER STREAM ==='; echo 'Waiting for Writer tasks...'; talos logs --project")
-                .arg("C-m")
-                .output();
-
-            let _ = self
-                .command()
-                .arg("send-keys")
-                .arg("-t")
-                .arg(format!("{session_name}:.top-right"))
-                .arg("echo '=== TALOS CRITIC AUDIT STREAM ==='; echo 'Waiting for Critic reviews...'; talos status")
-                .arg("C-m")
-                .output();
-
-            let _ = self
-                .command()
-                .arg("select-pane")
-                .arg("-t")
-                .arg(format!("{session_name}:.bottom"))
-                .output();
-
-            let _ = self
-                .command()
-                .arg("send-keys")
-                .arg("-t")
-                .arg(format!("{session_name}:.bottom"))
-                .arg("talos tui")
-                .arg("C-m")
-                .output();
-
-            return Ok(session_name);
-        }
-        bail!(
-            "Cannot create tmux control session {session_name}: {}",
-            safe_stderr(&output)
-        )
-    }
-
     pub fn attach_project_session(&self, session_name: &str) -> Result<()> {
-        let target = exact_session_target(session_name)?;
+        let target = self.session_target(session_name)?;
         if env::var_os("TMUX").is_some() {
             let current = self
                 .command()
@@ -198,15 +250,30 @@ impl TmuxClient {
     }
 
     pub fn has_session(&self, session_name: &str) -> Result<bool> {
-        let target = exact_session_target(session_name)?;
+        Ok(self.find_session_id(session_name)?.is_some())
+    }
+
+    fn session_target(&self, session_name: &str) -> Result<String> {
+        self.find_session_id(session_name)?
+            .context("TALOS tmux session no longer exists")
+    }
+
+    fn find_session_id(&self, session_name: &str) -> Result<Option<String>> {
+        validate_session_name(session_name)?;
         let output = self
             .command()
-            .arg("has-session")
-            .arg("-t")
-            .arg(&target)
+            .args(["list-sessions", "-F", "#{session_id} #{session_name}"])
             .output()
             .context("Cannot run tmux; install tmux or use TALOS in the foreground")?;
-        Ok(output.status.success())
+        if !output.status.success() {
+            let error = safe_stderr(&output);
+            if error.contains("no server running") || error.contains("No such file or directory") {
+                return Ok(None);
+            }
+            bail!("Cannot list tmux sessions: {error}");
+        }
+        let sessions = String::from_utf8(output.stdout).context("Invalid tmux session list")?;
+        Ok(find_exact_session_id(&sessions, session_name)?.map(str::to_owned))
     }
 
     fn run_interactive(&self, subcommand: &str, target: &str) -> Result<()> {
@@ -224,25 +291,93 @@ impl TmuxClient {
     }
 }
 
+fn pane_id(output: &str) -> Result<&str> {
+    let id = output.trim();
+    if !id
+        .strip_prefix('%')
+        .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    {
+        bail!("Invalid tmux pane identity");
+    }
+    Ok(id)
+}
+
+fn parse_workspace_panes(recorded: &str) -> Result<[&str; 3]> {
+    let mut ids = recorded.split_whitespace();
+    let writer = pane_id(ids.next().context("Missing Writer pane")?)?;
+    let critic = pane_id(ids.next().context("Missing Critic pane")?)?;
+    let cockpit = pane_id(ids.next().context("Missing Cockpit pane")?)?;
+    if ids.next().is_some() || writer == critic || writer == cockpit || critic == cockpit {
+        bail!("Invalid workspace pane identities");
+    }
+    Ok([writer, critic, cockpit])
+}
+
+fn validate_live_panes(expected: &[&str; 3], observed: &str) -> Result<()> {
+    for id in expected {
+        if !observed.lines().any(|line| {
+            let mut fields = line.split_whitespace();
+            fields.next() == Some(*id) && fields.next() == Some("0") && fields.next().is_none()
+        }) {
+            bail!("Workspace pane {id} is missing or has exited");
+        }
+    }
+    Ok(())
+}
+
+fn native_executable(adapter: AdapterId) -> Result<PathBuf> {
+    let executable = match adapter {
+        AdapterId::Agy => crate::adapter::agy::resolve_agy_executable(),
+        AdapterId::Codex => crate::adapter::codex::resolve_codex_executable(),
+        AdapterId::Claude => crate::adapter::claude::resolve_claude_executable(),
+        AdapterId::Omp => crate::adapter::omp::resolve_omp_executable(),
+        AdapterId::Pi => crate::adapter::pi::resolve_pi_executable(),
+        AdapterId::Kilo => crate::adapter::kilo::resolve_kilo_executable(),
+        AdapterId::OpenCode => crate::adapter::opencode::resolve_opencode_executable(),
+    };
+    executable.with_context(|| {
+        format!(
+            "{} is not installed; configure the corresponding role with talos config set",
+            adapter.as_str()
+        )
+    })
+}
+
 pub fn project_session_name(project_root: &Path) -> String {
     let digest = Sha256::digest(project_root.to_string_lossy().as_bytes());
     let mut suffix = String::with_capacity(16);
     for byte in digest.iter().take(8) {
         suffix.push_str(&format!("{byte:02x}"));
     }
-    format!("talos-{suffix}")
+    format!("talos-pair-{suffix}")
 }
 
-fn exact_session_target(session_name: &str) -> Result<String> {
-    if session_name.len() != 22
-        || !session_name.starts_with("talos-")
-        || !session_name[6..]
-            .bytes()
-            .all(|byte| byte.is_ascii_hexdigit())
+fn validate_session_name(session_name: &str) -> Result<()> {
+    if !session_name
+        .strip_prefix("talos-pair-")
+        .is_some_and(|suffix| {
+            suffix.len() == 16 && suffix.bytes().all(|byte| byte.is_ascii_hexdigit())
+        })
     {
         bail!("TALOS tmux session name is invalid");
     }
-    Ok(format!("={session_name}"))
+    Ok(())
+}
+
+fn find_exact_session_id<'a>(sessions: &'a str, name: &str) -> Result<Option<&'a str>> {
+    for line in sessions.lines() {
+        if let Some((id, observed_name)) = line.split_once(' ')
+            && observed_name == name
+        {
+            if !id.strip_prefix('$').is_some_and(|digits| {
+                !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
+            }) {
+                bail!("Invalid tmux session identity");
+            }
+            return Ok(Some(id));
+        }
+    }
+    Ok(None)
 }
 
 fn safe_stderr(output: &Output) -> String {
@@ -264,13 +399,33 @@ mod tests {
         sync::atomic::{AtomicU64, Ordering},
     };
 
-    use super::{TmuxClient, exact_session_target, project_session_name};
+    use super::{
+        TmuxClient, find_exact_session_id, pane_id, parse_workspace_panes, project_session_name,
+        validate_live_panes, validate_session_name,
+    };
+    use crate::config::ProjectConfig;
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
     fn test_socket() -> PathBuf {
         let id = NEXT_DIR.fetch_add(1, Ordering::Relaxed);
         std::env::temp_dir().join(format!("talos-tmux-test-{}-{id}.sock", std::process::id()))
+    }
+
+    struct IsolatedServer {
+        socket: PathBuf,
+        root: PathBuf,
+    }
+
+    impl Drop for IsolatedServer {
+        fn drop(&mut self) {
+            let _ = Command::new("tmux")
+                .arg("-S")
+                .arg(&self.socket)
+                .arg("kill-server")
+                .output();
+            let _ = fs::remove_dir_all(&self.root);
+        }
     }
 
     fn fake_tmux() -> (PathBuf, PathBuf) {
@@ -283,7 +438,7 @@ mod tests {
         let executable = root.join("tmux");
         let state_file = root.join("sessions");
         let script = format!(
-            "#!/bin/sh\nSTATE='{}'\ncase \"$1\" in\n  has-session) target=\"${{3#=}}\"; grep -Fx -- \"$target\" \"$STATE\" >/dev/null 2>&1 ;;\n  new-session) shift; while [ \"$#\" -gt 0 ]; do case \"$1\" in -s) session=\"$2\"; shift 2 ;; *) shift ;; esac; done; printf '%s\\n' \"$session\" >> \"$STATE\" ;;\n  list-sessions) cat \"$STATE\" ;;\n  *) exit 2 ;;\nesac\n",
+            "#!/bin/sh\nSTATE='{}'\ncase \"$1\" in\n  has-session) target=\"${{3#=}}\"; grep -Fx -- \"$target\" \"$STATE\" >/dev/null 2>&1 ;;\n  new-session) shift; while [ \"$#\" -gt 0 ]; do case \"$1\" in -s) session=\"$2\"; shift 2 ;; *) shift ;; esac; done; printf '%s\\n' \"$session\" >> \"$STATE\"; printf '%%0\\n' ;;\n  split-window) case \"$3\" in -v) printf '%%1\\n' ;; -h) printf '%%2\\n' ;; *) exit 2 ;; esac ;;\n  select-pane) exit 0 ;;\n  set-option) if [ \"$4\" = '@talos_pair_panes' ]; then printf '%s\\n' \"$5\" > \"$STATE.panes\"; fi ;;\n  show-options) if [ -f \"$STATE.panes\" ]; then cat \"$STATE.panes\"; fi ;;\n  list-panes) printf '%%0 0\\n%%1 0\\n%%2 0\\n' ;;\n  list-sessions) if [ ! -f \"$STATE\" ]; then printf 'no server running\\n' >&2; exit 1; fi; if [ \"$#\" -gt 1 ]; then while IFS= read -r session; do printf '$0 %s\\n' \"$session\"; done < \"$STATE\"; else cat \"$STATE\"; fi ;;\n  *) exit 2 ;;\nesac\n",
             state_file.display()
         );
         fs::write(&executable, script).expect("write fake tmux executable");
@@ -301,8 +456,25 @@ mod tests {
         let name = project_session_name(&project);
         assert_eq!(name, project_session_name(&project));
         assert!(name.starts_with("talos-"));
-        assert_eq!(exact_session_target(&name).unwrap(), format!("={name}"));
-        assert!(exact_session_target("talos-bad/name").is_err());
+        assert!(validate_session_name(&name).is_ok());
+        assert!(validate_session_name("talos-bad/name").is_err());
+        let sessions = format!("$0 {name}-other\n$1 {name}\n");
+        assert_eq!(find_exact_session_id(&sessions, &name).unwrap(), Some("$1"));
+        assert_eq!(find_exact_session_id(&sessions, "other").unwrap(), None);
+        assert_eq!(pane_id("%12\n").unwrap(), "%12");
+        assert!(pane_id("%12:other").is_err());
+    }
+
+    #[test]
+    fn rejects_incomplete_or_dead_workspace_topology() {
+        assert!(parse_workspace_panes("").is_err());
+        assert!(parse_workspace_panes("%0 %1").is_err());
+        assert!(parse_workspace_panes("%0 %1 %1").is_err());
+        assert!(parse_workspace_panes("%0 %1 %2 %3").is_err());
+        let expected = parse_workspace_panes("%0 %1 %2\n").unwrap();
+        assert!(validate_live_panes(&expected, "%0 0\n%1 0\n%2 0\n%3 0\n").is_ok());
+        assert!(validate_live_panes(&expected, "%0 0\n%1 0\n").is_err());
+        assert!(validate_live_panes(&expected, "%0 0\n%1 0\n%2 1\n").is_err());
     }
 
     #[test]
@@ -315,13 +487,25 @@ mod tests {
             server_socket: None,
         };
 
-        let first = client
-            .ensure_project_session(&project_root)
+        let first = project_session_name(&project_root.canonicalize().unwrap());
+        let fixture = std::path::Path::new("/bin/sh");
+        let config = ProjectConfig::default();
+        client
+            .create_pair_workspace(&project_root, &first, fixture, fixture, fixture, &config)
             .expect("create project session");
         let second = client
-            .ensure_project_session(&project_root)
+            .ensure_pair_workspace(&project_root, &config)
             .expect("reuse project session");
         assert_eq!(first, second);
+        fs::remove_file(temporary_root.join("sessions.panes")).expect("simulate incomplete setup");
+        let error = client
+            .ensure_pair_workspace(&project_root, &config)
+            .expect_err("refuse incomplete workspace");
+        assert!(
+            error
+                .to_string()
+                .contains("Existing panes were not changed")
+        );
         let listed = client
             .command()
             .arg("list-sessions")
@@ -340,9 +524,10 @@ mod tests {
     #[ignore = "Requires tmux Unix-socket creation outside the restricted sandbox"]
     fn creates_only_one_control_session_for_a_project() {
         let probe = TmuxClient::default().probe();
-        if !probe.available {
-            return;
-        }
+        assert!(
+            probe.available,
+            "Install tmux before running this acceptance test"
+        );
         let root = std::env::temp_dir().join(format!(
             "talos-tmux-project-{}-{}",
             std::process::id(),
@@ -350,18 +535,41 @@ mod tests {
         ));
         fs::create_dir_all(&root).expect("create isolated project root");
         let socket = test_socket();
+        let _server = IsolatedServer {
+            socket: socket.clone(),
+            root: root.clone(),
+        };
         let client = TmuxClient {
             executable: PathBuf::from("tmux"),
             server_socket: Some(socket.clone()),
         };
 
-        let first = client
-            .ensure_project_session(&root)
+        let first = project_session_name(&root.canonicalize().unwrap());
+        let fixture = root.join("fixture cli");
+        use std::os::unix::fs::PermissionsExt;
+        fs::write(&fixture, "#!/bin/sh\nexec sleep 120\n").unwrap();
+        fs::set_permissions(&fixture, fs::Permissions::from_mode(0o700)).unwrap();
+        let config = ProjectConfig::default();
+        client
+            .create_pair_workspace(&root, &first, &fixture, &fixture, &fixture, &config)
             .expect("create isolated control session");
+        let identity = || {
+            client
+                .checked(client.command().args([
+                    "list-panes",
+                    "-t",
+                    &first,
+                    "-F",
+                    "#{pane_id} #{pane_pid}",
+                ]))
+                .expect("record pane identities")
+        };
+        let before = identity();
         let second = client
-            .ensure_project_session(&root)
+            .ensure_pair_workspace(&root, &config)
             .expect("reuse existing control session");
         assert_eq!(first, second);
+        assert_eq!(before, identity(), "reconnect must preserve pane processes");
         assert!(client.has_session(&first).expect("find project session"));
 
         let listed = Command::new("tmux")
@@ -375,12 +583,27 @@ mod tests {
         assert!(listed.status.success());
         let names = String::from_utf8_lossy(&listed.stdout);
         assert_eq!(names.lines().collect::<Vec<_>>(), [first.as_str()]);
-
-        let _ = Command::new("tmux")
-            .arg("-S")
-            .arg(&socket)
-            .arg("kill-server")
-            .status();
-        let _ = fs::remove_dir_all(root);
+        let panes = client
+            .command()
+            .args([
+                "list-panes",
+                "-t",
+                &first,
+                "-F",
+                "#{pane_id} #{pane_top} #{pane_left} #{pane_height}",
+            ])
+            .output()
+            .expect("list panes");
+        assert!(panes.status.success());
+        let geometry = String::from_utf8(panes.stdout).unwrap();
+        assert_eq!(geometry.lines().count(), 3);
+        let mut rows: Vec<Vec<&str>> = geometry
+            .lines()
+            .map(|line| line.split_whitespace().collect())
+            .collect();
+        rows.sort_by_key(|row| row[1].parse::<u32>().unwrap());
+        assert_eq!(rows[0][1], rows[1][1]);
+        assert_ne!(rows[0][2], rows[1][2]);
+        assert!((6..=8).contains(&rows[2][3].parse::<u32>().unwrap()));
     }
 }

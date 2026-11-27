@@ -582,3 +582,15 @@ No schema change for process identity is selected or implemented. The separate s
      - Structure History list as discrete Sessions (`Session #<id> · [<status>] · <time> · <task_title>`) with color-coded status badges, making History a clean record of whole task runs rather than fragmented raw messages.
 - **Reason:** user reported being blocked by untracked `.gitignore` with no one-key recovery, requested avoiding obsolete hardcoded model lists in favor of native CLI configuration and model/reasoning mirroring, asked for distinct visual color accents across roles and logs, and requested session-oriented history.
 - **Consequence:** eliminates user deadlocks on dirty checkouts, provides seamless multi-model/multi-provider integration via native CLIs, elevates cockpit visual ergonomics, and maintains deterministic state management.
+## ADR-055 — Native CLI workspace boundary (R22)
+
+**Status:** Accepted direction; implementation and native acceptance pending.
+
+TALOS owns task state, review evidence and managed execution. tmux owns the
+persistent terminal workspace. Provider CLIs own interactive input, model
+configuration, authentication and their permission policies. The default
+interactive Git-project workspace should expose the original CLIs directly,
+with a compact TALOS status pane. Keep `talos tui` as a distinct managed mode.
+Do not conflate manual native activity with a managed Writer attempt, do not
+parse terminal screens as evidence, and do not restart existing sessions to
+apply configuration changes. Native session handoff requires separate evidence.
