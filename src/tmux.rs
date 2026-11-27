@@ -72,8 +72,20 @@ impl TmuxClient {
         let first = self.checked(
             self.command()
                 .args([
-                    "new-session", "-d", "-P", "-F", "#{pane_id}", "-s", name, "-n", "pair",
-                    "-x", "120", "-y", "40", "-c",
+                    "new-session",
+                    "-d",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-s",
+                    name,
+                    "-n",
+                    "pair",
+                    "-x",
+                    "120",
+                    "-y",
+                    "40",
+                    "-c",
                 ])
                 .arg(root)
                 .args(["sh", "-c", NATIVE, "talos-native"])
@@ -84,8 +96,17 @@ impl TmuxClient {
         let bottom = self.checked(
             self.command()
                 .args([
-                    "split-window", "-d", "-v", "-l", "7", "-P", "-F", "#{pane_id}", "-t",
-                    writer_id, "-c",
+                    "split-window",
+                    "-d",
+                    "-v",
+                    "-l",
+                    "7",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-t",
+                    writer_id,
+                    "-c",
                 ])
                 .arg(root)
                 .arg(talos)
@@ -95,8 +116,17 @@ impl TmuxClient {
         let right = self.checked(
             self.command()
                 .args([
-                    "split-window", "-d", "-h", "-l", "50%", "-P", "-F", "#{pane_id}", "-t",
-                    writer_id, "-c",
+                    "split-window",
+                    "-d",
+                    "-h",
+                    "-l",
+                    "50%",
+                    "-P",
+                    "-F",
+                    "#{pane_id}",
+                    "-t",
+                    writer_id,
+                    "-c",
                 ])
                 .arg(root)
                 .args(["sh", "-c", NATIVE, "talos-native"])
@@ -108,16 +138,23 @@ impl TmuxClient {
             (critic_id, format!("Critic | {}", config.critic.as_str())),
             (bottom_id, "TALOS | Cockpit".to_owned()),
         ] {
-            self.checked(
-                self.command()
-                    .args(["select-pane", "-t", id, "-T", &title]),
-            )?;
+            self.checked(self.command().args(["select-pane", "-t", id, "-T", &title]))?;
         }
         self.checked(self.command().args([
-            "set-option", "-w", "-t", writer_id, "pane-border-status", "top",
+            "set-option",
+            "-w",
+            "-t",
+            writer_id,
+            "pane-border-status",
+            "top",
         ]))?;
         self.checked(self.command().args([
-            "set-option", "-w", "-t", writer_id, "pane-border-format", "#{pane_title}",
+            "set-option",
+            "-w",
+            "-t",
+            writer_id,
+            "pane-border-format",
+            "#{pane_title}",
         ]))?;
         self.checked(self.command().args(["select-pane", "-t", writer_id]))?;
         // Publish topology only after all pane creation and configuration succeeded.
@@ -125,7 +162,11 @@ impl TmuxClient {
         let target = exact_session_target(name)?;
         let pane_ids = format!("{writer_id} {critic_id} {bottom_id}");
         self.checked(self.command().args([
-            "set-option", "-t", &target, WORKSPACE_PANES_OPTION, &pane_ids,
+            "set-option",
+            "-t",
+            &target,
+            WORKSPACE_PANES_OPTION,
+            &pane_ids,
         ]))?;
         self.validate_pair_workspace(name)?;
         Ok(())
@@ -134,12 +175,21 @@ impl TmuxClient {
     fn validate_pair_workspace(&self, name: &str) -> Result<()> {
         let target = exact_session_target(name)?;
         let recorded = self.checked(self.command().args([
-            "show-options", "-qv", "-t", &target, WORKSPACE_PANES_OPTION,
+            "show-options",
+            "-qv",
+            "-t",
+            &target,
+            WORKSPACE_PANES_OPTION,
         ]))?;
         let expected = parse_workspace_panes(&recorded)?;
         let window_target = format!("{target}:");
         let observed = self.checked(self.command().args([
-            "list-panes", "-s", "-t", &window_target, "-F", "#{pane_id} #{pane_dead}",
+            "list-panes",
+            "-s",
+            "-t",
+            &window_target,
+            "-F",
+            "#{pane_id} #{pane_dead}",
         ]))?;
         validate_live_panes(&expected, &observed)
     }
@@ -417,7 +467,11 @@ mod tests {
         let error = client
             .ensure_pair_workspace(&project_root, &config)
             .expect_err("refuse incomplete workspace");
-        assert!(error.to_string().contains("Existing panes were not changed"));
+        assert!(
+            error
+                .to_string()
+                .contains("Existing panes were not changed")
+        );
         let listed = client
             .command()
             .arg("list-sessions")
@@ -436,7 +490,10 @@ mod tests {
     #[ignore = "Requires tmux Unix-socket creation outside the restricted sandbox"]
     fn creates_only_one_control_session_for_a_project() {
         let probe = TmuxClient::default().probe();
-        assert!(probe.available, "Install tmux before running this acceptance test");
+        assert!(
+            probe.available,
+            "Install tmux before running this acceptance test"
+        );
         let root = std::env::temp_dir().join(format!(
             "talos-tmux-project-{}-{}",
             std::process::id(),
@@ -465,7 +522,11 @@ mod tests {
         let identity = || {
             client
                 .checked(client.command().args([
-                    "list-panes", "-t", &first, "-F", "#{pane_id} #{pane_pid}",
+                    "list-panes",
+                    "-t",
+                    &first,
+                    "-F",
+                    "#{pane_id} #{pane_pid}",
                 ]))
                 .expect("record pane identities")
         };
@@ -491,7 +552,10 @@ mod tests {
         let panes = client
             .command()
             .args([
-                "list-panes", "-t", &first, "-F",
+                "list-panes",
+                "-t",
+                &first,
+                "-F",
                 "#{pane_id} #{pane_top} #{pane_left} #{pane_height}",
             ])
             .output()
@@ -507,6 +571,5 @@ mod tests {
         assert_eq!(rows[0][1], rows[1][1]);
         assert_ne!(rows[0][2], rows[1][2]);
         assert!((6..=8).contains(&rows[2][3].parse::<u32>().unwrap()));
-
     }
 }

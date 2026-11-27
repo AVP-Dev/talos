@@ -9,9 +9,7 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend, widgets::Paragraph};
 
-use crate::{
-    app::ensure_talos_ignored, db::Database, project::Project, secrets::redact_sensitive,
-};
+use crate::{app::ensure_talos_ignored, db::Database, project::Project, secrets::redact_sensitive};
 
 fn status_text(database: &Database) -> Result<String> {
     let queue = database.queue_summary()?;
@@ -33,8 +31,14 @@ fn status_text(database: &Database) -> Result<String> {
     };
     Ok(format!(
         "TALOS | Native Pair (manual)\n{task}\nChecks: {checks} | Queue: {} waiting / {} complete / {} blocked | {}\nNative CLI permissions apply; do not run a managed Writer concurrently.\n[c] Full cockpit | tmux prefix + arrows: switch / z: zoom / d: detach",
-        queue.queued, queue.complete, queue.blocked_or_failed,
-        if control.queue_paused { "paused" } else { "ready" },
+        queue.queued,
+        queue.complete,
+        queue.blocked_or_failed,
+        if control.queue_paused {
+            "paused"
+        } else {
+            "ready"
+        },
     ))
 }
 
@@ -53,12 +57,21 @@ fn open_cockpit(project: &Project) -> Result<()> {
     let session_output = Command::new("tmux")
         .args(["display-message", "-p", "-t", &pane, "#{session_id}"])
         .output()?;
-    ensure!(session_output.status.success(), "Cannot locate the workspace session");
+    ensure!(
+        session_output.status.success(),
+        "Cannot locate the workspace session"
+    );
     let session = String::from_utf8(session_output.stdout)?;
     let session = session.trim();
     ensure!(numeric_id(session, '$'), "Invalid tmux session identity");
     let windows = Command::new("tmux")
-        .args(["list-windows", "-t", session, "-F", "#{window_id} #{window_name}"])
+        .args([
+            "list-windows",
+            "-t",
+            session,
+            "-F",
+            "#{window_id} #{window_name}",
+        ])
         .output()?;
     ensure!(windows.status.success(), "Cannot inspect workspace windows");
     let windows = String::from_utf8(windows.stdout)?;
@@ -117,7 +130,9 @@ pub(crate) fn run_status(project: Project) -> Result<()> {
                 && key.kind == KeyEventKind::Press
                 && key.code == KeyCode::Char('c')
             {
-                notice = open_cockpit(&project).err().map(|_| "Cannot open cockpit".to_owned());
+                notice = open_cockpit(&project)
+                    .err()
+                    .map(|_| "Cannot open cockpit".to_owned());
             }
         }
     })();
@@ -139,7 +154,10 @@ mod tests {
     #[test]
     fn cockpit_reuse_requires_exact_name_and_valid_window_id() {
         assert_eq!(existing_cockpit("@1 pair\n@2 talos-cockpit\n"), Some("@2"));
-        assert_eq!(existing_cockpit("@2 talos-cockpit-old\n@abc talos-cockpit"), None);
+        assert_eq!(
+            existing_cockpit("@2 talos-cockpit-old\n@abc talos-cockpit"),
+            None
+        );
         assert!(numeric_id("$1", '$'));
         assert!(!numeric_id("$1:other", '$'));
     }

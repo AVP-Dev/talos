@@ -1220,7 +1220,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Tui | Command::WorkspaceStatus => unreachable!("Terminal UI handled before database open"),
+        Command::Tui | Command::WorkspaceStatus => {
+            unreachable!("Terminal UI handled before database open")
+        }
     }
     Ok(())
 }
