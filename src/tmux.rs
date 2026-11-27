@@ -199,7 +199,7 @@ impl TmuxClient {
         if !output.status.success() {
             bail!("tmux command failed: {}", safe_stderr(&output));
         }
-        Ok(String::from_utf8(output.stdout).context("Invalid tmux output")?)
+        String::from_utf8(output.stdout).context("Invalid tmux output")
     }
 
     fn command(&self) -> Command {
