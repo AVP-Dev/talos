@@ -210,7 +210,12 @@ impl TmuxClient {
     }
 
     /// Replace only the explicitly selected role, preserving the other panes.
-    pub fn restart_native_role(&self, root: &Path, role: NativeRole, config: &ProjectConfig) -> Result<()> {
+    pub fn restart_native_role(
+        &self,
+        root: &Path,
+        role: NativeRole,
+        config: &ProjectConfig,
+    ) -> Result<()> {
         let adapter = match role {
             NativeRole::Writer => config.writer,
             NativeRole::Critic => config.critic,
@@ -219,18 +224,42 @@ impl TmuxClient {
         self.restart_role_with_executable(root, role, &executable, adapter)
     }
 
-    fn restart_role_with_executable(&self, root: &Path, role: NativeRole, executable: &Path, adapter: AdapterId) -> Result<()> {
+    fn restart_role_with_executable(
+        &self,
+        root: &Path,
+        role: NativeRole,
+        executable: &Path,
+        adapter: AdapterId,
+    ) -> Result<()> {
         let root = root.canonicalize()?;
         let name = project_session_name(&root);
         self.validate_pair_workspace(&name)?;
         let target = self.session_target(&name)?;
-        let record = self.checked(self.command().args(["show-options", "-qv", "-t", &target, WORKSPACE_PANES_OPTION]))?;
+        let record = self.checked(self.command().args([
+            "show-options",
+            "-qv",
+            "-t",
+            &target,
+            WORKSPACE_PANES_OPTION,
+        ]))?;
         let panes = parse_workspace_panes(&record)?;
         let pane = panes[role.index()];
-        self.checked(self.command().args(["respawn-pane", "-k", "-t", pane, "-c"]).arg(&root).args(["sh", "-c", NATIVE, "talos-native"]).arg(executable))?;
-        let label = match role { NativeRole::Writer => "Writer", NativeRole::Critic => "Critic" };
+        self.checked(
+            self.command()
+                .args(["respawn-pane", "-k", "-t", pane, "-c"])
+                .arg(&root)
+                .args(["sh", "-c", NATIVE, "talos-native"])
+                .arg(executable),
+        )?;
+        let label = match role {
+            NativeRole::Writer => "Writer",
+            NativeRole::Critic => "Critic",
+        };
         let title = format!("{label} | {}", adapter.as_str());
-        self.checked(self.command().args(["select-pane", "-t", pane, "-T", &title]))?;
+        self.checked(
+            self.command()
+                .args(["select-pane", "-t", pane, "-T", &title]),
+        )?;
         self.validate_pair_workspace(&name)
     }
 
@@ -646,17 +675,40 @@ mod tests {
         assert_ne!(rows[0][2], rows[1][2]);
         assert!((6..=8).contains(&rows[2][3].parse::<u32>().unwrap()));
         let target = client.session_target(&first).unwrap();
-        let record = client.checked(client.command().args([
-            "show-options", "-qv", "-t", &target, super::WORKSPACE_PANES_OPTION,
-        ])).unwrap();
+        let record = client
+            .checked(client.command().args([
+                "show-options",
+                "-qv",
+                "-t",
+                &target,
+                super::WORKSPACE_PANES_OPTION,
+            ]))
+            .unwrap();
         let ids = parse_workspace_panes(&record).unwrap();
         let before_restart = identity();
-        client.restart_role_with_executable(&root, super::NativeRole::Writer, &fixture, crate::adapter::AdapterId::Agy).expect("restart only Writer");
+        client
+            .restart_role_with_executable(
+                &root,
+                super::NativeRole::Writer,
+                &fixture,
+                crate::adapter::AdapterId::Agy,
+            )
+            .expect("restart only Writer");
         let after_restart = identity();
         for id in ids {
-            let old = before_restart.lines().find(|line| line.split_whitespace().next() == Some(id)).unwrap();
-            let new = after_restart.lines().find(|line| line.split_whitespace().next() == Some(id)).unwrap();
-            if id == ids[0] { assert_ne!(old, new); } else { assert_eq!(old, new); }
+            let old = before_restart
+                .lines()
+                .find(|line| line.split_whitespace().next() == Some(id))
+                .unwrap();
+            let new = after_restart
+                .lines()
+                .find(|line| line.split_whitespace().next() == Some(id))
+                .unwrap();
+            if id == ids[0] {
+                assert_ne!(old, new);
+            } else {
+                assert_eq!(old, new);
+            }
         }
     }
 }

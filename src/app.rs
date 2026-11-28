@@ -1246,7 +1246,10 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Tui | Command::WorkspaceStatus | Command::Settings | Command::RestartPane { .. } => {
+        Command::Tui
+        | Command::WorkspaceStatus
+        | Command::Settings
+        | Command::RestartPane { .. } => {
             unreachable!("Terminal UI handled before database open")
         }
     }

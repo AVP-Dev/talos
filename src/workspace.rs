@@ -22,7 +22,10 @@ use crate::{
 pub(crate) fn restart_role(project: &Project, role: NativeRole) -> Result<()> {
     ensure_talos_ignored(project)?;
     let database = Database::open(project)?;
-    ensure!(database.queue_summary()?.active == 0, "Finish or reconcile active managed tasks first");
+    ensure!(
+        database.queue_summary()?.active == 0,
+        "Finish or reconcile active managed tasks first"
+    );
     let config = ProjectConfig::load(project)?;
     TmuxClient::default().restart_native_role(&project.root, role, &config)
 }
@@ -292,7 +295,10 @@ pub(crate) fn run_settings(project: &Project) -> Result<bool> {
                         config.save(project)?;
                         notice = match restart_role(project, role) {
                             Ok(()) => "Selected native pane restarted.".to_owned(),
-                            Err(error) => format!("Settings saved; pane restart failed: {}", redact_sensitive(&error.to_string())),
+                            Err(error) => format!(
+                                "Settings saved; pane restart failed: {}",
+                                redact_sensitive(&error.to_string())
+                            ),
                         };
                     } else {
                         notice = "Pane replacement cancelled.".to_owned();
@@ -307,11 +313,17 @@ pub(crate) fn run_settings(project: &Project) -> Result<bool> {
                     }
                     KeyCode::Char('r' | 'R') => available = installed_adapters(),
                     KeyCode::Char('x' | 'X') if row < 2 => {
-                        if available.contains(&config.writer) && available.contains(&config.critic) {
-                            pending_restart = Some(if row == 0 { NativeRole::Writer } else { NativeRole::Critic });
+                        if available.contains(&config.writer) && available.contains(&config.critic)
+                        {
+                            pending_restart = Some(if row == 0 {
+                                NativeRole::Writer
+                            } else {
+                                NativeRole::Critic
+                            });
                             notice = "Exit the selected CLI first. Replace its process and terminal contents? Y confirms; any other key cancels.".to_owned();
                         } else {
-                            notice = "Select installed CLI roles before replacing a pane.".to_owned();
+                            notice =
+                                "Select installed CLI roles before replacing a pane.".to_owned();
                         }
                     }
                     KeyCode::Esc => return Ok(false),
