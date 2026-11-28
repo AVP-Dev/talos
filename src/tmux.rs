@@ -222,46 +222,83 @@ impl TmuxClient {
         self.validate_pair_workspace(&name)?;
         let target = self.session_target(&name)?;
         let recorded = self.checked(self.command().args([
-            "show-options", "-qv", "-t", &target, WORKSPACE_PANES_OPTION,
+            "show-options",
+            "-qv",
+            "-t",
+            &target,
+            WORKSPACE_PANES_OPTION,
         ]))?;
         let panes = parse_workspace_panes(&recorded)?;
-        let listed = self.checked(self.command().args([
-            "list-panes", "-t", panes[0], "-F", "#{pane_id}",
-        ]))?;
+        let listed =
+            self.checked(
+                self.command()
+                    .args(["list-panes", "-t", panes[0], "-F", "#{pane_id}"]),
+            )?;
         if listed.lines().collect::<Vec<_>>() != panes {
             bail!("Pair window must contain exactly its original three panes in role order");
         }
         let current = self.checked(self.command().args([
-            "display-message", "-p", "-t", panes[0], "#{window_layout}",
+            "display-message",
+            "-p",
+            "-t",
+            panes[0],
+            "#{window_layout}",
         ]))?;
         let saved = self.checked(self.command().args([
-            "show-options", "-qv", "-t", &target, COLUMNS_LAYOUT_OPTION,
+            "show-options",
+            "-qv",
+            "-t",
+            &target,
+            COLUMNS_LAYOUT_OPTION,
         ]))?;
         match layout {
             NativeLayout::Stacked => {
                 if saved.trim().is_empty() {
                     let geometry = self.checked(self.command().args([
-                        "list-panes", "-t", panes[0], "-F", "#{pane_top} #{pane_left}",
+                        "list-panes",
+                        "-t",
+                        panes[0],
+                        "-F",
+                        "#{pane_top} #{pane_left}",
                     ]))?;
-                    let rows: Vec<Vec<&str>> = geometry.lines().map(|line| line.split_whitespace().collect()).collect();
-                    if rows.len() != 3 || rows.iter().any(|row| row.len() != 2) || rows[0][0] != rows[1][0] || rows[0][1] == rows[1][1] || rows[2][0] == rows[0][0] {
+                    let rows: Vec<Vec<&str>> = geometry
+                        .lines()
+                        .map(|line| line.split_whitespace().collect())
+                        .collect();
+                    if rows.len() != 3
+                        || rows.iter().any(|row| row.len() != 2)
+                        || rows[0][0] != rows[1][0]
+                        || rows[0][1] == rows[1][1]
+                        || rows[2][0] == rows[0][0]
+                    {
                         bail!("Restore the original columns layout before saving it");
                     }
                     self.checked(self.command().args([
-                        "set-option", "-t", &target, COLUMNS_LAYOUT_OPTION, current.trim(),
+                        "set-option",
+                        "-t",
+                        &target,
+                        COLUMNS_LAYOUT_OPTION,
+                        current.trim(),
                     ]))?;
                 }
                 self.checked(self.command().args([
-                    "select-layout", "-t", panes[0], "even-vertical",
+                    "select-layout",
+                    "-t",
+                    panes[0],
+                    "even-vertical",
                 ]))?;
-                self.checked(self.command().args([
-                    "resize-pane", "-t", panes[2], "-y", "7",
-                ]))?;
+                self.checked(
+                    self.command()
+                        .args(["resize-pane", "-t", panes[2], "-y", "7"]),
+                )?;
             }
             NativeLayout::Columns => {
                 if !saved.trim().is_empty() {
                     self.checked(self.command().args([
-                        "select-layout", "-t", panes[0], saved.trim(),
+                        "select-layout",
+                        "-t",
+                        panes[0],
+                        saved.trim(),
                     ]))?;
                 }
             }
@@ -734,10 +771,22 @@ mod tests {
         assert_eq!(rows[0][1], rows[1][1]);
         assert_ne!(rows[0][2], rows[1][2]);
         assert!((6..=8).contains(&rows[2][3].parse::<u32>().unwrap()));
-        client.set_native_layout(&root, super::NativeLayout::Stacked).expect("stack native panes");
-        assert_eq!(before, identity(), "layout must preserve pane identities and processes");
-        client.set_native_layout(&root, super::NativeLayout::Columns).expect("restore native columns");
-        assert_eq!(before, identity(), "restoring layout must preserve pane identities and processes");
+        client
+            .set_native_layout(&root, super::NativeLayout::Stacked)
+            .expect("stack native panes");
+        assert_eq!(
+            before,
+            identity(),
+            "layout must preserve pane identities and processes"
+        );
+        client
+            .set_native_layout(&root, super::NativeLayout::Columns)
+            .expect("restore native columns");
+        assert_eq!(
+            before,
+            identity(),
+            "restoring layout must preserve pane identities and processes"
+        );
         let target = client.session_target(&first).unwrap();
         let record = client
             .checked(client.command().args([

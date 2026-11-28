@@ -157,7 +157,9 @@ pub(crate) fn run_status(project: Project) -> Result<()> {
                         .set_native_layout(&project.root, NativeLayout::Stacked),
                     _ => continue,
                 };
-                notice = result.err().map(|error| redact_sensitive(&error.to_string()));
+                notice = result
+                    .err()
+                    .map(|error| redact_sensitive(&error.to_string()));
             }
         }
     })();
