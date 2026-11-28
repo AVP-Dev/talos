@@ -280,6 +280,14 @@ pub async fn run(cli: Cli) -> Result<()> {
         crate::workspace::run_settings(&project)?;
         return Ok(());
     }
+    if let Command::RestartPane { role, confirm } = &command {
+        if !confirm {
+            bail!("Explicit confirmation is required to replace a pane");
+        }
+        crate::workspace::restart_role(&project, *role)?;
+        println!("Selected native pane restarted");
+        return Ok(());
+    }
 
     ensure_talos_ignored(&project)?;
 
@@ -1238,7 +1246,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Tui | Command::WorkspaceStatus | Command::Settings => {
+        Command::Tui | Command::WorkspaceStatus | Command::Settings | Command::RestartPane { .. } => {
             unreachable!("Terminal UI handled before database open")
         }
     }

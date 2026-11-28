@@ -16,8 +16,16 @@ use crate::{
     db::Database,
     project::Project,
     secrets::redact_sensitive,
-    tmux::native_executable,
+    tmux::{NativeRole, TmuxClient, native_executable},
 };
+
+pub(crate) fn restart_role(project: &Project, role: NativeRole) -> Result<()> {
+    ensure_talos_ignored(project)?;
+    let database = Database::open(project)?;
+    ensure!(database.queue_summary()?.active == 0, "Finish or reconcile active managed tasks first");
+    let config = ProjectConfig::load(project)?;
+    TmuxClient::default().restart_native_role(&project.root, role, &config)
+}
 
 fn status_text(database: &Database) -> Result<String> {
     let queue = database.queue_summary()?;
@@ -227,6 +235,7 @@ pub(crate) fn run_settings(project: &Project) -> Result<bool> {
     }
     let mut row = 0;
     let mut notice = String::new();
+    let mut pending_restart = None;
     enable_raw_mode()?;
     let result = (|| -> Result<bool> {
         execute!(io::stdout(), EnterAlternateScreen)?;
@@ -267,7 +276,7 @@ pub(crate) fn run_settings(project: &Project) -> Result<bool> {
                     "disabled"
                 }
             ));
-            body.push_str("Models, providers, reasoning and login are configured in the original CLIs.\nRole changes apply to newly created workspaces; running panes are preserved.\n\nArrows: select/change | R: rescan | Enter: save | Esc: cancel\n");
+            body.push_str("Models, providers, reasoning and login are configured in the original CLIs.\nEnter saves only; X saves and replaces the selected role after confirmation.\nExit its native CLI before replacing it. Other panes are preserved.\n\nArrows: select/change | R: rescan | Enter: save | X: replace role | Esc: cancel\n");
             body.push_str(&notice);
             terminal.draw(|frame| {
                 frame.render_widget(
@@ -278,6 +287,18 @@ pub(crate) fn run_settings(project: &Project) -> Result<bool> {
             if let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
             {
+                if let Some(role) = pending_restart.take() {
+                    if matches!(key.code, KeyCode::Char('y' | 'Y')) {
+                        config.save(project)?;
+                        notice = match restart_role(project, role) {
+                            Ok(()) => "Selected native pane restarted.".to_owned(),
+                            Err(error) => format!("Settings saved; pane restart failed: {}", redact_sensitive(&error.to_string())),
+                        };
+                    } else {
+                        notice = "Pane replacement cancelled.".to_owned();
+                    }
+                    continue;
+                }
                 match key.code {
                     KeyCode::Up => row = (row + SETTING_COUNT - 1) % SETTING_COUNT,
                     KeyCode::Down => row = (row + 1) % SETTING_COUNT,
@@ -285,6 +306,14 @@ pub(crate) fn run_settings(project: &Project) -> Result<bool> {
                         change_setting(&mut config, &available, row, key.code == KeyCode::Right)
                     }
                     KeyCode::Char('r' | 'R') => available = installed_adapters(),
+                    KeyCode::Char('x' | 'X') if row < 2 => {
+                        if available.contains(&config.writer) && available.contains(&config.critic) {
+                            pending_restart = Some(if row == 0 { NativeRole::Writer } else { NativeRole::Critic });
+                            notice = "Exit the selected CLI first. Replace its process and terminal contents? Y confirms; any other key cancels.".to_owned();
+                        } else {
+                            notice = "Select installed CLI roles before replacing a pane.".to_owned();
+                        }
+                    }
                     KeyCode::Esc => return Ok(false),
                     KeyCode::Enter => {
                         if !available.contains(&config.writer)
