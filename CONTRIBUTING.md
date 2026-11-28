@@ -36,7 +36,8 @@ cargo test --locked --all-targets
 
 ## Pull Request Guidelines
 
-- Create a feature branch from `master` (`git checkout -b feature/your-feature-name`).
+- Keep two long-lived branches: `master` for the verified release baseline and `dev` for ongoing development and testing.
+- Work on `dev`; promote a verified batch through a `dev` → `master` pull request. Synchronize `dev` with `master` afterward. Create stable release tags only after the applicable acceptance checks pass.
 - Keep changes scoped to a single logical slice.
 - Include corresponding unit tests for new functionality or bug fixes.
 - Fill out the PR template with verification evidence.

@@ -19,8 +19,12 @@ The other panes are not restarted. The real tmux test checks peer PIDs before
 and after restart. CI run 46121408941 passed on Linux and macOS, including
 real tmux restart acceptance. PR #3 is ready; merge is pending authorization.
 The follow-up layout slice saves the original columns layout and switches to
-stacked panes with a compact status pane; no process is restarted. Layout
-acceptance remains pending.
+stacked panes with a compact status pane; no process is restarted. CI run
+46121898401 passed on macOS and Linux, including layout and PID preservation;
+PR #3 merged as cfceab1. CI run 46125505202 captured the real tmux/xterm
+workspace and F2 settings window with official Codex and Claude Code binaries,
+before authentication. These captures establish native startup, not inference,
+provider-account acceptance, or SSH reconnect acceptance.
 
 ### R22 — Native Pair workspace (in progress)
 
