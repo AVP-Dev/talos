@@ -10,7 +10,7 @@
   <p><a href="#native-workspace">Workspace</a> · <a href="#installation">Installation</a> · <a href="#managed-workflow">Managed workflow</a> · <a href="docs/operator-runbook.md">Operator guide</a> · <a href="https://talos.avpdev.com">Website</a></p>
 </div>
 
-> **Development preview:** the native workspace described below is available on `master` and in CI preview builds. The published v0.1.1 release remains the previous managed cockpit. Native provider and SSH acceptance are still pending.
+> **v0.1.2 — Native workspace preview:** the native workspace described below is included in v0.1.2. It is operator-controlled; authenticated provider execution and SSH acceptance are still pending.
 
 ## Native workspace
 
@@ -31,7 +31,7 @@ The native workspace is operator-controlled. It does not infer task completion f
 
 ## Installation
 
-### Development preview (macOS ARM64 / Linux x64)
+### Development builds (macOS ARM64 / Linux x64)
 
 Download the platform archive and checksum from a successful [CI run](https://github.com/AVP-Dev/talos/actions/workflows/ci.yml). The `dev` branch is for ongoing development and testing; `master` holds the verified baseline. These preview binaries do not replace the published release automatically. Extract the archive and verify its checksum before running the executable.
 

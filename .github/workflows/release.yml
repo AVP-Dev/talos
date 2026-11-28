@@ -7,8 +7,12 @@ on:
   workflow_dispatch:
     inputs:
       tag:
-        description: Existing stable release tag to build
+        description: Release tag to build
         required: true
+      create_tag:
+        description: Create a new release tag from this exact master commit after successful builds
+        type: boolean
+        default: false
       propose_tap_update:
         description: Open a Homebrew tap pull request after publishing the release
         type: boolean
@@ -19,6 +23,7 @@ permissions:
 
 env:
   RELEASE_TAG: ${{ inputs.tag || github.ref_name }}
+  RELEASE_COMMIT: ${{ inputs.create_tag && github.sha || '' }}
 
 concurrency:
   group: release-${{ inputs.tag || github.ref_name }}
@@ -43,7 +48,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_COMMIT || format('refs/tags/{0}', env.RELEASE_TAG) }}
           persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -53,6 +58,10 @@ jobs:
           TARGET: ${{ matrix.target }}
         run: |
           [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]
+          if [ -n "$RELEASE_COMMIT" ]; then
+            test "$GITHUB_REF" = refs/heads/master
+            test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+          fi
           cargo build --release --locked --target "$TARGET"
           binary="$PWD/target/$TARGET/release/talos"
           test "$("$binary" --version)" = "talos ${RELEASE_TAG#v}"
@@ -79,7 +88,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          ref: refs/tags/${{ env.RELEASE_TAG }}
+          ref: ${{ env.RELEASE_COMMIT || format('refs/tags/{0}', env.RELEASE_TAG) }}
           persist-credentials: false
       - uses: actions/download-artifact@v4
         with:
@@ -103,7 +112,14 @@ jobs:
             if [ -f "$notes_path" ]; then
               notes=(--notes-file "$notes_path")
             fi
-            gh release create "$RELEASE_TAG" --verify-tag --title "TALOS $RELEASE_TAG" "${notes[@]}" archives/* talos.rb
+            tag_options=(--verify-tag)
+            if [ -n "$RELEASE_COMMIT" ]; then
+              test "$GITHUB_REF" = refs/heads/master
+              test "$(git rev-parse HEAD)" = "$RELEASE_COMMIT"
+              test -z "$(git ls-remote origin "refs/tags/$RELEASE_TAG")"
+              tag_options=(--target "$RELEASE_COMMIT")
+            fi
+            gh release create "$RELEASE_TAG" "${tag_options[@]}" --title "TALOS $RELEASE_TAG" "${notes[@]}" archives/* talos.rb
           fi
       - uses: actions/upload-artifact@v4
         with:

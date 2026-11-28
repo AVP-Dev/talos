@@ -86,7 +86,7 @@ fi
 # Accept a numeric version or its release tag.
 CLEAN_VERSION="${VERSION#v}"
 if [[ ! "$CLEAN_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
-  log_error "Expected a stable release tag such as v0.1.1."
+  log_error "Expected a release tag such as v0.1.2."
   exit 1
 fi
 VERSION="v$CLEAN_VERSION"

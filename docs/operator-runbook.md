@@ -15,10 +15,10 @@ Run the first command to install and the second when the tap publishes an update
 
 ### Release archives
 
-Download an archive for your platform and the matching `.sha256` file from [GitHub Releases](https://github.com/AVP-Dev/talos/releases). For example, with the Ubuntu-compatible x86-64 archive for `v0.1.1` in your current directory:
+Download an archive for your platform and the matching `.sha256` file from [GitHub Releases](https://github.com/AVP-Dev/talos/releases). For example, with the Ubuntu-compatible x86-64 archive for `v0.1.2` in your current directory:
 
 ```sh
-archive=talos-v0.1.1-x86_64-unknown-linux-gnu.tar.gz
+archive=talos-v0.1.2-x86_64-unknown-linux-gnu.tar.gz
 shasum -a 256 -c "$archive.sha256" &&
   tar -xzf "$archive" &&
   install -d "$HOME/.local/bin" &&
@@ -33,7 +33,7 @@ On Linux, `sha256sum -c "$archive.sha256"` also verifies the file. For macOS or 
 For an install script you can inspect before running:
 
 ```sh
-curl -fsSLo talos-install.sh https://raw.githubusercontent.com/AVP-Dev/talos/v0.1.1/install.sh
+curl -fsSLo talos-install.sh https://raw.githubusercontent.com/AVP-Dev/talos/v0.1.2/install.sh
 less talos-install.sh
 bash talos-install.sh
 ```
