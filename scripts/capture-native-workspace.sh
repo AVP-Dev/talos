@@ -44,7 +44,10 @@ wait_for() {
 has_workspace() { tmux list-sessions -F '#{session_name}' 2>/dev/null | grep -q '^talos-pair-'; }
 wait_for has_workspace
 session="$(tmux list-sessions -F '#{session_name}' | head -n1)"
-has_panes() { [[ $(tmux list-panes -t "$session" 2>/dev/null | wc -l) -eq 3 ]]; }
+has_panes() {
+  [[ $(tmux list-panes -t "$session" 2>/dev/null | wc -l) -eq 3 ]] &&
+    tmux show-options -qv -t "$session" @talos_pair_panes 2>/dev/null | grep -Eq '^%[0-9]+ %[0-9]+ %[0-9]+$'
+}
 wait_for has_panes
 read -r writer critic status < <(tmux show-options -qv -t "$session" @talos_pair_panes)
 has_status() { tmux capture-pane -p -t "$status" | grep -q 'Native Pair'; }
