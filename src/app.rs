@@ -1190,7 +1190,8 @@ pub async fn run(cli: Cli) -> Result<()> {
                         }
                         "mode" => match value.to_ascii_lowercase().as_str() {
                             "adaptive" => {
-                                config.orchestration.mode = crate::config::OrchestrationMode::Adaptive
+                                config.orchestration.mode =
+                                    crate::config::OrchestrationMode::Adaptive
                             }
                             "team" => {
                                 config.orchestration.mode = crate::config::OrchestrationMode::Team
@@ -1198,7 +1199,9 @@ pub async fn run(cli: Cli) -> Result<()> {
                             "pair" => {
                                 config.orchestration.mode = crate::config::OrchestrationMode::Pair
                             }
-                            _ => bail!("Unknown mode '{value}'. Supported modes: adaptive, team, pair"),
+                            _ => bail!(
+                                "Unknown mode '{value}'. Supported modes: adaptive, team, pair"
+                            ),
                         },
                         "max-writers" | "max_writers" => {
                             let n: usize = value

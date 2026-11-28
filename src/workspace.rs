@@ -168,7 +168,9 @@ fn cycle_adapter(current: AdapterId, available: &[AdapterId], next: bool) -> Ada
     available
         .iter()
         .position(|adapter| *adapter == current)
-        .map_or(available[0], |index| available[(index + offset) % available.len()])
+        .map_or(available[0], |index| {
+            available[(index + offset) % available.len()]
+        })
 }
 
 fn change_setting(config: &mut ProjectConfig, available: &[AdapterId], row: usize, next: bool) {
@@ -188,8 +190,15 @@ fn change_setting(config: &mut ProjectConfig, available: &[AdapterId], row: usiz
             }
         }
         2 => {
-            let modes = [OrchestrationMode::Adaptive, OrchestrationMode::Pair, OrchestrationMode::Team];
-            let index = modes.iter().position(|mode| *mode == config.orchestration.mode).unwrap_or(0);
+            let modes = [
+                OrchestrationMode::Adaptive,
+                OrchestrationMode::Pair,
+                OrchestrationMode::Team,
+            ];
+            let index = modes
+                .iter()
+                .position(|mode| *mode == config.orchestration.mode)
+                .unwrap_or(0);
             config.orchestration.mode = modes[(index + if next { 1 } else { 2 }) % modes.len()];
         }
         3 => {
@@ -227,28 +236,60 @@ pub(crate) fn run_settings(project: &Project) -> Result<bool> {
                 format!("Writer CLI: {}", config.writer.as_str()),
                 format!("Critic CLI: {}", config.critic.as_str()),
                 format!("Managed mode: {}", config.orchestration.mode.as_str()),
-                format!("Managed review rounds: {}", config.orchestration.max_review_rounds),
+                format!(
+                    "Managed review rounds: {}",
+                    config.orchestration.max_review_rounds
+                ),
                 format!("Managed writer limit: {}", config.max_concurrent_writers),
             ];
-            let discovered = available.iter().map(|adapter| adapter.as_str()).collect::<Vec<_>>().join(", ");
-            let mut body = format!("TALOS Settings\n\nAgents / Workspace\nInstalled: {discovered}\n");
+            let discovered = available
+                .iter()
+                .map(|adapter| adapter.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            let mut body =
+                format!("TALOS Settings\n\nAgents / Workspace\nInstalled: {discovered}\n");
             for (index, value) in rows.iter().enumerate() {
-                if index == 2 { body.push_str("\nManaged workflow\n"); }
-                body.push_str(&format!("{} {value}\n", if row == index { ">" } else { " " }));
+                if index == 2 {
+                    body.push_str("\nManaged workflow\n");
+                }
+                body.push_str(&format!(
+                    "{} {value}\n",
+                    if row == index { ">" } else { " " }
+                ));
             }
-            body.push_str(&format!("\nProject checks: {} configured | Git publication: {}\n", config.checks.len(), if config.github.is_some() { "configured" } else { "disabled" }));
+            body.push_str(&format!(
+                "\nProject checks: {} configured | Git publication: {}\n",
+                config.checks.len(),
+                if config.github.is_some() {
+                    "configured"
+                } else {
+                    "disabled"
+                }
+            ));
             body.push_str("Models, providers, reasoning and login are configured in the original CLIs.\nRole changes apply to newly created workspaces; running panes are preserved.\n\nArrows: select/change | R: rescan | Enter: save | Esc: cancel\n");
             body.push_str(&notice);
-            terminal.draw(|frame| frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), frame.area()))?;
-            if let Event::Key(key) = event::read()? && key.kind == KeyEventKind::Press {
+            terminal.draw(|frame| {
+                frame.render_widget(
+                    Paragraph::new(body).wrap(Wrap { trim: false }),
+                    frame.area(),
+                )
+            })?;
+            if let Event::Key(key) = event::read()?
+                && key.kind == KeyEventKind::Press
+            {
                 match key.code {
                     KeyCode::Up => row = (row + SETTING_COUNT - 1) % SETTING_COUNT,
                     KeyCode::Down => row = (row + 1) % SETTING_COUNT,
-                    KeyCode::Left | KeyCode::Right => change_setting(&mut config, &available, row, key.code == KeyCode::Right),
+                    KeyCode::Left | KeyCode::Right => {
+                        change_setting(&mut config, &available, row, key.code == KeyCode::Right)
+                    }
                     KeyCode::Char('r' | 'R') => available = installed_adapters(),
                     KeyCode::Esc => return Ok(false),
                     KeyCode::Enter => {
-                        if !available.contains(&config.writer) || !available.contains(&config.critic) {
+                        if !available.contains(&config.writer)
+                            || !available.contains(&config.critic)
+                        {
                             notice = "Select two installed CLI roles before saving.".to_owned();
                         } else {
                             config.save(project)?;
@@ -267,7 +308,7 @@ pub(crate) fn run_settings(project: &Project) -> Result<bool> {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_line, existing_window, numeric_id, change_setting};
+    use super::{change_setting, display_line, existing_window, numeric_id};
     use crate::{adapter::AdapterId, config::ProjectConfig};
 
     #[test]
@@ -278,7 +319,10 @@ mod tests {
 
     #[test]
     fn cockpit_reuse_requires_exact_name_and_valid_window_id() {
-        assert_eq!(existing_window("@1 pair\n@2 talos-cockpit\n", "talos-cockpit"), Some("@2"));
+        assert_eq!(
+            existing_window("@1 pair\n@2 talos-cockpit\n", "talos-cockpit"),
+            Some("@2")
+        );
         assert_eq!(
             existing_window("@2 talos-cockpit-old\n@abc talos-cockpit", "talos-cockpit"),
             None
