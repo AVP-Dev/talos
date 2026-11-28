@@ -58,7 +58,9 @@ or keys 2 and 1 in the compact status pane. Use the native tmux prefix
 followed by d to detach or z to zoom. Reconnect with `talos attach`.
 Do not run managed tasks concurrently with manual edits.
 
-Use an existing Git repository with a first commit. Install and configure at least one coding CLI separately. In your project, run `talos` or `talos tui`. If you launch from outside a Git project, the cockpit asks for a project path.
+### Separate managed cockpit
+
+Use an existing Git repository with a first commit. Install and configure at least one coding CLI separately. In your project, run `talos tui` explicitly to open the managed cockpit. If you launch from outside a Git project, the cockpit asks for a project path.
 
 1. **Settings.** Open `/config` or press **F2**. Use arrows to select and change the Writer, Critic, model or mode. Save with **Enter**. **R** rechecks local CLI availability after installation. Authenticate in the selected CLI itself when required.
 2. **Run.** Describe a change and press **Enter**. **Work** shows progress and the result. If the run is blocked, the input stays editable. **Alt+3** opens **Changes** to inspect uncommitted files. Press **Alt+1** to return to **Work**. Projects with draft PR publishing and task presets ask for confirmation in **Work**.

@@ -61,6 +61,20 @@ jobs:
       - name: Build Release Binary
         run: cargo build --release --locked
 
+      - name: Capture actual native workspace (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get install -y xvfb xterm xdotool imagemagick fonts-dejavu-core
+          xvfb-run -a -s '-screen 0 1600x1000x24' bash scripts/capture-native-workspace.sh target/release/talos captures
+
+      - uses: actions/upload-artifact@v4
+        if: runner.os == 'Linux'
+        with:
+          name: native-workspace-screenshots
+          path: captures/*.png
+          if-no-files-found: error
+          retention-days: 14
+
       - name: Package experimental preview
         run: |
           archive="talos-preview-${RUNNER_OS}-${RUNNER_ARCH}.tar.gz"
