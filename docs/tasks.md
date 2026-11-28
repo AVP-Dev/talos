@@ -274,7 +274,7 @@ Dependency: R6–R8.
 | ID | Status | Task | Exit criteria |
 |---|---|---|---|
 | T23.1 | in progress | Native settings and first-run selection | F2 in the status pane opens a separate settings window; selects installed roles, rescans available CLIs, and configures managed limits. Native model configuration stays in the original CLIs. CI pending. |
-| T23.2 | in progress | Pane lifecycle and layout | Single-role restart passed CI run 46121408941. Layout switching implemented locally; geometry and PID checks pending CI. |
+| T23.2 | done | Pane lifecycle and layout | Single-role restart and layout switching passed CI run 46121898401 on macOS/Linux. PR #3 merged as cfceab1. Actual workspace and settings screenshots captured in CI run 46124854600 with test CLIs. |
 | T23.3 | planned | Config consistency | Validate project checks and Git policy, support main and master throughout publication, and distinguish saved settings from live panes. |
 
 ## Required end-to-end scenarios from the original request

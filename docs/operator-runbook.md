@@ -44,6 +44,8 @@ The installer verifies the downloaded archive’s checksum and defaults to `$HOM
 
 ### Experimental native workspace
 
+![Actual native workspace with test CLI fixtures](media/native-workspace.png)
+
 `talos attach` opens the original Writer and Critic CLI terminals inside a
 persistent tmux session. In its compact status pane, F2 opens settings and
 `c` opens the separate managed cockpit. Enter saves role settings without
@@ -57,6 +59,8 @@ Use `talos layout stacked` or `talos layout columns` to switch geometry,
 or keys 2 and 1 in the compact status pane. Use the native tmux prefix
 followed by d to detach or z to zoom. Reconnect with `talos attach`.
 Do not run managed tasks concurrently with manual edits.
+
+![Native workspace settings](media/native-settings.png)
 
 ### Separate managed cockpit
 

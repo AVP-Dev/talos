@@ -14,6 +14,11 @@
 
 ## Native workspace
 
+<div align="center">
+  <img src="docs/media/native-workspace.png" width="960" alt="Actual TALOS tmux workspace with Writer and Critic terminals and compact status panel">
+  <p><sub>Actual TALOS development preview running in tmux/xterm. The two test CLI fixtures are interactive but do not connect to a provider.</sub></p>
+</div>
+
 TALOS runs the original Writer and Critic CLIs in a persistent tmux session. The agent terminals occupy the main work area; a compact TALOS pane shows recorded task state and provides access to settings and the managed cockpit. Models, reasoning, authentication, and provider permissions belong to the original CLIs.
 
 - **Writer / Critic:** independent interactive terminals.
@@ -63,6 +68,11 @@ talos attach
 ```
 
 On the first run, select two installed CLI roles. You can also open settings directly with `talos settings`. Enter saves the selections; R rescans installed CLIs. Use the original CLIs to configure their provider settings.
+
+<div align="center">
+  <img src="docs/media/native-settings.png" width="960" alt="Actual TALOS native settings with detected CLI roles and managed workflow limits">
+  <p><sub>Native settings window captured from the running development preview.</sub></p>
+</div>
 
 | Control | Action |
 | --- | --- |
