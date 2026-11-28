@@ -269,6 +269,14 @@ Dependency: R6–R8.
 | T22.2 | in progress | Native session acceptance | Automated layout and reuse passed on both platforms. Actual provider startup, SSH detach/reconnect, role configuration, zoom and CLI exit acceptance remain pending. |
 | T22.3 | planned | Managed/manual authority boundary | Define and verify provider-supported handoff without duplicating Writer execution or inferring evidence from screen contents. |
 
+## R23 — Native workspace settings
+
+| ID | Status | Task | Exit criteria |
+|---|---|---|---|
+| T23.1 | in progress | Native settings and first-run selection | F2 in the status pane opens a separate settings window; selects installed roles, rescans available CLIs, and configures managed limits. Native model configuration stays in the original CLIs. CI pending. |
+| T23.2 | planned | Pane lifecycle and layout | Explicit role replacement and restart with operator confirmation, without losing unrelated panes. |
+| T23.3 | planned | Config consistency | Validate project checks and Git policy, support main and master throughout publication, and distinguish saved settings from live panes. |
+
 ## Required end-to-end scenarios from the original request
 
 First launch/repeat `up`; Writer/Critic success and justified rejection; child task; independent parallel work; adding a task while work is running; manual takeover; CLI recovery; orchestrator crash; SSH disconnect/reconnect; Linux reboot autostart; PR without merge; duplicate-execution prevention; and rechecking original acceptance criteria before closeout. Keep separate evidence for each scenario; do not combine them into a misleading test.

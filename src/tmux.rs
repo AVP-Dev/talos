@@ -325,7 +325,7 @@ fn validate_live_panes(expected: &[&str; 3], observed: &str) -> Result<()> {
     Ok(())
 }
 
-fn native_executable(adapter: AdapterId) -> Result<PathBuf> {
+pub(crate) fn native_executable(adapter: AdapterId) -> Result<PathBuf> {
     let executable = match adapter {
         AdapterId::Agy => crate::adapter::agy::resolve_agy_executable(),
         AdapterId::Codex => crate::adapter::codex::resolve_codex_executable(),

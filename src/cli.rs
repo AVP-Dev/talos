@@ -47,6 +47,8 @@ pub enum Command {
     /// Show the compact workspace status panel.
     #[command(hide = true)]
     WorkspaceStatus,
+    /// Configure native workspace roles and managed workflow preferences.
+    Settings,
     /// View or modify project configuration (.talos/config.json).
     Config(ConfigArgs),
     /// Launch the interactive terminal orchestrator dashboard.
