@@ -4,6 +4,15 @@
 
 ## Current phase
 
+### R23 — Native workspace settings (in progress)
+
+T23.1 adds `talos settings`, first-run installed adapter selection, and F2
+in the compact pane to open a separate native settings window. The settings
+screen excludes provider models and credentials, and exposes managed mode,
+review rounds and writer limit separately. Existing native panes are not
+restarted by saving configuration. The CLI accepts adaptive mode again.
+Build and CI validation are pending. T23.2/T23.3 remain open.
+
 ### R22 — Native Pair workspace (in progress)
 
 The user approved the native CLI workspace: two equal upper panes and a

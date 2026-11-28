@@ -9,7 +9,15 @@ use crossterm::{
 };
 use ratatui::{Terminal, backend::CrosstermBackend, widgets::Paragraph};
 
-use crate::{app::ensure_talos_ignored, db::Database, project::Project, secrets::redact_sensitive};
+use crate::{
+    adapter::AdapterId,
+    app::ensure_talos_ignored,
+    config::{OrchestrationMode, ProjectConfig},
+    db::Database,
+    project::Project,
+    secrets::redact_sensitive,
+    tmux::native_executable,
+};
 
 fn status_text(database: &Database) -> Result<String> {
     let queue = database.queue_summary()?;
@@ -30,7 +38,7 @@ fn status_text(database: &Database) -> Result<String> {
         None => "—".to_owned(),
     };
     Ok(format!(
-        "TALOS | Native Pair (manual)\n{task}\nChecks: {checks} | Queue: {} waiting / {} complete / {} blocked | {}\nNative CLI permissions apply; do not run a managed Writer concurrently.\n[c] Full cockpit | tmux prefix + arrows: switch / z: zoom / d: detach",
+        "TALOS | Native Pair (manual)\n{task}\nChecks: {checks} | Queue: {} waiting / {} complete / {} blocked | {}\nNative CLI permissions apply; do not run a managed Writer concurrently.\n[F2] Settings [c] Full cockpit | tmux prefix + arrows / z / d",
         queue.queued,
         queue.complete,
         queue.blocked_or_failed,
@@ -50,7 +58,7 @@ fn display_line(value: &str) -> String {
         .collect()
 }
 
-fn open_cockpit(project: &Project) -> Result<()> {
+fn open_window(project: &Project, name: &str, subcommand: &str) -> Result<()> {
     let executable = env::current_exe()?;
     let pane = env::var("TMUX_PANE").context("The status pane is not inside tmux")?;
     ensure!(numeric_id(&pane, '%'), "Invalid tmux pane identity");
@@ -75,7 +83,7 @@ fn open_cockpit(project: &Project) -> Result<()> {
         .output()?;
     ensure!(windows.status.success(), "Cannot inspect workspace windows");
     let windows = String::from_utf8(windows.stdout)?;
-    if let Some(window) = existing_cockpit(&windows) {
+    if let Some(window) = existing_window(&windows, name) {
         let target = format!("{session}:{window}");
         let status = Command::new("tmux")
             .args(["select-window", "-t", &target])
@@ -85,10 +93,10 @@ fn open_cockpit(project: &Project) -> Result<()> {
     }
     let target = format!("{session}:");
     let status = Command::new("tmux")
-        .args(["new-window", "-t", &target, "-n", "talos-cockpit", "-c"])
+        .args(["new-window", "-t", &target, "-n", name, "-c"])
         .arg(&project.root)
         .arg(executable)
-        .arg("tui")
+        .arg(subcommand)
         .status()?;
     ensure!(status.success(), "Cannot open the full cockpit");
     Ok(())
@@ -100,10 +108,10 @@ fn numeric_id(value: &str, prefix: char) -> bool {
     })
 }
 
-fn existing_cockpit(windows: &str) -> Option<&str> {
+fn existing_window<'a>(windows: &'a str, expected: &str) -> Option<&'a str> {
     windows.lines().find_map(|line| {
         let (id, name) = line.split_once(' ')?;
-        (name == "talos-cockpit" && numeric_id(id, '@')).then_some(id)
+        (name == expected && numeric_id(id, '@')).then_some(id)
     })
 }
 
@@ -128,11 +136,127 @@ pub(crate) fn run_status(project: Project) -> Result<()> {
             if event::poll(Duration::from_secs(1))?
                 && let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
-                && key.code == KeyCode::Char('c')
             {
-                notice = open_cockpit(&project)
-                    .err()
-                    .map(|_| "Cannot open cockpit".to_owned());
+                let result = match key.code {
+                    KeyCode::Char('c') => open_window(&project, "talos-cockpit", "tui"),
+                    KeyCode::F(2) => open_window(&project, "talos-settings", "settings"),
+                    _ => continue,
+                };
+                notice = result.err().map(|_| "Cannot open window".to_owned());
+            }
+        }
+    })();
+    let _ = execute!(io::stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+    let _ = disable_raw_mode();
+    result
+}
+
+const SETTING_COUNT: usize = 5;
+
+fn installed_adapters() -> Vec<AdapterId> {
+    AdapterId::ALL
+        .into_iter()
+        .filter(|adapter| native_executable(*adapter).is_ok())
+        .collect()
+}
+
+fn cycle_adapter(current: AdapterId, available: &[AdapterId], next: bool) -> AdapterId {
+    if available.is_empty() {
+        return current;
+    }
+    let offset = if next { 1 } else { available.len() - 1 };
+    available
+        .iter()
+        .position(|adapter| *adapter == current)
+        .map_or(available[0], |index| available[(index + offset) % available.len()])
+}
+
+fn change_setting(config: &mut ProjectConfig, available: &[AdapterId], row: usize, next: bool) {
+    match row {
+        0 => {
+            let adapter = cycle_adapter(config.writer, available, next);
+            if config.writer != adapter {
+                config.writer = adapter;
+                config.writer_model = None;
+            }
+        }
+        1 => {
+            let adapter = cycle_adapter(config.critic, available, next);
+            if config.critic != adapter {
+                config.critic = adapter;
+                config.critic_model = None;
+            }
+        }
+        2 => {
+            let modes = [OrchestrationMode::Adaptive, OrchestrationMode::Pair, OrchestrationMode::Team];
+            let index = modes.iter().position(|mode| *mode == config.orchestration.mode).unwrap_or(0);
+            config.orchestration.mode = modes[(index + if next { 1 } else { 2 }) % modes.len()];
+        }
+        3 => {
+            let rounds = config.orchestration.max_review_rounds;
+            config.orchestration.max_review_rounds = (rounds + if next { 0 } else { 3 }) % 5 + 1;
+        }
+        4 => {
+            let workers = config.max_concurrent_writers;
+            let workers = (workers + if next { 0 } else { 1 }) % 3 + 1;
+            config.max_concurrent_writers = workers;
+            config.orchestration.max_writer_workers = workers;
+        }
+        _ => {}
+    }
+}
+
+pub(crate) fn run_settings(project: &Project) -> Result<bool> {
+    use ratatui::widgets::Wrap;
+
+    ensure_talos_ignored(project)?;
+    let mut config = ProjectConfig::load(project)?;
+    let mut available = installed_adapters();
+    if !crate::config::config_path(&project.state_root).exists() && !available.is_empty() {
+        config.writer = available[0];
+        config.critic = available.get(1).copied().unwrap_or(available[0]);
+    }
+    let mut row = 0;
+    let mut notice = String::new();
+    enable_raw_mode()?;
+    let result = (|| -> Result<bool> {
+        execute!(io::stdout(), EnterAlternateScreen)?;
+        let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+        loop {
+            let rows = [
+                format!("Writer CLI: {}", config.writer.as_str()),
+                format!("Critic CLI: {}", config.critic.as_str()),
+                format!("Managed mode: {}", config.orchestration.mode.as_str()),
+                format!("Managed review rounds: {}", config.orchestration.max_review_rounds),
+                format!("Managed writer limit: {}", config.max_concurrent_writers),
+            ];
+            let discovered = available.iter().map(|adapter| adapter.as_str()).collect::<Vec<_>>().join(", ");
+            let mut body = format!("TALOS Settings\n\nAgents / Workspace\nInstalled: {discovered}\n");
+            for (index, value) in rows.iter().enumerate() {
+                if index == 2 { body.push_str("\nManaged workflow\n"); }
+                body.push_str(&format!("{} {value}\n", if row == index { ">" } else { " " }));
+            }
+            body.push_str(&format!("\nProject checks: {} configured | Git publication: {}\n", config.checks.len(), if config.github.is_some() { "configured" } else { "disabled" }));
+            body.push_str("Models, providers, reasoning and login are configured in the original CLIs.\nRole changes apply to newly created workspaces; running panes are preserved.\n\nArrows: select/change | R: rescan | Enter: save | Esc: cancel\n");
+            body.push_str(&notice);
+            terminal.draw(|frame| frame.render_widget(Paragraph::new(body).wrap(Wrap { trim: false }), frame.area()))?;
+            if let Event::Key(key) = event::read()? && key.kind == KeyEventKind::Press {
+                match key.code {
+                    KeyCode::Up => row = (row + SETTING_COUNT - 1) % SETTING_COUNT,
+                    KeyCode::Down => row = (row + 1) % SETTING_COUNT,
+                    KeyCode::Left | KeyCode::Right => change_setting(&mut config, &available, row, key.code == KeyCode::Right),
+                    KeyCode::Char('r' | 'R') => available = installed_adapters(),
+                    KeyCode::Esc => return Ok(false),
+                    KeyCode::Enter => {
+                        if !available.contains(&config.writer) || !available.contains(&config.critic) {
+                            notice = "Select two installed CLI roles before saving.".to_owned();
+                        } else {
+                            config.save(project)?;
+                            return Ok(true);
+                        }
+                    }
+                    _ => {}
+                }
             }
         }
     })();
@@ -143,7 +267,8 @@ pub(crate) fn run_status(project: Project) -> Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{display_line, existing_cockpit, numeric_id};
+    use super::{display_line, existing_window, numeric_id, change_setting};
+    use crate::{adapter::AdapterId, config::ProjectConfig};
 
     #[test]
     fn status_text_removes_control_characters_and_bounds_title() {
@@ -153,12 +278,30 @@ mod tests {
 
     #[test]
     fn cockpit_reuse_requires_exact_name_and_valid_window_id() {
-        assert_eq!(existing_cockpit("@1 pair\n@2 talos-cockpit\n"), Some("@2"));
+        assert_eq!(existing_window("@1 pair\n@2 talos-cockpit\n", "talos-cockpit"), Some("@2"));
         assert_eq!(
-            existing_cockpit("@2 talos-cockpit-old\n@abc talos-cockpit"),
+            existing_window("@2 talos-cockpit-old\n@abc talos-cockpit", "talos-cockpit"),
             None
         );
         assert!(numeric_id("$1", '$'));
         assert!(!numeric_id("$1:other", '$'));
+    }
+
+    #[test]
+    fn native_settings_cycle_only_installed_adapters_and_bounded_limits() {
+        let mut config = ProjectConfig::default();
+        let available = [AdapterId::Codex, AdapterId::Claude];
+        change_setting(&mut config, &available, 0, true);
+        assert_eq!(config.writer, AdapterId::Codex);
+        change_setting(&mut config, &available, 0, true);
+        assert_eq!(config.writer, AdapterId::Claude);
+        change_setting(&mut config, &available, 0, false);
+        assert_eq!(config.writer, AdapterId::Codex);
+        for _ in 0..10 {
+            change_setting(&mut config, &available, 3, true);
+            change_setting(&mut config, &available, 4, false);
+            assert!((1..=5).contains(&config.orchestration.max_review_rounds));
+            assert!((1..=3).contains(&config.max_concurrent_writers));
+        }
     }
 }

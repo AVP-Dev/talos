@@ -246,6 +246,14 @@ pub async fn run(cli: Cli) -> Result<()> {
                 );
             }
         }
+        if !tmux.has_session(&expected_session)?
+            && !crate::config::config_path(&project.state_root).exists()
+            && io::stdin().is_terminal()
+            && !cli.json
+            && !crate::workspace::run_settings(&project)?
+        {
+            return Ok(());
+        }
         let config = ProjectConfig::load(&project)?;
         let session_name = tmux.ensure_pair_workspace(&project.root, &config)?;
         if cli.json {
@@ -267,6 +275,10 @@ pub async fn run(cli: Cli) -> Result<()> {
     }
     if matches!(&command, Command::WorkspaceStatus) {
         return tokio::task::spawn_blocking(move || crate::workspace::run_status(project)).await?;
+    }
+    if matches!(&command, Command::Settings) {
+        crate::workspace::run_settings(&project)?;
+        return Ok(());
     }
 
     ensure_talos_ignored(&project)?;
@@ -1177,13 +1189,16 @@ pub async fn run(cli: Cli) -> Result<()> {
                             config.critic = adapter;
                         }
                         "mode" => match value.to_ascii_lowercase().as_str() {
+                            "adaptive" => {
+                                config.orchestration.mode = crate::config::OrchestrationMode::Adaptive
+                            }
                             "team" => {
                                 config.orchestration.mode = crate::config::OrchestrationMode::Team
                             }
                             "pair" => {
                                 config.orchestration.mode = crate::config::OrchestrationMode::Pair
                             }
-                            _ => bail!("Unknown mode '{value}'. Supported modes: team, pair"),
+                            _ => bail!("Unknown mode '{value}'. Supported modes: adaptive, team, pair"),
                         },
                         "max-writers" | "max_writers" => {
                             let n: usize = value
@@ -1220,7 +1235,7 @@ pub async fn run(cli: Cli) -> Result<()> {
                 }
             }
         }
-        Command::Tui | Command::WorkspaceStatus => {
+        Command::Tui | Command::WorkspaceStatus | Command::Settings => {
             unreachable!("Terminal UI handled before database open")
         }
     }
