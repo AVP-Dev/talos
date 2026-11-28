@@ -33,7 +33,7 @@ The native workspace is operator-controlled. It does not infer task completion f
 
 ### Development preview (macOS ARM64 / Linux x64)
 
-Download the platform archive and checksum from a successful [master CI run](https://github.com/AVP-Dev/talos/actions/workflows/ci.yml). These are experimental binaries; they do not replace the stable release automatically. Extract the archive and verify its checksum before running the executable.
+Download the platform archive and checksum from a successful [CI run](https://github.com/AVP-Dev/talos/actions/workflows/ci.yml). The `dev` branch is for ongoing development and testing; `master` holds the verified baseline. These preview binaries do not replace the published release automatically. Extract the archive and verify its checksum before running the executable.
 
 ### Stable release
 
