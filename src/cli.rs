@@ -49,6 +49,19 @@ pub enum Command {
     WorkspaceStatus,
     /// Configure native workspace roles and managed workflow preferences.
     Settings,
+    /// Restart one native pane after exiting its current CLI. Other panes remain intact.
+    RestartPane {
+        #[arg(value_enum)]
+        role: crate::tmux::NativeRole,
+        /// Confirm replacement of the selected pane process and its terminal contents.
+        #[arg(long, required = true)]
+        confirm: bool,
+    },
+    /// Switch the native workspace layout without restarting panes.
+    Layout {
+        #[arg(value_enum)]
+        layout: crate::tmux::NativeLayout,
+    },
     /// View or modify project configuration (.talos/config.json).
     Config(ConfigArgs),
     /// Launch the interactive terminal orchestrator dashboard.

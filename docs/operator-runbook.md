@@ -42,6 +42,22 @@ The installer verifies the downloaded archive’s checksum and defaults to `$HOM
 
 ## Start a task in the cockpit
 
+### Experimental native workspace
+
+`talos attach` opens the original Writer and Critic CLI terminals inside a
+persistent tmux session. In its compact status pane, F2 opens settings and
+`c` opens the separate managed cockpit. Enter saves role settings without
+restarting a terminal. To apply a role change to a running workspace, exit
+that native CLI first, select the role in settings and press X, then Y to
+confirm replacement. Alternatively use `talos restart-pane writer --confirm`
+or `talos restart-pane critic --confirm`. This replaces only the selected
+pane process and terminal contents; the other panes remain open.
+
+Use `talos layout stacked` or `talos layout columns` to switch geometry,
+or keys 2 and 1 in the compact status pane. Use the native tmux prefix
+followed by d to detach or z to zoom. Reconnect with `talos attach`.
+Do not run managed tasks concurrently with manual edits.
+
 Use an existing Git repository with a first commit. Install and configure at least one coding CLI separately. In your project, run `talos` or `talos tui`. If you launch from outside a Git project, the cockpit asks for a project path.
 
 1. **Settings.** Open `/config` or press **F2**. Use arrows to select and change the Writer, Critic, model or mode. Save with **Enter**. **R** rechecks local CLI availability after installation. Authenticate in the selected CLI itself when required.

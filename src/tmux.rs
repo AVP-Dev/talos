@@ -11,6 +11,29 @@ use sha2::{Digest, Sha256};
 use crate::{adapter::AdapterId, config::ProjectConfig, secrets::redact_sensitive};
 
 const WORKSPACE_PANES_OPTION: &str = "@talos_pair_panes";
+const COLUMNS_LAYOUT_OPTION: &str = "@talos_columns_layout";
+const NATIVE: &str = "\"$1\"; exec \"${SHELL:-/bin/sh}\"";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum NativeRole {
+    Writer,
+    Critic,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
+pub enum NativeLayout {
+    Columns,
+    Stacked,
+}
+
+impl NativeRole {
+    fn index(self) -> usize {
+        match self {
+            Self::Writer => 0,
+            Self::Critic => 1,
+        }
+    }
+}
 
 #[derive(Clone, Debug, Serialize)]
 pub struct TmuxProbe {
@@ -68,7 +91,6 @@ impl TmuxClient {
     ) -> Result<()> {
         // Multi-argument tmux commands preserve paths with spaces without shell
         // interpolation. The shell fallback keeps a pane alive after CLI exit.
-        const NATIVE: &str = "\"$1\"; exec \"${SHELL:-/bin/sh}\"";
         let first = self.checked(
             self.command()
                 .args([
@@ -192,6 +214,150 @@ impl TmuxClient {
             "#{pane_id} #{pane_dead}",
         ]))?;
         validate_live_panes(&expected, &observed)
+    }
+
+    /// Change geometry without restarting the native terminals.
+    pub fn set_native_layout(&self, root: &Path, layout: NativeLayout) -> Result<()> {
+        let name = project_session_name(&root.canonicalize()?);
+        self.validate_pair_workspace(&name)?;
+        let target = self.session_target(&name)?;
+        let recorded = self.checked(self.command().args([
+            "show-options",
+            "-qv",
+            "-t",
+            &target,
+            WORKSPACE_PANES_OPTION,
+        ]))?;
+        let panes = parse_workspace_panes(&recorded)?;
+        let listed =
+            self.checked(
+                self.command()
+                    .args(["list-panes", "-t", panes[0], "-F", "#{pane_id}"]),
+            )?;
+        if listed.lines().collect::<Vec<_>>() != panes {
+            bail!("Pair window must contain exactly its original three panes in role order");
+        }
+        let current = self.checked(self.command().args([
+            "display-message",
+            "-p",
+            "-t",
+            panes[0],
+            "#{window_layout}",
+        ]))?;
+        let saved = self.checked(self.command().args([
+            "show-options",
+            "-qv",
+            "-t",
+            &target,
+            COLUMNS_LAYOUT_OPTION,
+        ]))?;
+        match layout {
+            NativeLayout::Stacked => {
+                if saved.trim().is_empty() {
+                    let geometry = self.checked(self.command().args([
+                        "list-panes",
+                        "-t",
+                        panes[0],
+                        "-F",
+                        "#{pane_top} #{pane_left}",
+                    ]))?;
+                    let rows: Vec<Vec<&str>> = geometry
+                        .lines()
+                        .map(|line| line.split_whitespace().collect())
+                        .collect();
+                    if rows.len() != 3
+                        || rows.iter().any(|row| row.len() != 2)
+                        || rows[0][0] != rows[1][0]
+                        || rows[0][1] == rows[1][1]
+                        || rows[2][0] == rows[0][0]
+                    {
+                        bail!("Restore the original columns layout before saving it");
+                    }
+                    self.checked(self.command().args([
+                        "set-option",
+                        "-t",
+                        &target,
+                        COLUMNS_LAYOUT_OPTION,
+                        current.trim(),
+                    ]))?;
+                }
+                self.checked(self.command().args([
+                    "select-layout",
+                    "-t",
+                    panes[0],
+                    "even-vertical",
+                ]))?;
+                self.checked(
+                    self.command()
+                        .args(["resize-pane", "-t", panes[2], "-y", "7"]),
+                )?;
+            }
+            NativeLayout::Columns => {
+                if !saved.trim().is_empty() {
+                    self.checked(self.command().args([
+                        "select-layout",
+                        "-t",
+                        panes[0],
+                        saved.trim(),
+                    ]))?;
+                }
+            }
+        }
+        self.validate_pair_workspace(&name)
+    }
+
+    /// Replace only the explicitly selected role, preserving the other panes.
+    pub fn restart_native_role(
+        &self,
+        root: &Path,
+        role: NativeRole,
+        config: &ProjectConfig,
+    ) -> Result<()> {
+        let adapter = match role {
+            NativeRole::Writer => config.writer,
+            NativeRole::Critic => config.critic,
+        };
+        let executable = native_executable(adapter)?;
+        self.restart_role_with_executable(root, role, &executable, adapter)
+    }
+
+    fn restart_role_with_executable(
+        &self,
+        root: &Path,
+        role: NativeRole,
+        executable: &Path,
+        adapter: AdapterId,
+    ) -> Result<()> {
+        let root = root.canonicalize()?;
+        let name = project_session_name(&root);
+        self.validate_pair_workspace(&name)?;
+        let target = self.session_target(&name)?;
+        let record = self.checked(self.command().args([
+            "show-options",
+            "-qv",
+            "-t",
+            &target,
+            WORKSPACE_PANES_OPTION,
+        ]))?;
+        let panes = parse_workspace_panes(&record)?;
+        let pane = panes[role.index()];
+        self.checked(
+            self.command()
+                .args(["respawn-pane", "-k", "-t", pane, "-c"])
+                .arg(&root)
+                .args(["sh", "-c", NATIVE, "talos-native"])
+                .arg(executable),
+        )?;
+        let label = match role {
+            NativeRole::Writer => "Writer",
+            NativeRole::Critic => "Critic",
+        };
+        let title = format!("{label} | {}", adapter.as_str());
+        self.checked(
+            self.command()
+                .args(["select-pane", "-t", pane, "-T", &title]),
+        )?;
+        self.validate_pair_workspace(&name)
     }
 
     fn checked(&self, command: &mut Command) -> Result<String> {
@@ -605,5 +771,57 @@ mod tests {
         assert_eq!(rows[0][1], rows[1][1]);
         assert_ne!(rows[0][2], rows[1][2]);
         assert!((6..=8).contains(&rows[2][3].parse::<u32>().unwrap()));
+        client
+            .set_native_layout(&root, super::NativeLayout::Stacked)
+            .expect("stack native panes");
+        assert_eq!(
+            before,
+            identity(),
+            "layout must preserve pane identities and processes"
+        );
+        client
+            .set_native_layout(&root, super::NativeLayout::Columns)
+            .expect("restore native columns");
+        assert_eq!(
+            before,
+            identity(),
+            "restoring layout must preserve pane identities and processes"
+        );
+        let target = client.session_target(&first).unwrap();
+        let record = client
+            .checked(client.command().args([
+                "show-options",
+                "-qv",
+                "-t",
+                &target,
+                super::WORKSPACE_PANES_OPTION,
+            ]))
+            .unwrap();
+        let ids = parse_workspace_panes(&record).unwrap();
+        let before_restart = identity();
+        client
+            .restart_role_with_executable(
+                &root,
+                super::NativeRole::Writer,
+                &fixture,
+                crate::adapter::AdapterId::Agy,
+            )
+            .expect("restart only Writer");
+        let after_restart = identity();
+        for id in ids {
+            let old = before_restart
+                .lines()
+                .find(|line| line.split_whitespace().next() == Some(id))
+                .unwrap();
+            let new = after_restart
+                .lines()
+                .find(|line| line.split_whitespace().next() == Some(id))
+                .unwrap();
+            if id == ids[0] {
+                assert_ne!(old, new);
+            } else {
+                assert_eq!(old, new);
+            }
+        }
     }
 }
