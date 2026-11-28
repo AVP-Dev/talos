@@ -44,7 +44,7 @@ The installer verifies the downloaded archive’s checksum and defaults to `$HOM
 
 ### Experimental native workspace
 
-![Actual native workspace with test CLI fixtures](media/native-workspace.png)
+![Actual native workspace with original Codex and Claude Code startup screens](media/native-workspace.png)
 
 `talos attach` opens the original Writer and Critic CLI terminals inside a
 persistent tmux session. In its compact status pane, F2 opens settings and

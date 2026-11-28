@@ -15,8 +15,8 @@
 ## Native workspace
 
 <div align="center">
-  <img src="docs/media/native-workspace.png" width="960" alt="Actual TALOS tmux workspace with Writer and Critic terminals and compact status panel">
-  <p><sub>Actual TALOS development preview running in tmux/xterm. The two test CLI fixtures are interactive but do not connect to a provider.</sub></p>
+  <img src="docs/media/native-workspace.png" width="960" alt="Actual TALOS tmux workspace with original Codex and Claude Code startup screens and compact status panel">
+  <p><sub>Actual TALOS development preview in tmux/xterm, running official Codex and Claude Code. First-launch screens are shown before account sign-in.</sub></p>
 </div>
 
 TALOS runs the original Writer and Critic CLIs in a persistent tmux session. The agent terminals occupy the main work area; a compact TALOS pane shows recorded task state and provides access to settings and the managed cockpit. Models, reasoning, authentication, and provider permissions belong to the original CLIs.
