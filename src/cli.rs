@@ -57,6 +57,11 @@ pub enum Command {
         #[arg(long, required = true)]
         confirm: bool,
     },
+    /// Switch the native workspace layout without restarting panes.
+    Layout {
+        #[arg(value_enum)]
+        layout: crate::tmux::NativeLayout,
+    },
     /// View or modify project configuration (.talos/config.json).
     Config(ConfigArgs),
     /// Launch the interactive terminal orchestrator dashboard.

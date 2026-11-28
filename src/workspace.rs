@@ -16,7 +16,7 @@ use crate::{
     db::Database,
     project::Project,
     secrets::redact_sensitive,
-    tmux::{NativeRole, TmuxClient, native_executable},
+    tmux::{NativeLayout, NativeRole, TmuxClient, native_executable},
 };
 
 pub(crate) fn restart_role(project: &Project, role: NativeRole) -> Result<()> {
@@ -49,7 +49,7 @@ fn status_text(database: &Database) -> Result<String> {
         None => "—".to_owned(),
     };
     Ok(format!(
-        "TALOS | Native Pair (manual)\n{task}\nChecks: {checks} | Queue: {} waiting / {} complete / {} blocked | {}\nNative CLI permissions apply; do not run a managed Writer concurrently.\n[F2] Settings [c] Full cockpit | tmux prefix + arrows / z / d",
+        "TALOS | Native Pair (manual)\n{task}\nChecks: {checks} | Queue: {} waiting / {} complete / {} blocked | {}\nNative CLI permissions apply; do not run a managed Writer concurrently.\n[F2] Settings [c] Cockpit [1] Columns [2] Stacked | tmux prefix + arrows / z / d",
         queue.queued,
         queue.complete,
         queue.blocked_or_failed,
@@ -151,9 +151,13 @@ pub(crate) fn run_status(project: Project) -> Result<()> {
                 let result = match key.code {
                     KeyCode::Char('c') => open_window(&project, "talos-cockpit", "tui"),
                     KeyCode::F(2) => open_window(&project, "talos-settings", "settings"),
+                    KeyCode::Char('1') => TmuxClient::default()
+                        .set_native_layout(&project.root, NativeLayout::Columns),
+                    KeyCode::Char('2') => TmuxClient::default()
+                        .set_native_layout(&project.root, NativeLayout::Stacked),
                     _ => continue,
                 };
-                notice = result.err().map(|_| "Cannot open window".to_owned());
+                notice = result.err().map(|error| redact_sensitive(&error.to_string()));
             }
         }
     })();

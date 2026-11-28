@@ -16,7 +16,11 @@ T23.2 adds explicit single-role replacement via `talos restart-pane writer
 --confirm` (or critic) and Settings X then Y. Exit the selected CLI before
 replacement; this ends that pane process and does not preserve its scrollback.
 The other panes are not restarted. The real tmux test checks peer PIDs before
-and after restart. CI validation and alternate layouts remain pending.
+and after restart. CI run 46121408941 passed on Linux and macOS, including
+real tmux restart acceptance. PR #3 is ready; merge is pending authorization.
+The follow-up layout slice saves the original columns layout and switches to
+stacked panes with a compact status pane; no process is restarted. Layout
+acceptance remains pending.
 
 ### R22 — Native Pair workspace (in progress)
 
