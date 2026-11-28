@@ -1,8 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Run under xvfb-run on Linux. The terminal and TALOS are real; the two
-# fixture executables intentionally do not connect to a model provider.
+# Run under xvfb-run on a clean Linux runner with the official CLI binaries.
+# No account sign-in, credentials or model prompts are used in this capture.
 binary="$(realpath "$1")"
 output="$(realpath -m "$2")"
 mkdir -p "$output"
@@ -17,12 +17,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-mkdir -p "$scratch/bin" "$scratch/demo-project"
-for role in codex claude; do
-  printf '#!/bin/sh\nprintf "%%s\\n" "TALOS demo CLI fixture: %s" "No provider connected. This terminal is interactive." "Type exit to return to the shell." ""\nwhile IFS= read -r line; do [ "$line" = exit ] && exit 0; done\n' "$role" > "$scratch/bin/$role"
-  chmod 700 "$scratch/bin/$role"
-done
-export PATH="$scratch/bin:$PATH"
+mkdir -p "$scratch/demo-project"
+command -v codex >/dev/null
+command -v claude >/dev/null
+test -z "${OPENAI_API_KEY:-}${ANTHROPIC_API_KEY:-}${ANTHROPIC_AUTH_TOKEN:-}"
 cd "$scratch/demo-project"
 git init -q
 git -c user.name=Demo -c user.email=demo@example.invalid commit --allow-empty -qm 'Initial demo commit'
@@ -52,6 +50,11 @@ wait_for has_panes
 read -r writer critic status < <(tmux show-options -qv -t "$session" @talos_pair_panes)
 has_status() { tmux capture-pane -p -t "$status" | grep -q 'Native Pair'; }
 wait_for has_status
+native_ready() {
+  tmux capture-pane -p -t "$writer" | grep -Eiq 'codex|openai|sign in' &&
+    tmux capture-pane -p -t "$critic" | grep -Eiq 'claude|anthropic|welcome|theme'
+}
+wait_for native_ready
 window="$(xdotool search --name "$title" | head -n1)"
 sleep 1
 import -window "$window" "$output/native-workspace.png"
